@@ -1,0 +1,18 @@
+//! Reads Claude Code's local data. Has no UI, so a web version can reuse it later.
+
+pub mod catalog;
+pub mod config;
+pub mod delete;
+pub mod format;
+pub mod index;
+pub mod model;
+pub mod paths;
+pub mod preview;
+pub mod query;
+pub mod recovery;
+pub mod registry;
+pub mod rename;
+pub mod resume;
+pub mod setup;
+pub mod transcript;
+pub mod window;

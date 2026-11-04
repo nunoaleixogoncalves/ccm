@@ -1,0 +1,71 @@
+use serde::{Deserialize, Serialize};
+
+/// Which agent wrote a conversation. Only Claude Code exists in v1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Source {
+    ClaudeCode,
+}
+
+/// One conversation. Everything except `open` and `folder_exists` is cached in the index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Session {
+    pub id: String,
+    pub source: Source,
+    pub transcript_path: String,
+    /// Fingerprint of the transcript when it was parsed.
+    pub transcript_size: u64,
+    pub transcript_mtime_ns: i64,
+    /// Transcript plus the sibling folder holding subagents and tool results.
+    pub size_bytes: u64,
+    pub name: String,
+    /// First recorded folder, which is where a resume must start. Kept exact, so sanitize it
+    /// before display.
+    pub folder: Option<String>,
+    pub branch: Option<String>,
+    pub model: Option<String>,
+    pub started_at_ms: Option<i64>,
+    pub last_active_ms: Option<i64>,
+    /// Tokens used by the last main-thread response.
+    pub context_used: Option<u64>,
+    pub prompts: u64,
+    pub replies: u64,
+    pub cost_usd: Option<f64>,
+    pub lines_added: Option<u64>,
+    pub lines_removed: Option<u64>,
+    pub pr_url: Option<String>,
+    pub continued_in: Option<String>,
+    /// Recaps saved by Claude Code, newest first.
+    #[serde(default)]
+    pub recaps: Vec<String>,
+    /// Lines that could not be parsed.
+    pub bad_lines: u64,
+    #[serde(skip)]
+    pub open: bool,
+    /// The log shows it started and never ended, and nothing is running it.
+    #[serde(skip)]
+    pub crashed: bool,
+    /// The real size, saved by the status line.
+    #[serde(skip)]
+    pub window_size: Option<u64>,
+    #[serde(skip, default = "yes")]
+    pub folder_exists: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Session {
+    pub fn messages(&self) -> u64 {
+        self.prompts + self.replies
+    }
+
+    /// Junk means Claude never replied. It only filters and never deletes anything by itself.
+    pub fn is_junk(&self) -> bool {
+        self.replies == 0
+    }
+
+    pub fn is_folder_missing(&self) -> bool {
+        self.folder.is_some() && !self.folder_exists
+    }
+}

@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/ccm-core", "crates/ccm"]
+resolver = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true

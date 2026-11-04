@@ -1,0 +1,204 @@
+# ccm
+
+**A terminal app for finding, resuming and cleaning up your Claude Code conversations.**
+
+![ccm showing a list of conversations with details and a preview of the selected one](docs/screenshot.png)
+
+*The conversations in this screenshot are examples.*
+
+## Why
+
+If you run a lot of Claude Code sessions, they pile up:
+
+- Finding an old conversation means remembering when and where it ran, or what it was called.
+- Claude Code can purge a whole project, but not one conversation and everything stored with it.
+- After a crash or reboot, nothing tells you which conversations were open or which folders they ran in.
+
+`ccm` puts every conversation from every project in one table, with full-text search and a preview. It only uses the files Claude Code already keeps, and it opens in a fraction of a second, even with hundreds of conversations.
+
+## What you can do
+
+- **Browse:** see every conversation's folder, age, context used, messages, size, model, branch and status.
+- **Search:** find a conversation by anything said in it.
+- **Preview:** read the latest messages and scroll back, without opening the conversation.
+- **Resume:** open it in a new terminal, in the folder it ran in. Inside `herdr-app`, it opens in that folder's workspace.
+- **Delete:** permanently remove one or many conversations and their data, after a confirmation that lists what goes.
+- **Rename:** the new name also shows in Claude Code's own `/resume`.
+- **Clean up:** filter for conversations Claude never replied to, ones whose folder is gone, and large ones.
+- **Recover:** after a crash, see what was running and reopen it all at once.
+
+## Install
+
+You need:
+
+- [Claude Code](https://claude.com/claude-code)
+- Git
+- [Rust](https://rustup.rs), current stable
+- A C compiler, to build the bundled SQLite
+
+| System | C compiler |
+|---|---|
+| macOS | `xcode-select --install` |
+| Arch, Omarchy | `sudo pacman -S --needed base-devel` |
+| Debian, Ubuntu | `sudo apt install build-essential` |
+| Fedora | `sudo dnf install gcc` |
+
+Then run:
+
+```sh
+git clone https://github.com/nunoaleixogoncalves/ccm.git
+cd ccm
+./install.sh
+```
+
+This puts `ccm` in `~/.local/bin`. To use another folder, set `CCM_INSTALL_DIR`. The script tells you if that folder isn't on your `PATH`.
+
+It then runs `ccm setup`, which shows the changes it would make to Claude Code's settings and applies them only if you answer `y`. Those changes are only needed for crash recovery and exact context window sizes. Everything else works without them.
+
+If you use mise, install with this script and not `cargo install`. `cargo install` puts `ccm` where mise creates a shim that fails outside this repository.
+
+### Optional tools
+
+| Tool | What it's for | Without it |
+|---|---|---|
+| `wl-copy` or `xclip` | Copying on Linux | `ccm` asks your terminal to copy, which not every terminal allows |
+| `xdg-terminal-exec` | Resuming in a new terminal on Linux | Set `terminal` in the [configuration](#configuration), or run the command `ccm` shows you |
+
+## Update
+
+From the repository folder:
+
+```sh
+git pull
+./install.sh
+```
+
+## Usage
+
+Run `ccm` from anywhere.
+
+| Command | What it does |
+|---|---|
+| `ccm` | Opens the list |
+| `ccm setup` | Installs the hooks crash recovery needs, after showing the changes |
+| `ccm --help` | Shows the commands |
+
+`ccm hook` and `ccm hook status-line` are also there, but Claude Code runs those. You won't need to.
+
+### Keys
+
+Most actions are also buttons in the footer, so you can click them.
+
+| Key | Action |
+|---|---|
+| Up, Down, or `k`, `j` | Move the selection |
+| Page Up, Page Down, Home, End | Move further |
+| Enter | Resume the selected conversation |
+| `/` | Search. Enter keeps the results, Esc clears them |
+| `[`, `]` | Scroll the preview back and forward |
+| Space | Mark or unmark, then move to the next row |
+| `a` | Mark everything shown, or clear those marks |
+| `d`, then `y` | Delete the selected or marked conversations |
+| `m`, while confirming a delete | Choose whether to delete memory notes too. It only appears when there are notes to delete |
+| `Shift+R` | Rename |
+| `y` | Copy the conversation's ID |
+| `Shift+Y` | Copy the command that resumes it |
+| `Shift+O` | Open the list of crashed conversations to reopen |
+| `o` | Show only open conversations |
+| `x` | Show only crashed conversations |
+| `Shift+J` | Show only junk, meaning conversations Claude never replied to |
+| `m` | Show only conversations whose folder is missing |
+| `l` | Show only large conversations |
+| `c` | Clear the filters |
+| `g` | Group by folder |
+| `s` | Change the sort column |
+| `r` | Reverse the sort |
+| Esc | Clear the marks, then the search, then quit |
+| `q`, Ctrl-C | Quit |
+
+With the mouse, you can click a row to select it, double-click to resume, click a column heading to sort, and use the wheel to scroll.
+
+## Configuration
+
+Everything is optional. The file is `~/.config/ccm/config.toml`:
+
+```toml
+# What counts as large for the l filter, in MB. The default is 100.
+large_threshold_mb = 200
+
+# The command that opens a terminal. "claude --resume <id>" is added to the end,
+# and it runs in the conversation's folder. The default is xdg-terminal-exec.
+terminal = ["foot", "-e"]
+
+# Context window sizes by model, for models that show "?".
+[windows]
+claude-opus-4-8 = 200000
+```
+
+On macOS, set `terminal` to a terminal that can run a command, such as `["alacritty", "-e"]`. If no terminal can be started, `ccm` shows the command to run yourself.
+
+## What it touches on your machine
+
+`ccm` reads Claude Code's files in `~/.claude`, or in `CLAUDE_CONFIG_DIR` if that's set. It sends nothing over the network.
+
+It writes these files of its own:
+
+| Path | What it holds |
+|---|---|
+| `~/.cache/ccm/index.db` | The search index, including a copy of conversation text. It's owner-only, and safe to delete because `ccm` rebuilds it |
+| `~/.config/ccm/config.toml` | Your configuration, if you create one. `ccm` only reads it |
+| `~/.local/state/ccm/sessions.jsonl` | When sessions start and end, as IDs and times only |
+| `~/.local/state/ccm/windows/` | Each session's context window size |
+| `~/.local/state/ccm/backups/` | Your original settings files, from before `ccm setup` changed them |
+
+### What `ccm setup` changes
+
+- `settings.json` gets a `SessionStart` and a `SessionEnd` hook that record when sessions start and end.
+- `statusline.sh` gets one line that saves the context window size. If you don't use a `statusline.sh`, or `ccm` can't safely edit yours, it tells you what to add instead.
+
+### What a delete removes
+
+**A delete can't be undone.** `ccm` refuses to delete a conversation that's open, or that was written to in the last minute. It also stops if it can't tell, such as when a running session's registry file can't be read.
+
+| | |
+|---|---|
+| **Removed** | The transcript and its folder of subagents and tool results, its file history, session environment, tasks, debug log and telemetry, and its search index entry |
+| **Edited** | `history.jsonl` loses that conversation's lines, using Claude Code's own lock. A pasted-content file goes only if nothing else uses it |
+| **Kept unless you press `m`** | Memory notes that only this conversation wrote |
+| **Always kept** | Other conversations, including forks and continuations, plus memory notes edited by hand, `plans/`, and the folder's trust setting |
+
+## Crash recovery
+
+Claude Code records a clean exit, or a closed terminal, but it can't record a power loss or a hard kill. With the hooks installed, `ccm` shows a session that started and never ended as crashed, in red. Press `Shift+O` to choose which ones to reopen. Any you untick stop showing as crashed.
+
+Only sessions started after `ccm setup` are tracked.
+
+## Platforms
+
+| Platform | Status |
+|---|---|
+| Linux | Built and tested. Used in `foot` and `herdr-app` |
+| macOS | Should work, but it has never been run on a Mac |
+| Windows | Not supported |
+
+Tested with Claude Code 2.1.296. Claude Code's file format isn't documented and can change, so `ccm` skips anything it doesn't recognise and warns you rather than crashing.
+
+## Security
+
+To report a problem privately, see [SECURITY.md](SECURITY.md).
+
+## Uninstall
+
+1. Remove the `ccm` hook entries from `~/.claude/settings.json`, and the two lines mentioning `ccm` from `~/.claude/statusline.sh`.
+2. Delete the program and its files:
+
+```sh
+rm ~/.local/bin/ccm
+rm -rf ~/.cache/ccm ~/.config/ccm ~/.local/state/ccm
+```
+
+The last folder holds the backups of your settings, so copy them first if you want them. Your conversations aren't touched.
+
+## License
+
+[MIT](LICENSE)
