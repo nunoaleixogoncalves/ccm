@@ -539,7 +539,7 @@ mod tests {
         for key in ['R', '/', 'J', 'o', 'g', 'y'] {
             a.on_key(KeyCode::Char(key));
         }
-        assert!(a.renaming.is_none() && !a.typing && !a.filters.junk && !a.filters.open && !a.grouped && a.status.is_none());
+        assert!(a.renaming.is_none() && !a.typing && !a.filters.junk && !a.filters.open && a.grouping == crate::app::Grouping::Off && a.status.is_none());
         a.on_key(KeyCode::Char('a'));
         assert!(a.marked.is_empty() && !a.worktrees.marked.is_empty(), "marks go on worktrees here, not conversations");
         a.on_key(KeyCode::Esc);

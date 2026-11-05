@@ -2,7 +2,8 @@ use ccm_core::delete::Item;
 use ccm_core::format::{ago, bytes, sanitize};
 use ccm_core::model::Session;
 use ccm_core::preview::{Preview, Role};
-use ccm_core::query::{GroupRow, SortKey};
+use ccm_core::query::{worktree_of, Group, GroupRow, SortKey};
+use ccm_core::repo::Place;
 use chrono::{Local, TimeZone};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -11,7 +12,10 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, HighlightSpacing, Paragraph,
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{Action, App, View};
+use std::collections::HashMap;
+use std::path::Path;
+
+use crate::app::{Action, App, Grouping, View};
 
 mod worktrees;
 
@@ -287,8 +291,14 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect, now_ms: i64) {
         .rows
         .iter()
         .map(|row| match row {
-            GroupRow::Header { folder, count, size_bytes } => {
-                let name = folder.as_deref().map_or("(no folder recorded)".to_string(), |p| sanitize(&short_path(p, &app.home)));
+            GroupRow::Header { group, count, size_bytes } => {
+                let shown = |p: &str| sanitize(&short_path(p, &app.home));
+                let name = match group {
+                    Group::Folder(p) | Group::Repo(p) => shown(p),
+                    Group::NotGit(p) => format!("{} (not in Git)", shown(p)),
+                    Group::Gone(p) => format!("{} (folder gone)", shown(p)),
+                    Group::NoFolder => "(no folder recorded)".to_string(),
+                };
                 Row::new([Cell::from(format!("{name}  {count}  {}", bytes(*size_bytes)))])
                     .style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
             }
@@ -345,8 +355,8 @@ fn row_style(s: &Session) -> Style {
 
 fn column_text(app: &App, s: &Session, key: SortKey, width: usize, now_ms: i64) -> String {
     match key {
-        SortKey::Name if app.marked.contains(&s.id) => format!("● {}", fit_end(&display_name(s), width.saturating_sub(2))),
-        SortKey::Name => fit_end(&display_name(s), width),
+        SortKey::Name if app.marked.contains(&s.id) => format!("● {}", name_text(app, s, width.saturating_sub(2))),
+        SortKey::Name => name_text(app, s, width),
         SortKey::Folder => s.folder.as_deref().map_or("-".into(), |p| fit_start(&sanitize(&short_path(p, &app.home)), width)),
         SortKey::LastActive => ago(now_ms, s.last_active_ms),
         SortKey::Context => app.context_text(s),
@@ -356,6 +366,22 @@ fn column_text(app: &App, s: &Session, key: SortKey, width: usize, now_ms: i64) 
         SortKey::Branch => fit_end(s.branch.as_deref().unwrap_or("-"), width),
         SortKey::Status => App::status_text(s).to_string(),
     }
+}
+
+/// The name, followed in repository groups by the branch and the worktree, which tell apart the
+/// work in one repository. The name is shortened first, so the tag stays visible.
+fn name_text(app: &App, s: &Session, width: usize) -> String {
+    let tag = if app.grouping == Grouping::Repo { repo_tag(s, &app.places) } else { None };
+    let Some(tag) = tag else { return fit_end(&display_name(s), width) };
+    let tag = fit_end(&format!(" [{tag}]"), width / 2);
+    let name = fit_end(&display_name(s), width.saturating_sub(tag.width()));
+    format!("{name}{tag}")
+}
+
+fn repo_tag(s: &Session, places: &HashMap<String, Place>) -> Option<String> {
+    let worktree = worktree_of(s, places).map(|w| Path::new(w).file_name().map_or(w.into(), |n| n.to_string_lossy()));
+    let parts: Vec<String> = s.branch.as_deref().into_iter().map(sanitize).chain(worktree.map(|w| sanitize(&w))).collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 fn display_name(s: &Session) -> String {
@@ -577,13 +603,21 @@ fn footer_groups(app: &App) -> [(&'static str, Vec<Button>); 2] {
                 ("m", "Missing", Action::ToggleMissing, app.filters.missing),
                 ("l", "Large", Action::ToggleLarge, app.filters.large),
                 ("c", "Clear", Action::ClearFilters, false),
-                ("g", "Group", Action::ToggleGroup, app.grouped),
+                ("g", group_label(app.grouping), Action::ToggleGroup, app.grouping != Grouping::Off),
                 ("s", "Sort", Action::NextSort, false),
                 ("r", "Reverse", Action::ReverseSort, false),
                 ("w", "Worktrees", Action::Worktrees, false),
             ],
         ),
     ]
+}
+
+fn group_label(grouping: Grouping) -> &'static str {
+    match grouping {
+        Grouping::Off => "Group",
+        Grouping::Folder => "Group: folder",
+        Grouping::Repo => "Group: repo",
+    }
 }
 
 /// Lays out the group names, with no action, and their buttons in rows, as `(row, x, text, action, on)`.
@@ -693,6 +727,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::RepoRequest;
     use ccm_core::config::Config;
     use ccm_core::delete::{Failure, Note, Outcome, Plan, Skipped};
     use ccm_core::model::Source;
@@ -981,6 +1016,84 @@ mod tests {
     }
 
     #[test]
+    fn g_steps_through_folder_and_repository_grouping_and_every_button_still_fits() {
+        let mut a = app();
+        for (grouping, label) in [(Grouping::Folder, "g Group: folder"), (Grouping::Repo, "g Group: repo"), (Grouping::Off, "g Group ")] {
+            a.on_key(KeyCode::Char('g'));
+            assert_eq!(a.grouping, grouping);
+            let screen = render(&mut a, 80, 30);
+            assert!(screen.contains(label), "{screen}");
+            assert_eq!(a.hit.buttons.len(), footer_groups(&a).iter().map(|(_, b)| b.len()).sum::<usize>(), "{screen}");
+        }
+    }
+
+    #[test]
+    fn git_is_asked_only_while_grouping_by_repository_and_each_folder_once() {
+        let mut a = app();
+        assert_eq!(a.repo_request(), None);
+        a.on_key(KeyCode::Char('g'));
+        assert_eq!(a.repo_request(), None, "folder grouping needs no Git");
+        a.on_key(KeyCode::Char('g'));
+        let folders = vec!["/home/me/a".to_string(), "/home/me/b".to_string()];
+        assert_eq!(a.repo_request(), Some(RepoRequest { folders: folders.clone(), used: folders.clone(), full: true }));
+        assert_eq!(a.repo_request(), None, "one look at a time");
+        a.finish_repo_lookup(HashMap::from([("/home/me/a".to_string(), Place::NotGit)]));
+        assert_eq!(a.repo_request(), None, "a folder Git couldn't be asked about isn't asked again straight away");
+
+        let mut more = a.sessions.clone();
+        more.push(session("id-new", "New one", "/home/me/c", 0));
+        a.set_sessions(more);
+        let request = a.repo_request().unwrap();
+        assert_eq!((request.folders, request.full), (vec!["/home/me/c".to_string()], false), "only the new folder");
+        a.finish_repo_lookup(HashMap::new());
+
+        a.on_key(KeyCode::Char('g'));
+        a.on_key(KeyCode::Char('g'));
+        a.on_key(KeyCode::Char('g'));
+        assert!(a.repo_request().unwrap().full, "picking repository grouping again looks at everything again");
+    }
+
+    #[test]
+    fn repository_groups_join_worktrees_and_tag_each_conversation_with_its_branch_and_worktree() {
+        let mut a = app();
+        let mut login = session("id-login", "Fix the login form", "/home/me/a-login/src", 0);
+        login.branch = Some("login-fix".into());
+        let mut more = a.sessions.clone();
+        more.push(login);
+        a.set_sessions(more);
+        for _ in 0..2 {
+            a.on_key(KeyCode::Char('g'));
+        }
+        let repo = |worktree: Option<&str>| Place::Repo { repo: "/home/me/a".into(), worktree: worktree.map(String::from) };
+        a.finish_repo_lookup(HashMap::from([
+            ("/home/me/a".to_string(), repo(None)),
+            ("/home/me/a-login/src".to_string(), repo(Some("/home/me/a-login"))),
+            ("/home/me/b".to_string(), Place::NotGit),
+        ]));
+        let screen = render(&mut a, 160, 20);
+        let header = row_of(&screen, "~/a  3  304M");
+        assert!(header < row_of(&screen, "Fix the login form [login-fix · a-login]"), "{screen}");
+        assert!(row_of(&screen, "Open one [main]") > header, "{screen}");
+        assert!(row_of(&screen, "~/b (not in Git)  1  2M") > row_of(&screen, "Old model [main]"), "{screen}");
+
+        a.on_key(KeyCode::Char('g'));
+        let screen = render(&mut a, 160, 20);
+        assert!(!screen.contains("[main]") && screen.contains("Fix the login form"), "tags only in repository groups:\n{screen}");
+    }
+
+    #[test]
+    fn a_long_name_is_cut_before_its_repository_tag() {
+        let mut a = app();
+        a.grouping = Grouping::Repo;
+        let mut s = session("id-long", &"word ".repeat(20), "/home/me/a", 0);
+        s.branch = Some("feature".into());
+        assert!(name_text(&a, &s, 30).ends_with(" [feature]"), "{}", name_text(&a, &s, 30));
+        assert!(name_text(&a, &s, 30).width() <= 30);
+        a.grouping = Grouping::Folder;
+        assert!(!name_text(&a, &s, 30).contains("feature"));
+    }
+
+    #[test]
     fn the_selection_stays_on_the_same_conversation_across_a_refresh() {
         let mut a = app();
         a.on_key(KeyCode::Down);
@@ -1091,7 +1204,7 @@ mod tests {
         searchable(&mut a);
         type_text(&mut a, "qglo");
         assert_eq!(a.query, "qglo");
-        assert!(!a.quit && !a.grouped && !a.filters.large && !a.filters.open);
+        assert!(!a.quit && a.grouping == Grouping::Off && !a.filters.large && !a.filters.open);
     }
 
     #[test]
@@ -1102,7 +1215,7 @@ mod tests {
         a.on_key(KeyCode::Enter);
         assert!(!a.typing);
         a.on_key(KeyCode::Char('g'));
-        assert!(a.grouped, "shortcuts work again");
+        assert!(a.grouping == Grouping::Folder, "shortcuts work again");
         assert!(render(&mut a, 160, 20).contains(" / old"));
         a.on_key(KeyCode::Esc);
         assert!(a.query.is_empty() && !a.quit);

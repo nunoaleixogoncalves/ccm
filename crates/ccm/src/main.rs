@@ -3,6 +3,7 @@ mod clipboard;
 mod ui;
 mod worktrees;
 
+use std::collections::HashMap;
 use std::io::{stdin, stdout, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -18,6 +19,7 @@ use ccm_core::model::Session;
 use ccm_core::paths::Paths;
 use ccm_core::recovery;
 use ccm_core::removal;
+use ccm_core::repo::{self, Place};
 use ccm_core::rename;
 use ccm_core::resume::{self, Launch};
 use ccm_core::setup;
@@ -26,7 +28,7 @@ use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, Key
 use crossterm::execute;
 use ratatui::DefaultTerminal;
 
-use app::App;
+use app::{App, RepoRequest};
 
 /// Often enough to feel live, and cheap: a poll only stats files unless something changed.
 /// Polling is needed anyway, because a killed process produces no file event.
@@ -141,7 +143,7 @@ fn browse(paths: Paths) -> Result<()> {
 
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
-    let result = run(&mut terminal, &mut app, updates);
+    let result = run(&mut terminal, &mut app, updates, paths.index.clone());
     let _ = execute!(stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -205,11 +207,55 @@ fn spawn_refresher(mut catalog: Catalog) -> Receiver<Update> {
     rx
 }
 
-fn run(terminal: &mut DefaultTerminal, app: &mut App, updates: Receiver<Update>) -> Result<()> {
+/// Answers what each folder's repository is, reusing what the index saved before. Folders that
+/// weren't in Git are asked about again on a full request, in case one has become a repository.
+fn look_up_repos(index: &Path, request: &RepoRequest) -> HashMap<String, Place> {
+    let mut index = Index::open(index).ok();
+    let saved = index.as_ref().and_then(|i| i.repos().ok()).unwrap_or_default();
+    let reusable = |f: &String| match saved.get(f) {
+        Some(Place::Repo { .. }) => true,
+        Some(_) => !request.full,
+        None => false,
+    };
+    let ask: Vec<String> = request.folders.iter().filter(|f| !reusable(f)).cloned().collect();
+    let answers = repo::look_up_all(&ask);
+    if let Some(index) = index.as_mut() {
+        let _ = index.save_repos(&answers, &request.used);
+    }
+    let mut out: HashMap<String, Place> =
+        request.folders.iter().filter_map(|f| saved.get(f).filter(|_| reusable(f)).map(|p| (f.clone(), p.clone()))).collect();
+    out.extend(answers);
+    out
+}
+
+fn run(terminal: &mut DefaultTerminal, app: &mut App, updates: Receiver<Update>, index: PathBuf) -> Result<()> {
     let mut dirty = true;
     let mut last_draw = Instant::now();
     let mut worktree_scan: Option<Receiver<Scan>> = None;
+    let mut repo_lookup: Option<Receiver<HashMap<String, Place>>> = None;
     while !app.quit {
+        if repo_lookup.is_none()
+            && let Some(request) = app.repo_request()
+        {
+            let (tx, rx) = mpsc::channel();
+            let index = index.clone();
+            thread::spawn(move || {
+                let _ = tx.send(look_up_repos(&index, &request));
+            });
+            repo_lookup = Some(rx);
+        }
+        if let Some(rx) = &repo_lookup {
+            let finished = match rx.try_recv() {
+                Ok(answers) => Some(answers),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(HashMap::new()),
+            };
+            if let Some(answers) = finished {
+                app.finish_repo_lookup(answers);
+                repo_lookup = None;
+                dirty = true;
+            }
+        }
         if worktree_scan.is_none()
             && let Some(folders) = app.worktree_request()
         {

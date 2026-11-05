@@ -24,6 +24,7 @@ If you run a lot of Claude Code sessions, they pile up:
 - **Resume:** open it in a new terminal, in the folder it ran in. Inside `herdr-app`, it opens in that folder's workspace.
 - **Delete:** permanently remove one or many conversations and their data, after a confirmation that lists what goes.
 - **Rename:** the new name also shows in Claude Code's own `/resume`.
+- **Group:** by the folder a conversation ran in, or by Git repository, so the work in a repository and all its worktrees shows together.
 - **Clean up:** filter for conversations Claude never replied to, ones whose folder is gone, and large ones.
 - **Recover:** after a crash, see what was running and reopen it all at once.
 - **Worktrees:** see the Git worktrees of the repositories your conversations used, with their uncommitted changes, unpushed commits and the conversations that worked in each, and remove the ones you're done with.
@@ -67,7 +68,7 @@ If you use mise, install with this script and not `cargo install`. `cargo instal
 |---|---|---|
 | `wl-copy` or `xclip` | Copying on Linux | `ccm` asks your terminal to copy, which not every terminal allows |
 | `xdg-terminal-exec` | Resuming in a new terminal on Linux | Set `terminal` in the [configuration](#configuration), or run the command `ccm` shows you |
-| Git 2.36 or later | The [worktree view](#worktrees) | The view says Git wasn't found |
+| Git 2.36 or later | The [worktree view](#worktrees) and [grouping by repository](#grouping) | The view says Git wasn't found, and conversations stay grouped by folder |
 
 ## Update
 
@@ -132,12 +133,22 @@ View:
 | `m` | Show only conversations whose folder is missing |
 | `l` | Show only large conversations |
 | `c` | Clear the filters |
-| `g` | Group by folder |
+| `g` | Group by folder, then by repository, then not at all. See [Grouping](#grouping) |
 | `s` | Change the sort column |
 | `r` | Reverse the sort |
 | `w` | Show the [worktrees](#worktrees). `w` or Esc goes back |
 
 With the mouse, you can click a row to select it, double-click to resume, click a column heading to sort, and use the wheel to scroll.
+
+## Grouping
+
+Press `g` once to group conversations by the folder they started in, and again to group them by Git repository. A third press turns grouping off.
+
+- A repository's group holds the conversations that started in its main folder and in any of its worktrees. It's named by the main folder.
+- Each conversation shows its branch, and its worktree when that isn't the main folder, as in `Fix the login form [login-fix · shop-login]`.
+- `ccm` asks Git which repository each folder belongs to, once per folder, and keeps the answer. A worktree you remove later stays in its repository's group. Folders that weren't in a repository are asked about again each time you pick repository grouping.
+- A folder that's gone and was never seen in Git goes to the repository whose folder contains it, as with `.claude/worktrees`. Otherwise it gets its own group, marked "folder gone". Folders outside Git keep their own groups, marked "not in Git".
+- Until Git answers, which usually takes a fraction of a second, conversations stay grouped by folder.
 
 ## Worktrees
 
@@ -187,13 +198,13 @@ On macOS, set `terminal` to a terminal that can run a command, such as `["alacri
 
 `ccm` reads Claude Code's files in `~/.claude`, or in `CLAUDE_CONFIG_DIR` if that's set. It sends nothing over the network.
 
-While the [worktree view](#worktrees) is open, it runs Git in the repositories your conversations worked in. Only `git worktree remove` changes anything, and only after you confirm. It ignores `GIT_*` variables from its own environment, stops a repository's `core.fsmonitor` setting from running a program, takes no optional locks and never fetches.
+While the [worktree view](#worktrees) is open, it runs Git in the repositories your conversations worked in. While [grouping by repository](#grouping), it asks Git which repository each folder belongs to. Only `git worktree remove` changes anything, and only after you confirm. It ignores `GIT_*` variables from its own environment, stops a repository's `core.fsmonitor` setting from running a program, takes no optional locks and never fetches.
 
 It writes these files of its own:
 
 | Path | What it holds |
 |---|---|
-| `~/.cache/ccm/index.db` | The search index, including a copy of conversation text. It's owner-only, and safe to delete because `ccm` rebuilds it |
+| `~/.cache/ccm/index.db` | The search index, including a copy of conversation text, and the repository of each folder conversations started in. It's owner-only, and safe to delete because `ccm` rebuilds it |
 | `~/.config/ccm/config.toml` | Your configuration, if you create one. `ccm` only reads it |
 | `~/.local/state/ccm/sessions.jsonl` | When sessions start and end, as IDs and times only |
 | `~/.local/state/ccm/windows/` | Each session's context window size |
