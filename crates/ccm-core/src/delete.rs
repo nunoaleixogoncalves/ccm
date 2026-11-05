@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 use crate::paths::{is_uuid, Paths};
 use crate::recovery;
-use crate::registry::{has_unreadable_entry, open_sessions};
+use crate::registry::{has_unreadable_entry, live_roster, open_sessions};
 use crate::transcript::read_capped_line;
 
 /// A transcript written this recently may belong to a session the registry doesn't list.
@@ -142,7 +142,7 @@ impl Busy {
     fn read(paths: &Paths, proc_root: &Path) -> Self {
         Self {
             open: open_sessions(&paths.sessions(), proc_root),
-            roster: fs::read_to_string(paths.claude.join("daemon/roster.json")).unwrap_or_default(),
+            roster: live_roster(&paths.claude.join("daemon/roster.json"), proc_root),
             unreadable: has_unreadable_entry(&paths.sessions(), proc_root),
         }
     }
@@ -942,10 +942,27 @@ mod tests {
     fn a_background_job_that_is_running_is_refused() {
         let t = Tree::new();
         t.transcript("-p", A, "{}\n");
-        t.write("daemon/roster.json", &format!(r#"{{"workers":{{"{}":{{"pid":1}}}}}}"#, &A[..8]));
+        let proc = t.proc.join("4242");
+        fs::create_dir_all(&proc).unwrap();
+        let fields: Vec<String> = (3..=21).map(|i| i.to_string()).collect();
+        fs::write(proc.join("stat"), format!("4242 (claude) {} 777 23\n", fields.join(" "))).unwrap();
+        t.write("daemon/roster.json", &format!(r#"{{"workers":{{"{}":{{"pid":4242,"procStart":"777","sessionId":"{A}"}}}}}}"#, &A[..8]));
         let plan = t.plan(&[A]);
         assert!(plan.items.is_empty());
         assert!(plan.skipped[0].reason.contains("background"));
+    }
+
+    #[test]
+    fn a_background_job_that_has_died_does_not_block_a_delete() {
+        let t = Tree::new();
+        t.transcript("-p", A, "{}\n");
+        t.transcript("-p", B, "{}\n");
+        t.write(
+            "daemon/roster.json",
+            &format!(r#"{{"workers":{{"{}":{{"pid":4242,"procStart":"777","sessionId":"{A}","dispatch":"{B}"}}}}}}"#, &A[..8]),
+        );
+        let plan = t.plan(&[A, B]);
+        assert_eq!(plan.items.len(), 2, "{:?}", plan.skipped.iter().map(|s| &s.reason).collect::<Vec<_>>());
     }
 
     #[test]

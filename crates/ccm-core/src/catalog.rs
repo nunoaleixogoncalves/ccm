@@ -12,7 +12,7 @@ use crate::index::{Index, SearchDoc};
 use crate::model::{Session, Source};
 use crate::paths::{session_id_of, Paths};
 use crate::recovery;
-use crate::registry::open_sessions;
+use crate::registry::{live_roster, open_sessions};
 use crate::transcript;
 
 pub struct Catalog {
@@ -96,7 +96,7 @@ impl Catalog {
 
     fn annotated(&self) -> Vec<Session> {
         let open = open_sessions(&self.paths.sessions(), &self.proc_root);
-        let roster = fs::read_to_string(self.paths.claude.join("daemon/roster.json")).unwrap_or_default();
+        let roster = live_roster(&self.paths.claude.join("daemon/roster.json"), &self.proc_root);
         let crashed = recovery::crashed(&self.paths, &open, &roster, chrono::Utc::now().timestamp_millis());
         let windows = recovery::saved_windows(&self.paths);
         let mut folders: HashMap<&str, bool> = HashMap::new();
