@@ -116,7 +116,7 @@ Actions:
 | `y` | Copy the conversation's ID |
 | `Shift+Y` | Copy the command that resumes it |
 | `Shift+O` | Open the list of crashed conversations to reopen |
-| Esc | Clear the marks, then the search, then quit |
+| Esc | Clear the marks, then the search. It never quits |
 | `q`, Ctrl-C | Quit |
 
 View:

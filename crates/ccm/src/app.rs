@@ -832,7 +832,8 @@ impl App {
             KeyCode::Char('g') => self.run(Action::ToggleGroup),
             KeyCode::Char('s') => self.run(Action::NextSort),
             KeyCode::Char('r') => self.run(Action::ReverseSort),
-            KeyCode::Char('q') | KeyCode::Esc => self.run(Action::Quit),
+            KeyCode::Esc => self.status = Some("Press q to quit.".into()),
+            KeyCode::Char('q') => self.run(Action::Quit),
             _ => {}
         }
     }

@@ -1069,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_keeps_the_results_and_esc_then_clears_before_quitting() {
+    fn enter_keeps_the_results_and_esc_then_clears_them() {
         let mut a = app();
         searchable(&mut a);
         type_text(&mut a, "old");
@@ -1080,8 +1080,30 @@ mod tests {
         assert!(render(&mut a, 160, 20).contains(" / old"));
         a.on_key(KeyCode::Esc);
         assert!(a.query.is_empty() && !a.quit);
+    }
+
+    #[test]
+    fn esc_never_quits_and_says_how_to() {
+        let mut a = app();
         a.on_key(KeyCode::Esc);
+        assert!(!a.quit);
+        assert!(render(&mut a, 160, 20).contains("Press q to quit."));
+        a.on_key(KeyCode::Char('q'));
         assert!(a.quit);
+    }
+
+    #[test]
+    fn repeated_esc_on_the_delete_dialog_keeps_ccm_open() {
+        let mut a = app();
+        let calls = deletable(&mut a, &[]);
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Char('d'));
+        for _ in 0..3 {
+            a.on_key(KeyCode::Esc);
+        }
+        assert!(a.confirm_delete.is_none() && !a.quit);
+        a.perform_delete();
+        assert!(calls.borrow().is_empty());
     }
 
     #[test]
