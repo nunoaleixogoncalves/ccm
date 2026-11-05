@@ -1,7 +1,7 @@
 //! The on-disk cache. Claude Code's files are the source of truth, so anything wrong with the
 //! index is fixed by deleting it and scanning again.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
@@ -9,6 +9,7 @@ use std::path::Path;
 use rusqlite::{params, Connection, OpenFlags};
 
 use crate::model::Session;
+use crate::repo::Place;
 
 /// Bump when the stored data or the parser changes, so old rows are rebuilt.
 const SCHEMA_VERSION: i32 = 4;
@@ -25,6 +26,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
     title, path, branch, prompts, replies,
     content = '', contentless_delete = 1,
     tokenize = 'unicode61 remove_diacritics 2'
+);
+CREATE TABLE IF NOT EXISTS repos (
+    folder TEXT PRIMARY KEY,
+    repo TEXT,
+    worktree TEXT
 );
 "#;
 
@@ -126,6 +132,49 @@ impl Index {
         self.apply(&[], ids)?;
         self.conn.execute_batch("INSERT INTO search (search) VALUES ('optimize');")?;
         self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+    }
+}
+
+impl Index {
+    /// What Git said about each folder before. Folders that were gone aren't kept, as there was
+    /// nothing to learn from them.
+    pub fn repos(&self) -> rusqlite::Result<HashMap<String, Place>> {
+        let mut stmt = self.conn.prepare("SELECT folder, repo, worktree FROM repos")?;
+        let rows = stmt.query_map([], |r| {
+            let repo: Option<String> = r.get(1)?;
+            let place = match repo {
+                Some(repo) => Place::Repo { repo, worktree: r.get(2)? },
+                None => Place::NotGit,
+            };
+            Ok((r.get::<_, String>(0)?, place))
+        })?;
+        rows.collect()
+    }
+
+    /// Saves new answers, and drops those for folders no conversation uses any more.
+    pub fn save_repos(&mut self, answers: &HashMap<String, Place>, used: &[String]) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut put = tx.prepare(
+                "INSERT INTO repos (folder, repo, worktree) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(folder) DO UPDATE SET repo = excluded.repo, worktree = excluded.worktree",
+            )?;
+            for (folder, place) in answers {
+                match place {
+                    Place::Repo { repo, worktree } => put.execute(params![folder, repo, worktree])?,
+                    Place::NotGit => put.execute(params![folder, None::<String>, None::<String>])?,
+                    Place::Gone => 0,
+                };
+            }
+            let used: HashSet<&str> = used.iter().map(String::as_str).collect();
+            let stored: Vec<String> =
+                tx.prepare("SELECT folder FROM repos")?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            let mut del = tx.prepare("DELETE FROM repos WHERE folder = ?1")?;
+            for folder in stored.iter().filter(|f| !used.contains(f.as_str())) {
+                del.execute(params![folder])?;
+            }
+        }
+        tx.commit()
     }
 }
 
@@ -271,6 +320,30 @@ mod tests {
         assert_eq!(s.search("").unwrap(), None);
         assert_eq!(s.search("   ").unwrap(), None);
         assert_eq!(s.search("-- *").unwrap(), None);
+    }
+
+    #[test]
+    fn repository_answers_are_kept_until_no_conversation_uses_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let mut index = Index::open(&path).unwrap();
+        let shop = Place::Repo { repo: "/w/shop".into(), worktree: Some("/w/shop-login".into()) };
+        let answers = HashMap::from([
+            ("/w/shop-login/src".to_string(), shop.clone()),
+            ("/w/notes".to_string(), Place::NotGit),
+            ("/w/gone".to_string(), Place::Gone),
+        ]);
+        let used = ["/w/shop-login/src".to_string(), "/w/notes".to_string(), "/w/gone".to_string()];
+        index.save_repos(&answers, &used).unwrap();
+        drop(index);
+        let mut index = Index::open(&path).unwrap();
+        let saved = index.repos().unwrap();
+        assert_eq!(saved.len(), 2, "a gone folder taught nothing: {saved:?}");
+        assert_eq!(saved["/w/shop-login/src"], shop);
+        assert_eq!(saved["/w/notes"], Place::NotGit);
+
+        index.save_repos(&HashMap::new(), &used[..1]).unwrap();
+        assert_eq!(index.repos().unwrap().into_keys().collect::<Vec<_>>(), ["/w/shop-login/src"]);
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! Filtering, sorting and grouping. Plain functions over a slice, shared by any front end.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use crate::model::Session;
+use crate::repo::{infer, Place};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Filters {
@@ -99,31 +101,99 @@ pub fn select(sessions: &[Session], filters: Filters, large_bytes: u64, key: Sor
     rows
 }
 
+/// What a group's conversations share.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Group {
+    /// A folder, or, when grouping by repository, a folder Git hasn't answered for yet.
+    Folder(String),
+    /// A repository, named by its main folder.
+    Repo(String),
+    /// A folder that isn't in a Git repository.
+    NotGit(String),
+    /// A folder that no longer exists, in no repository `ccm` knows of.
+    Gone(String),
+    NoFolder,
+}
+
+impl Group {
+    fn path(&self) -> Option<&str> {
+        match self {
+            Group::Folder(p) | Group::Repo(p) | Group::NotGit(p) | Group::Gone(p) => Some(p),
+            Group::NoFolder => None,
+        }
+    }
+}
+
 /// Rows of a grouped list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GroupRow {
-    Header { folder: Option<String>, count: usize, size_bytes: u64 },
+    Header { group: Group, count: usize, size_bytes: u64 },
     Item(usize),
 }
 
 /// Groups already-sorted rows by folder, keeping their order within each group. Groups are
 /// alphabetical, and conversations with no recorded folder come last.
 pub fn group_by_folder(sessions: &[Session], rows: &[usize]) -> Vec<GroupRow> {
-    let mut folders: Vec<Option<&str>> = rows.iter().map(|&i| sessions[i].folder.as_deref()).collect();
-    folders.sort_by(|a, b| match (a, b) {
+    group_by(sessions, rows, |s| s.folder.clone().map_or(Group::NoFolder, Group::Folder))
+}
+
+/// Groups already-sorted rows by the repository of the folder each conversation started in.
+/// `places` holds what Git said about each folder. A folder that's gone goes to the repository
+/// that contains it, if any.
+pub fn group_by_repo(sessions: &[Session], rows: &[usize], places: &HashMap<String, Place>) -> Vec<GroupRow> {
+    let repos: Vec<&str> = places
+        .values()
+        .filter_map(|p| match p {
+            Place::Repo { repo, .. } => Some(repo.as_str()),
+            _ => None,
+        })
+        .collect();
+    group_by(sessions, rows, |s| {
+        let Some(folder) = &s.folder else { return Group::NoFolder };
+        match places.get(folder) {
+            Some(Place::Repo { repo, .. }) => Group::Repo(repo.clone()),
+            Some(Place::NotGit) => Group::NotGit(folder.clone()),
+            Some(Place::Gone) => {
+                infer(folder, repos.iter().copied()).map_or_else(|| Group::Gone(folder.clone()), |r| Group::Repo(r.to_string()))
+            }
+            None => Group::Folder(folder.clone()),
+        }
+    })
+}
+
+/// The worktree a conversation started in, when it's not the repository's main folder, for
+/// telling apart the work in one repository group.
+pub fn worktree_of<'a>(s: &'a Session, places: &'a HashMap<String, Place>) -> Option<&'a str> {
+    let folder = s.folder.as_deref()?;
+    match places.get(folder)? {
+        Place::Repo { worktree, .. } => worktree.as_deref(),
+        Place::Gone => {
+            let repos = places.values().filter_map(|p| match p {
+                Place::Repo { repo, .. } => Some(repo.as_str()),
+                _ => None,
+            });
+            infer(folder, repos).filter(|r| *r != folder).map(|_| folder)
+        }
+        Place::NotGit => None,
+    }
+}
+
+fn group_by(sessions: &[Session], rows: &[usize], key: impl Fn(&Session) -> Group) -> Vec<GroupRow> {
+    let keys: Vec<Group> = rows.iter().map(|&i| key(&sessions[i])).collect();
+    let mut groups: Vec<&Group> = keys.iter().collect();
+    groups.sort_by(|a, b| match (a.path(), b.path()) {
         (None, None) => Ordering::Equal,
         (None, _) => Ordering::Greater,
         (_, None) => Ordering::Less,
-        (a, b) => a.cmp(b),
+        (x, y) => x.cmp(&y).then_with(|| a.cmp(b)),
     });
-    folders.dedup();
+    groups.dedup();
 
-    let mut out = Vec::with_capacity(rows.len() + folders.len());
-    for folder in folders {
-        let members: Vec<usize> =
-            rows.iter().copied().filter(|&i| sessions[i].folder.as_deref() == folder).collect();
+    let mut out = Vec::with_capacity(rows.len() + groups.len());
+    for group in groups {
+        let members: Vec<usize> = rows.iter().zip(&keys).filter(|(_, k)| *k == group).map(|(&i, _)| i).collect();
         out.push(GroupRow::Header {
-            folder: folder.map(str::to_owned),
+            group: group.clone(),
             count: members.len(),
             size_bytes: members.iter().map(|&i| sessions[i].size_bytes).sum(),
         });
@@ -251,7 +321,11 @@ mod tests {
         x2.size_bytes = 5;
         let all = [x1, none, a, x2];
         let rows = group_by_folder(&all, &[3, 1, 2, 0]);
-        let header = |f: Option<&str>, count, size_bytes| GroupRow::Header { folder: f.map(String::from), count, size_bytes };
+        let header = |f: Option<&str>, count, size_bytes| GroupRow::Header {
+            group: f.map_or(Group::NoFolder, |f| Group::Folder(f.into())),
+            count,
+            size_bytes,
+        };
         assert_eq!(
             rows,
             [
@@ -264,5 +338,54 @@ mod tests {
                 GroupRow::Item(1),
             ]
         );
+    }
+
+    #[test]
+    fn repository_groups_join_worktrees_and_keep_other_folders_apart() {
+        let at = |id: &str, folder: Option<&str>| {
+            let mut s = session(id);
+            s.folder = folder.map(String::from);
+            s
+        };
+        let all = [
+            at("main", Some("/w/shop")),
+            at("login", Some("/w/shop-login/src")),
+            at("tidy-gone", Some("/w/shop/.claude/worktrees/tidy")),
+            at("notes", Some("/w/notes")),
+            at("lost", Some("/w/lost")),
+            at("waiting", Some("/w/new")),
+            at("none", None),
+        ];
+        let repo = |worktree: Option<&str>| Place::Repo { repo: "/w/shop".into(), worktree: worktree.map(String::from) };
+        let places = HashMap::from([
+            ("/w/shop".to_string(), repo(None)),
+            ("/w/shop-login/src".to_string(), repo(Some("/w/shop-login"))),
+            ("/w/shop/.claude/worktrees/tidy".to_string(), Place::Gone),
+            ("/w/notes".to_string(), Place::NotGit),
+            ("/w/lost".to_string(), Place::Gone),
+        ]);
+        let header = |group, count| GroupRow::Header { group, count, size_bytes: 0 };
+        assert_eq!(
+            group_by_repo(&all, &[0, 1, 2, 3, 4, 5, 6], &places),
+            [
+                header(Group::Gone("/w/lost".into()), 1),
+                GroupRow::Item(4),
+                header(Group::Folder("/w/new".into()), 1),
+                GroupRow::Item(5),
+                header(Group::NotGit("/w/notes".into()), 1),
+                GroupRow::Item(3),
+                header(Group::Repo("/w/shop".into()), 3),
+                GroupRow::Item(0),
+                GroupRow::Item(1),
+                GroupRow::Item(2),
+                header(Group::NoFolder, 1),
+                GroupRow::Item(6),
+            ]
+        );
+        let worktree = |i: usize| worktree_of(&all[i], &places);
+        assert_eq!(worktree(0), None);
+        assert_eq!(worktree(1), Some("/w/shop-login"));
+        assert_eq!(worktree(2), Some("/w/shop/.claude/worktrees/tidy"), "a gone worktree is named by its folder");
+        assert_eq!(worktree(4), None);
     }
 }

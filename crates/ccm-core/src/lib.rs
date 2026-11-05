@@ -12,6 +12,7 @@ pub mod query;
 pub mod recovery;
 pub mod registry;
 pub mod removal;
+pub mod repo;
 pub mod rename;
 pub mod resume;
 pub mod setup;
