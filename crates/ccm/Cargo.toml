@@ -12,7 +12,7 @@ anyhow = "1.0.104"
 ccm-core = { version = "1.0.0", path = "../ccm-core" }
 chrono = "0.4.45"
 crossterm = "0.29.0"
-ratatui = "0.30.2"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 unicode-width = "0.2.3"
 
 [dev-dependencies]
