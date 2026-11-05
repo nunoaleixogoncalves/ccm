@@ -172,18 +172,18 @@ It writes these files of its own:
 ### What `ccm setup` changes
 
 - `settings.json` gets a `SessionStart` and a `SessionEnd` hook that record when sessions start and end.
-- `statusline.sh` gets one line that saves the context window size. If you don't use a `statusline.sh`, or `ccm` can't safely edit yours, it tells you what to add instead.
+- `statusline.sh` gets two lines, a comment and a command, that save the context window size. If you don't use a `statusline.sh`, or `ccm` can't safely edit yours, it tells you what to add instead.
 
 ### What a delete removes
 
-**A delete can't be undone.** `ccm` refuses to delete a conversation that's open, or that was written to in the last minute. It also stops if it can't tell, such as when a running session's registry file can't be read.
+**A delete can't be undone.** `ccm` refuses to delete a conversation that's open, running as a background job, or written to in the last minute. It also stops if it can't tell, such as when a running session's registry file can't be read.
 
 | | |
 |---|---|
-| **Removed** | The transcript and its folder of subagents and tool results, its file history, session environment, tasks, debug log and telemetry, and its search index entry |
+| **Removed** | The transcript and its folder of subagents and tool results, its file history, session environment, tasks, debug log and telemetry, its search index entry, and its finished background job's files |
 | **Edited** | `history.jsonl` loses that conversation's lines, using Claude Code's own lock. A pasted-content file goes only if nothing else uses it |
 | **Kept unless you press `m`** | Memory notes that only this conversation wrote |
-| **Always kept** | Other conversations, including forks and continuations, plus memory notes edited by hand, `plans/`, and the folder's trust setting |
+| **Always kept** | Other conversations, including forks and continuations, plus memory notes edited by hand, `plans/`, the folder's trust setting, and a background job that may have a worktree, which `ccm` tells you to remove with `claude rm` |
 
 ## Crash recovery
 
@@ -199,7 +199,7 @@ Only sessions started after `ccm setup` are tracked.
 | macOS | Built and tested on Intel and Apple Silicon by automated checks, but not yet used by hand |
 | Windows | Not supported |
 
-Tested with Claude Code 2.1.296. Claude Code's file format isn't documented and can change, so `ccm` skips anything it doesn't recognise and warns you rather than crashing.
+Tested with Claude Code 2.1.318. Claude Code's file format isn't documented and can change, so `ccm` skips anything it doesn't recognise and warns you rather than crashing.
 
 ## Security
 
