@@ -21,7 +21,8 @@ use ccm_core::recovery;
 use ccm_core::removal;
 use ccm_core::repo::{self, Place};
 use ccm_core::rename;
-use ccm_core::resume::{self, Launch};
+use ccm_core::forks;
+use ccm_core::resume::{self, Fork, Launch};
 use ccm_core::setup;
 use ccm_core::worktree::{self, Scan};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyModifiers};
@@ -122,7 +123,14 @@ fn browse(paths: Paths) -> Result<()> {
     app.status = config_error;
     let terminal_command = config_terminal.clone();
     let claude_json = paths.claude_json.clone();
-    app.resume = Some(Box::new(move |id, folder| resume_conversation(id, folder, terminal_command.as_deref(), &claude_json)));
+    let fork_paths = paths.clone();
+    app.resume = Some(Box::new(move |id, fork, folder| {
+        if let Some(fork) = fork {
+            forks::record(&fork_paths, &fork.id, id, now_ms()).map_err(|e| format!("Couldn't note the fork, so it wasn't started: {e}"))?;
+        }
+        resume_conversation(id, fork, folder, terminal_command.as_deref(), &claude_json)
+    }));
+    app.forks = forks::load(&paths);
     app.search = Some(Box::new(move |q| searcher.search(q).map_err(|e| e.to_string())));
     let plan_paths = paths.clone();
     app.planner = Some(Box::new(move |ids| delete::plan(&plan_paths, Path::new(PROC), ids)));
@@ -162,11 +170,12 @@ fn delete_conversations(paths: &Paths, plan: &Plan, notes: bool) -> Result<Outco
 }
 
 /// Opens the conversation in `herdr-app` when running inside it, otherwise in a new terminal.
-fn resume_conversation(id: &str, folder: &Path, terminal: Option<&[String]>, claude_json: &Path) -> Result<String, String> {
+fn resume_conversation(id: &str, fork: Option<&Fork>, folder: &Path, terminal: Option<&[String]>, claude_json: &Path) -> Result<String, String> {
     let in_herdr = resume::in_herdr(|v| std::env::var(v).ok());
-    let (launch, place) = if in_herdr { herdr_plan(id, folder)? } else { (resume::terminal_launch(id, folder, terminal), "a new terminal") };
+    let claude = resume::claude_args(id, fork);
+    let (launch, place) = if in_herdr { herdr_plan(&claude, folder)? } else { (resume::terminal_launch(&claude, folder, terminal), "a new terminal") };
     if let Err(e) = resume::start(&launch) {
-        return Err(format!("Couldn't start it ({e}). Run: {}", resume::manual_command(id, folder)));
+        return Err(format!("Couldn't start it ({e}). Run: {}", resume::manual_command(id, fork, folder)));
     }
     // Claude Code asks this itself, in the new terminal. Only the user may answer it.
     let warning = match resume::is_trusted(claude_json, folder) {
@@ -176,12 +185,12 @@ fn resume_conversation(id: &str, folder: &Path, terminal: Option<&[String]>, cla
     Ok(format!("Opened in {place}.{warning}"))
 }
 
-fn herdr_plan(id: &str, folder: &Path) -> Result<(Launch, &'static str), String> {
+fn herdr_plan(claude: &[String], folder: &Path) -> Result<(Launch, &'static str), String> {
     let terminals = resume::herdr_terminals().map_err(|e| format!("Couldn't read herdr's terminals: {e}"))?;
     let space = folder.to_str().and_then(|f| resume::find_space(&terminals, f));
     let new_id = |prefix| resume::new_herdr_id(prefix).map_err(|e| e.to_string());
     let place = if space.is_some() { "a new tab of its workspace" } else { "a new workspace" };
-    let launch = resume::herdr_launch(id, folder, space.as_deref(), &new_id("tb")?, &new_id("sp")?);
+    let launch = resume::herdr_launch(claude, folder, space.as_deref(), &new_id("tb")?, &new_id("sp")?);
     Ok((launch, place))
 }
 

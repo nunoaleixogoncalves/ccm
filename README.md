@@ -22,6 +22,7 @@ If you run a lot of Claude Code sessions, they pile up:
 - **Search:** find a conversation by anything said in it.
 - **Preview:** read the latest messages and scroll back, without opening the conversation.
 - **Resume:** open it in a new terminal, in the folder it ran in. Inside `herdr-app`, it opens in that folder's workspace.
+- **Fork:** start a new conversation as a copy of one, to try another direction while the original stays as it was.
 - **Delete:** permanently remove one or many conversations and their data, after a confirmation that lists what goes.
 - **Rename:** the new name also shows in Claude Code's own `/resume`.
 - **Group:** by the folder a conversation ran in, or by Git repository, so the work in a repository and all its worktrees shows together.
@@ -111,6 +112,7 @@ Actions:
 | Key | What it does |
 |---|---|
 | Enter | Resume the selected conversation |
+| `f` | Fork it. See [Forking](#forking) |
 | `d` or Del, then `y` or Del | Delete the selected or marked conversations. You can also click Delete twice. A second Del needs a moment's pause, so holding the key can't delete anything |
 | `m`, while confirming a delete | Choose whether to delete memory notes too. It only appears when there are notes to delete |
 | `Shift+R` | Rename |
@@ -139,6 +141,17 @@ View:
 | `w` | Show the [worktrees](#worktrees). `w` or Esc goes back |
 
 With the mouse, you can click a row to select it, double-click to resume, click a column heading to sort, and use the wheel to scroll.
+
+## Forking
+
+Press `f` to start a fork of the selected conversation. It's Claude Code's own fork (`claude --resume <id> --fork-session`): a new conversation that starts with a copy of the whole history, while the original stays as it was.
+
+- It opens like a resume: in a new terminal, or in `herdr-app`, in the folder the conversation started in. Claude Code looks for the original there, so it can't start anywhere else.
+- It's named after the original with "(fork)" added. Rename it with `Shift+R` as usual.
+- You can fork an open conversation. The original carries on untouched.
+- Claude Code records no link between a fork and its original, so `ccm` picks the fork's ID and keeps its own log of the forks it starts. The details panel shows "Forked from" on a fork and "Forks" on the original.
+- The fork shows in the list once Claude Code saves it, which may be only after you send it a first message. `ccm` then selects it.
+- Deleting either one leaves the other alone.
 
 ## Grouping
 
@@ -207,6 +220,7 @@ It writes these files of its own:
 | `~/.cache/ccm/index.db` | The search index, including a copy of conversation text, and the repository of each folder conversations started in. It's owner-only, and safe to delete because `ccm` rebuilds it |
 | `~/.config/ccm/config.toml` | Your configuration, if you create one. `ccm` only reads it |
 | `~/.local/state/ccm/sessions.jsonl` | When sessions start and end, as IDs and times only |
+| `~/.local/state/ccm/forks.jsonl` | Which conversations are forks `ccm` started, and of which, as IDs and times only |
 | `~/.local/state/ccm/windows/` | Each session's context window size |
 | `~/.local/state/ccm/backups/` | Your original settings files, from before `ccm setup` changed them |
 

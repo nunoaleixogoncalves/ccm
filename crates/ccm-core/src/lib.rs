@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod config;
 pub mod delete;
+pub mod forks;
 pub mod format;
 pub mod index;
 pub mod model;
