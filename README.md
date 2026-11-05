@@ -108,7 +108,7 @@ Actions:
 | Key | What it does |
 |---|---|
 | Enter | Resume the selected conversation |
-| `d`, then `y` | Delete the selected or marked conversations |
+| `d` or Del, then `y` or Del | Delete the selected or marked conversations. You can also click Delete twice. A second Del needs a moment's pause, so holding the key can't delete anything |
 | `m`, while confirming a delete | Choose whether to delete memory notes too. It only appears when there are notes to delete |
 | `Shift+R` | Rename |
 | Space | Mark or unmark, then move to the next row |
