@@ -195,7 +195,7 @@ Only sessions started after `ccm setup` are tracked.
 
 | Platform | Status |
 |---|---|
-| Linux | Built and tested. Used in `foot` and `herdr-app` |
+| Linux | Built and tested. Used in `foot`, GNOME Terminal and `herdr-app`, and it should work in most modern terminals |
 | macOS | Built and tested on Intel and Apple Silicon by automated checks, but not yet used by hand |
 | Windows | Not supported |
 
