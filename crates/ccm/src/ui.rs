@@ -218,7 +218,7 @@ fn delete_dialog(app: &App) -> Dialog {
         body.extend(plan.notes.iter().map(|n| (format!("  {}", sanitize(&n.name())), plain)));
     }
     let notes = if plan.notes.is_empty() { "" } else { "m toggle notes   " };
-    let bottom = format!("y delete   {notes}any other key cancels   or click Delete again");
+    let bottom = format!("y or Del delete   {notes}any other key cancels   or click Delete again");
     Dialog { title: " Delete permanently? ", top, body, bottom }
 }
 
@@ -1069,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_keeps_the_results_and_esc_then_clears_before_quitting() {
+    fn enter_keeps_the_results_and_esc_then_clears_them() {
         let mut a = app();
         searchable(&mut a);
         type_text(&mut a, "old");
@@ -1080,8 +1080,79 @@ mod tests {
         assert!(render(&mut a, 160, 20).contains(" / old"));
         a.on_key(KeyCode::Esc);
         assert!(a.query.is_empty() && !a.quit);
+    }
+
+    #[test]
+    fn esc_never_quits_and_says_how_to() {
+        let mut a = app();
         a.on_key(KeyCode::Esc);
+        assert!(!a.quit);
+        assert!(render(&mut a, 160, 20).contains("Press q to quit."));
+        a.on_key(KeyCode::Char('q'));
         assert!(a.quit);
+    }
+
+    #[test]
+    fn del_opens_the_delete_dialog_and_a_second_del_confirms() {
+        let mut a = app();
+        let calls = deletable(&mut a, &[]);
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Delete);
+        assert!(a.confirm_delete.is_some());
+        a.age_confirmation();
+        a.on_key(KeyCode::Delete);
+        assert!(a.has_pending_delete());
+        a.perform_delete();
+        assert_eq!(*calls.borrow(), vec![(vec!["id-old".to_string()], false)]);
+    }
+
+    #[test]
+    fn y_confirms_a_delete_opened_with_del() {
+        let mut a = app();
+        let calls = deletable(&mut a, &[]);
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Delete);
+        a.on_key(KeyCode::Char('y'));
+        a.perform_delete();
+        assert_eq!(calls.borrow().len(), 1);
+    }
+
+    #[test]
+    fn holding_del_never_deletes() {
+        let mut a = app();
+        let calls = deletable(&mut a, &[]);
+        select_named(&mut a, "Old model");
+        for _ in 0..50 {
+            a.on_key(KeyCode::Delete);
+        }
+        assert!(a.confirm_delete.is_some() && !a.has_pending_delete());
+        assert!(render(&mut a, 160, 30).contains("Too quick"));
+        a.perform_delete();
+        assert!(calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn del_does_nothing_while_typing_a_search() {
+        let mut a = app();
+        searchable(&mut a);
+        type_text(&mut a, "old");
+        a.on_key(KeyCode::Delete);
+        assert!(a.confirm_delete.is_none());
+        assert_eq!(a.query, "old");
+    }
+
+    #[test]
+    fn repeated_esc_on_the_delete_dialog_keeps_ccm_open() {
+        let mut a = app();
+        let calls = deletable(&mut a, &[]);
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Char('d'));
+        for _ in 0..3 {
+            a.on_key(KeyCode::Esc);
+        }
+        assert!(a.confirm_delete.is_none() && !a.quit);
+        a.perform_delete();
+        assert!(calls.borrow().is_empty());
     }
 
     #[test]
@@ -1864,7 +1935,7 @@ mod tests {
         for _ in 0..50 {
             let screen = render(&mut a, 120, 30);
             assert!(screen.contains("40 conversations, 80M freed"), "the total stays:\n{screen}");
-            assert!(screen.contains("y delete"), "the keys stay:\n{screen}");
+            assert!(screen.contains("y or Del delete"), "the keys stay:\n{screen}");
             assert!(screen.contains("of 40"), "{screen}");
             for i in 0..40 {
                 if screen.contains(&format!("Name{i:03}  ")) {

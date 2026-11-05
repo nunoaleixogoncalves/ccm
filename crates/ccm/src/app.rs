@@ -57,6 +57,9 @@ pub type CopyFn = Box<dyn FnMut(&str) -> Result<String, String>>;
 /// Two clicks on a row this close together are a double-click. Terminals report each click
 /// separately, so this has to be timed here.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// Del both opens and confirms a delete, and a held key looks like repeated presses. Longer than
+/// the usual pause before a key starts repeating, so holding Del can't delete anything.
+const DEL_PAUSE: Duration = Duration::from_secs(1);
 /// A resumed session takes a moment to register as open. Until then, block a second launch.
 const RESUME_COOLDOWN: Duration = Duration::from_secs(20);
 const DELETE_REPORT: &str = " Delete finished ";
@@ -345,6 +348,11 @@ impl App {
         let Some(confirm) = self.confirm_delete.as_mut() else { return };
         match key {
             KeyCode::Char('y') => self.confirm(),
+            KeyCode::Delete if confirm.opened.elapsed() < DEL_PAUSE => {
+                confirm.opened = Instant::now();
+                self.status = Some("Too quick. Wait a moment, then press Del again.".into());
+            }
+            KeyCode::Delete => self.confirm(),
             KeyCode::Char('m') if !confirm.plan.notes.is_empty() => confirm.include_notes = !confirm.include_notes,
             _ => {
                 self.confirm_delete = None;
@@ -362,7 +370,7 @@ impl App {
     #[cfg(test)]
     pub fn age_confirmation(&mut self) {
         if let Some(confirm) = self.confirm_delete.as_mut() {
-            confirm.opened -= DOUBLE_CLICK;
+            confirm.opened -= DEL_PAUSE;
         }
     }
 
@@ -805,7 +813,7 @@ impl App {
             KeyCode::Char('/') => self.run(Action::Search),
             KeyCode::Char('[') => self.preview_scroll += 3,
             KeyCode::Char(']') => self.preview_scroll = self.preview_scroll.saturating_sub(3),
-            KeyCode::Char('d') => self.run(Action::Delete),
+            KeyCode::Char('d') | KeyCode::Delete => self.run(Action::Delete),
             KeyCode::Char('R') => self.run(Action::Rename),
             KeyCode::Char('y') => self.run(Action::CopyId),
             KeyCode::Char('Y') => self.run(Action::CopyCommand),
@@ -832,7 +840,8 @@ impl App {
             KeyCode::Char('g') => self.run(Action::ToggleGroup),
             KeyCode::Char('s') => self.run(Action::NextSort),
             KeyCode::Char('r') => self.run(Action::ReverseSort),
-            KeyCode::Char('q') | KeyCode::Esc => self.run(Action::Quit),
+            KeyCode::Esc => self.status = Some("Press q to quit.".into()),
+            KeyCode::Char('q') => self.run(Action::Quit),
             _ => {}
         }
     }
