@@ -78,6 +78,8 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const DEL_PAUSE: Duration = Duration::from_secs(1);
 /// A resumed session takes a moment to register as open. Until then, block a second launch.
 const RESUME_COOLDOWN: Duration = Duration::from_secs(20);
+/// How long removing worktrees with unpushed commits stays locked, so the warning gets read.
+pub const UNPUSHED_COUNTDOWN: Duration = Duration::from_secs(5);
 const DELETE_REPORT: &str = " Delete finished ";
 const REOPEN_REPORT: &str = " Reopen finished ";
 const REMOVE_REPORT: &str = " Remove finished ";
@@ -112,6 +114,27 @@ pub struct ConfirmDelete {
 pub struct ConfirmRemove {
     pub plan: removal::Plan,
     opened: Instant,
+    /// Set when a worktree has unpushed commits. Confirming stays locked until then, and trying
+    /// early starts it over, so a held key or a quick double press can't get through.
+    unlocks: Option<Instant>,
+    /// Confirming was tried early at least once. Said in the popup, because a status message
+    /// would replace the footer's Remove button.
+    pub restarted: bool,
+}
+
+impl ConfirmRemove {
+    /// Whole seconds left before confirming works, or `None` once it does.
+    pub fn seconds_left(&self) -> Option<u64> {
+        let left = self.unlocks?.checked_duration_since(Instant::now())?;
+        (!left.is_zero()).then(|| left.as_millis().div_ceil(1000) as u64)
+    }
+
+    fn restart(&mut self) {
+        if self.unlocks.is_some() {
+            self.unlocks = Some(Instant::now() + UNPUSHED_COUNTDOWN);
+            self.restarted = true;
+        }
+    }
 }
 
 /// One row of the "reopen all" list.
@@ -299,6 +322,7 @@ impl App {
     pub fn can_press_delete(&self) -> bool {
         match self.view {
             View::Conversations => self.can_change() || !self.marked_shown().is_empty(),
+            View::Worktrees if self.confirm_remove.as_ref().is_some_and(|c| c.seconds_left().is_some()) => false,
             View::Worktrees => self.worktrees.selected().is_some() || !self.worktrees.marked_shown().is_empty(),
         }
     }
@@ -316,7 +340,8 @@ impl App {
             return;
         }
         self.dialog_scroll = 0;
-        self.confirm_remove = Some(ConfirmRemove { plan, opened: Instant::now() });
+        let unlocks = plan.items.iter().any(|i| i.unpushed > 0).then(|| Instant::now() + UNPUSHED_COUNTDOWN);
+        self.confirm_remove = Some(ConfirmRemove { plan, opened: Instant::now(), unlocks, restarted: false });
     }
 
     fn answer_remove(&mut self, key: KeyCode) {
@@ -324,6 +349,10 @@ impl App {
             return;
         }
         let Some(confirm) = self.confirm_remove.as_mut() else { return };
+        if matches!(key, KeyCode::Char('y') | KeyCode::Delete) && confirm.seconds_left().is_some() {
+            confirm.restart();
+            return;
+        }
         match key {
             KeyCode::Char('y') => self.confirm_removal(),
             KeyCode::Delete if confirm.opened.elapsed() < DEL_PAUSE => {
@@ -351,7 +380,10 @@ impl App {
         self.status = None;
         let outcome = remover(&plan, &self.sessions);
         let count = outcome.removed.len();
-        let summary = format!("Removed {count} worktree{}. Their branches are kept.", if count == 1 { "" } else { "s" });
+        let summary = match count {
+            1 => "Removed 1 worktree. Its branch is kept.".to_string(),
+            n => format!("Removed {n} worktrees. Their branches are kept."),
+        };
         let path = |p: &std::path::Path| sanitize(&p.display().to_string());
         let mut lines = Vec::new();
         for f in &outcome.failures {
@@ -377,6 +409,19 @@ impl App {
         if let Some(confirm) = self.confirm_remove.as_mut() {
             confirm.opened -= DEL_PAUSE;
         }
+    }
+
+    /// Lets a test act as if the countdown has run out.
+    #[cfg(test)]
+    pub fn end_countdown(&mut self) {
+        if let Some(confirm) = self.confirm_remove.as_mut() {
+            confirm.unlocks = confirm.unlocks.map(|_| Instant::now());
+        }
+    }
+
+    /// True while something on screen counts down, so it needs redrawing without input.
+    pub fn counting_down(&self) -> bool {
+        self.confirm_remove.as_ref().is_some_and(|c| c.unlocks.is_some_and(|t| t.elapsed() < Duration::from_secs(1)))
     }
 
     /// Recomputes the rows and keeps the selection on the same conversation where possible.
@@ -1086,9 +1131,13 @@ impl App {
             }
             return;
         }
-        if let Some(confirm) = &self.confirm_remove {
+        if let Some(confirm) = self.confirm_remove.as_mut() {
             let on_remove = self.hit.buttons.iter().any(|(r, a)| *a == Action::Delete && inside(r));
             if on_remove && confirm.opened.elapsed() < DOUBLE_CLICK {
+                return;
+            }
+            if on_remove && confirm.seconds_left().is_some() {
+                confirm.restart();
                 return;
             }
             if on_remove { self.confirm_removal() } else { self.cancel_removal() }

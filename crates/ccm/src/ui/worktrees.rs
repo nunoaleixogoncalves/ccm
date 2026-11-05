@@ -252,6 +252,14 @@ pub(super) fn remove_dialog(app: &App) -> Dialog {
     let warn = Style::new().fg(Color::Yellow);
     let count = plan.items.len();
     let mut top = vec![(format!("{count} worktree{} will be removed. Branches stay, so commits are kept.", if count == 1 { "" } else { "s" }), bold)];
+    let danger = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let ahead: Vec<&Planned> = plan.items.iter().filter(|i| i.unpushed > 0).collect();
+    if !ahead.is_empty() {
+        let commits: u64 = ahead.iter().map(|i| i.unpushed).sum();
+        let (of, have) = if count == 1 { ("It".to_string(), "has") } else { (format!("{} of these", ahead.len()), "have") };
+        let commits = plural(commits, "unpushed commit", "unpushed commits");
+        top.push((format!("Warning: {of} {have} {commits}. Branches keep them, but only on this machine."), danger));
+    }
     let ignored: u64 = plan.items.iter().map(|i| i.ignored_bytes).sum();
     if plan.items.iter().any(|i| !i.ignored.is_empty()) {
         let at_least = if plan.items.iter().any(|i| i.ignored_more) { "at least " } else { "" };
@@ -269,7 +277,13 @@ pub(super) fn remove_dialog(app: &App) -> Dialog {
     if body.last().is_some_and(|(l, _): &(String, Style)| l.is_empty()) {
         body.pop();
     }
-    let bottom = "y or Del remove   any other key cancels   or click Remove again".into();
+    let bottom = match confirm.seconds_left() {
+        Some(left) => {
+            let again = if confirm.restarted { "Too early, so it started over. " } else { "" };
+            format!("{again}Remove unlocks in {left}s. Pressing y, Del or Remove before then starts it over.   Any other key cancels.")
+        }
+        None => "y or Del remove   any other key cancels   or click Remove again".into(),
+    };
     Dialog { title: " Remove worktrees? ", top, body, bottom }
 }
 
@@ -277,6 +291,15 @@ fn item_lines(app: &App, item: &Planned, bold: Style, warn: Style, plain: Style)
     let path = sanitize(&short_path(&item.target.path.to_string_lossy(), &app.home));
     let branch = item.branch.as_deref().map_or("(detached)".to_string(), sanitize);
     let mut lines = vec![(format!("{path}  {branch}"), bold)];
+    let danger = Style::new().fg(Color::Red);
+    match (item.unpushed, item.has_remote) {
+        (0, _) => {}
+        (n, true) => lines.push((format!("  {} on no remote branch, as of the last fetch.", plural(n, "commit", "commits")), danger)),
+        (n, false) => lines.push((format!("  No remote, so {} only on this machine.", plural(n, "commit is", "commits are")), danger)),
+    }
+    if item.unpushed > 0 && item.upstream_gone {
+        lines.push(("  Its remote branch was deleted, which usually means it was merged. ccm can't check.".into(), plain));
+    }
     if item.gone {
         lines.push(("  Its folder is already gone. This only clears Git's record of it.".into(), plain));
     }
@@ -580,7 +603,7 @@ mod tests {
 
     type Calls = std::rc::Rc<std::cell::RefCell<Vec<Vec<std::path::PathBuf>>>>;
 
-    /// Planning refuses the api worktree and accepts the rest. Removal records what it was given.
+    /// Planning refuses the blog's worktree, whose state is unknown, and accepts the rest. Removal records what it was given.
     fn removable(a: &mut App, fail: bool) -> (Calls, Calls) {
         use ccm_core::removal::{Outcome, Plan, Refused};
         let (planned, removed): (Calls, Calls) = Default::default();
@@ -591,8 +614,8 @@ mod tests {
             p.borrow_mut().push(targets.iter().map(|t| t.path.clone()).collect());
             let mut plan = Plan::default();
             for t in targets {
-                if t.path.ends_with("shop-api") {
-                    plan.refused.push(Refused { path: t.path.clone(), reason: "it has 4 unpushed commits".into() });
+                if t.path.ends_with("blog-x") {
+                    plan.refused.push(Refused { path: t.path.clone(), reason: "Git couldn't read its state".into() });
                     continue;
                 }
                 let at = worktrees.iter().position(|w| w.path == t.path).unwrap();
@@ -604,6 +627,9 @@ mod tests {
                     ignored_bytes: if t.path.ends_with("shop-login") { 3 * 1024 * 1024 } else { 0 },
                     ignored_more: false,
                     links: links[at].clone(),
+                    unpushed: worktrees[at].state.map_or(0, |s| s.unpushed),
+                    has_remote: true,
+                    upstream_gone: t.path.ends_with("shop-merged"),
                 });
             }
             plan
@@ -622,9 +648,13 @@ mod tests {
 
     fn select(a: &mut App, name: &str) {
         a.on_key(KeyCode::Home);
-        while !a.worktrees.selected().unwrap().0.path.ends_with(name) {
+        for _ in 0..a.worktrees.rows.len() {
+            if a.worktrees.selected().unwrap().0.path.ends_with(name) {
+                return;
+            }
             a.on_key(KeyCode::Down);
         }
+        panic!("{name} isn't a row");
     }
 
     #[test]
@@ -660,7 +690,7 @@ mod tests {
         assert_eq!(a.status.as_deref(), Some("Removing…"));
         a.perform_delete();
         assert_eq!(removed.borrow().len(), 1);
-        assert_eq!(a.status.as_deref(), Some("Removed 1 worktree. Their branches are kept."));
+        assert_eq!(a.status.as_deref(), Some("Removed 1 worktree. Its branch is kept."));
         assert!(!render(&mut a, 140, 30).contains("~/shop-login"));
         assert!(a.worktree_request().is_some(), "it looks again straight away");
     }
@@ -687,16 +717,16 @@ mod tests {
     fn marks_pick_what_goes_and_refusals_are_listed() {
         let mut a = app();
         let (planned, _) = removable(&mut a, false);
-        select(&mut a, "shop-api");
+        select(&mut a, "blog-x");
         a.on_key(KeyCode::Char(' '));
-        assert!(a.worktrees.selected().unwrap().0.path.ends_with("shop-login"), "space moves on");
+        assert!(a.worktrees.selected().unwrap().0.path.ends_with("shop-api"), "space moves on");
         a.on_key(KeyCode::Char(' '));
         let screen = render(&mut a, 140, 40);
-        assert!(line(&screen, "ccm  worktrees").contains("2 marked") && line(&screen, "~/shop-api").contains("● "), "{screen}");
+        assert!(line(&screen, "ccm  worktrees").contains("2 marked") && line(&screen, "~/blog-x").contains("● "), "{screen}");
         a.on_key(KeyCode::Char('d'));
         assert_eq!(planned.borrow()[0].len(), 2);
         let screen = render(&mut a, 140, 40);
-        assert!(screen.contains("Skipping ~/shop-api: it has 4 unpushed commits"), "{screen}");
+        assert!(screen.contains("Skipping ~/blog-x: Git couldn't read its state"), "{screen}");
         a.on_key(KeyCode::Char('n'));
 
         a.on_key(KeyCode::Esc);
@@ -711,10 +741,10 @@ mod tests {
     fn when_everything_is_refused_it_says_why_without_a_popup() {
         let mut a = app();
         removable(&mut a, false);
-        select(&mut a, "shop-api");
+        select(&mut a, "blog-x");
         a.on_key(KeyCode::Char('d'));
         assert!(a.confirm_remove.is_none());
-        assert_eq!(a.status.as_deref(), Some("Can't remove: it has 4 unpushed commits."));
+        assert_eq!(a.status.as_deref(), Some("Can't remove: Git couldn't read its state."));
     }
 
     #[test]
@@ -755,6 +785,93 @@ mod tests {
         a.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
         a.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 2);
         assert!(a.confirm_remove.is_none() && removed.borrow().len() == 1);
+    }
+
+    #[test]
+    fn unpushed_commits_warn_and_lock_confirming_while_a_countdown_runs() {
+        let mut a = app();
+        let (_, removed) = removable(&mut a, false);
+        select(&mut a, "shop-api");
+        a.on_key(KeyCode::Char('d'));
+        let screen = render(&mut a, 140, 40);
+        for text in [
+            "Warning: It has 4 unpushed commits. Branches keep them, but only on this machine.",
+            "  4 commits on no remote branch, as of the last fetch.",
+            "Remove unlocks in 5s. Pressing y, Del or Remove before then starts it over.",
+        ] {
+            assert!(screen.contains(text), "{text} missing:\n{screen}");
+        }
+        assert!(!a.can_press_delete(), "the Remove button is dimmed");
+        for key in [KeyCode::Char('y'), KeyCode::Delete, KeyCode::Char('y')] {
+            a.age_removal();
+            a.on_key(key);
+            assert!(a.confirm_remove.is_some() && !a.has_pending_delete(), "{key:?} got through the countdown");
+        }
+        assert!(render(&mut a, 140, 40).contains("Too early, so it started over. Remove unlocks in 5s."));
+
+        a.end_countdown();
+        assert!(render(&mut a, 140, 40).contains("y or Del remove"));
+        a.on_key(KeyCode::Char('y'));
+        a.perform_delete();
+        assert_eq!(removed.borrow().len(), 1);
+    }
+
+    #[test]
+    fn during_the_countdown_any_other_key_still_cancels() {
+        let mut a = app();
+        let (_, removed) = removable(&mut a, false);
+        select(&mut a, "shop-api");
+        a.on_key(KeyCode::Char('d'));
+        a.on_key(KeyCode::Down);
+        assert!(a.confirm_remove.is_some(), "scrolling isn't an answer");
+        a.on_key(KeyCode::Char('n'));
+        assert!(a.confirm_remove.is_none() && removed.borrow().is_empty());
+    }
+
+    #[test]
+    fn clicking_remove_during_the_countdown_starts_it_over_and_clicking_elsewhere_cancels() {
+        let mut a = app();
+        let (_, removed) = removable(&mut a, false);
+        select(&mut a, "shop-api");
+        let screen = render(&mut a, 140, 30);
+        let y = screen.lines().position(|l| l.contains("d Remove")).unwrap() as u16;
+        let x = line(&screen, "d Remove").find("d Remove").unwrap() as u16 + 1;
+        a.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        render(&mut a, 140, 30);
+        a.age_removal();
+        a.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(a.confirm_remove.as_ref().is_some_and(|c| c.restarted) && !a.has_pending_delete());
+        a.end_countdown();
+        render(&mut a, 140, 30);
+        a.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        a.perform_delete();
+        assert_eq!(removed.borrow().len(), 1);
+
+        select(&mut a, "shop-old");
+        render(&mut a, 140, 30);
+        a.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        a.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 2);
+        assert!(a.confirm_remove.is_none() && removed.borrow().len() == 1);
+    }
+
+    #[test]
+    fn a_deleted_remote_branch_is_explained_and_no_countdown_without_unpushed_commits() {
+        let mut a = app();
+        removable(&mut a, false);
+        let scan = a.worktrees.scan.clone().unwrap();
+        let mut worktrees = scan.worktrees.clone();
+        worktrees.push(worktree("/home/me/shop-merged", "/home/me/shop", Some("merged"), state(0, 1)));
+        a.finish_worktree_scan(Scan { worktrees, ..scan });
+        removable(&mut a, false);
+        select(&mut a, "shop-merged");
+        a.on_key(KeyCode::Char('d'));
+        let screen = render(&mut a, 140, 40);
+        assert!(screen.contains("usually means it was merged") && screen.contains("Remove unlocks in"), "{screen}");
+        a.on_key(KeyCode::Esc);
+        select(&mut a, "shop-login");
+        a.on_key(KeyCode::Char('d'));
+        assert!(a.confirm_remove.as_ref().unwrap().seconds_left().is_none());
+        assert!(!render(&mut a, 140, 40).contains("Warning:"));
     }
 
     #[test]

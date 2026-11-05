@@ -472,9 +472,10 @@ mod tests {
         let out = dir.path().join("ids");
         let script = dir.path().join("s.sh");
         // A new session makes it the leader of a new process group. `sid` isn't in macOS's `ps`.
-        std::fs::write(&script, format!("#!/bin/sh\necho $$ $(ps -o pgid= -p $$) > '{}'\n", out.display())).unwrap();
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        let l = Launch { program: script.display().to_string(), args: vec![], cwd: dir.path().into(), long_running: false };
+        std::fs::write(&script, format!("echo $$ $(ps -o pgid= -p $$) > '{}'\n", out.display())).unwrap();
+        // Run through `sh`, because executing a file just written can fail with "text file busy"
+        // while another test's fork still holds it open.
+        let l = Launch { program: "sh".into(), args: vec![script.display().to_string()], cwd: dir.path().into(), long_running: false };
         start(&l).unwrap();
         let ids = std::fs::read_to_string(&out).unwrap();
         let (pid, group) = ids.trim().split_once(' ').unwrap();
