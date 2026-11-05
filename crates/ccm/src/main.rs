@@ -33,7 +33,8 @@ const RESIZE_EVERY: u32 = 30;
 const PROC: &str = "/proc";
 
 const USAGE: &str = "Usage: ccm          browse your conversations
-       ccm setup    install the hooks crash recovery needs, after showing the changes";
+       ccm setup    install the hooks crash recovery needs, after showing the changes
+       ccm --version";
 
 fn main() -> Result<()> {
     let paths = Paths::from_env().ok_or_else(|| anyhow!("HOME is not set"))?;
@@ -47,6 +48,10 @@ fn main() -> Result<()> {
         }
         ["hook", "status-line"] => {
             run_hook(|input| recovery::record_status_line(&paths, input));
+            Ok(())
+        }
+        ["--version" | "-V"] => {
+            println!("ccm {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         ["--help" | "-h"] => {
