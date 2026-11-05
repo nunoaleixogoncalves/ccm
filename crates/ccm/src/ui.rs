@@ -101,6 +101,8 @@ fn draw_dialog(f: &mut Frame, app: &mut App) {
         Dialog { title: app.report_title, top: Vec::new(), body, bottom: "Press any other key to close.".into() }
     } else if app.confirm_delete.is_some() {
         delete_dialog(app)
+    } else if app.confirm_remove.is_some() {
+        worktrees::remove_dialog(app)
     } else if app.reopen.is_some() {
         reopen_dialog(app)
     } else {
@@ -113,7 +115,7 @@ fn draw_dialog(f: &mut Frame, app: &mut App) {
     let wrapped = |lines: &[(String, Style)]| -> Vec<Line<'static>> {
         lines
             .iter()
-            .flat_map(|(text, style)| wrap(text, inner_width).into_iter().map(|l| Line::from(Span::styled(l, *style))).collect::<Vec<_>>())
+            .flat_map(|(text, style)| wrap_indented(text, inner_width).into_iter().map(|l| Line::from(Span::styled(l, *style))).collect::<Vec<_>>())
             .collect()
     };
     let top = wrapped(&dialog.top);
@@ -529,12 +531,26 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Wraps a dialog line, keeping its leading spaces on every line it becomes, so nested lines
+/// stay under their heading. At most half the width is kept as indent.
+fn wrap_indented(text: &str, width: usize) -> Vec<String> {
+    let indent = (text.len() - text.trim_start_matches(' ').len()).min(width / 2);
+    let pad = " ".repeat(indent);
+    wrap(text.trim_start_matches(' '), width.saturating_sub(indent)).into_iter().map(|l| format!("{pad}{l}")).collect()
+}
+
 /// Every button, in priority order, since the last ones drop off a narrow terminal.
 type Button = (&'static str, &'static str, Action, bool);
 
 fn footer_groups(app: &App) -> [(&'static str, Vec<Button>); 2] {
     if app.view == View::Worktrees {
-        return [("Actions", vec![("q", "Quit", Action::Quit, false)]), ("View", vec![("w", "Conversations", Action::Worktrees, false)])];
+        let actions = vec![
+            ("d", "Remove", Action::Delete, app.confirm_remove.is_some()),
+            ("Space", "Mark", Action::Mark, false),
+            ("a", "All", Action::MarkAll, false),
+            ("q", "Quit", Action::Quit, false),
+        ];
+        return [("Actions", actions), ("View", vec![("w", "Conversations", Action::Worktrees, false)])];
     }
     [
         (
@@ -647,7 +663,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
         let disabled = match action {
             Action::Resume => !app.can_resume(),
             Action::Rename => !app.can_change(),
-            Action::Delete => !app.can_change() && app.marked_shown().is_empty(),
+            Action::Delete => !app.can_press_delete(),
             _ => false,
         };
         let solid = |background| Style::new().fg(BAR).bg(background).add_modifier(Modifier::BOLD);
@@ -1325,6 +1341,13 @@ mod tests {
         assert_eq!(wrap("a\n\nb", 5), ["a", "", "b"]);
         assert_eq!(wrap("abcdefgh", 3), ["abc", "def", "gh"]);
         assert_eq!(wrap("日本語", 4), ["日本", "語"]);
+    }
+
+    #[test]
+    fn dialog_lines_keep_their_indent_when_wrapped() {
+        assert_eq!(wrap_indented("  one two three", 9), ["  one two", "  three"]);
+        assert_eq!(wrap_indented("plain", 9), ["plain"]);
+        assert_eq!(wrap_indented("        deep", 6), ["   dee", "   p"], "indent is capped at half the width");
     }
 
     /// Records resumes instead of starting anything.

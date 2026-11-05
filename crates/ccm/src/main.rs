@@ -17,6 +17,7 @@ use ccm_core::index::{Index, Searcher};
 use ccm_core::model::Session;
 use ccm_core::paths::Paths;
 use ccm_core::recovery;
+use ccm_core::removal;
 use ccm_core::rename;
 use ccm_core::resume::{self, Launch};
 use ccm_core::setup;
@@ -130,6 +131,10 @@ fn browse(paths: Paths) -> Result<()> {
     app.copier = Some(Box::new(clipboard::copy));
     let dismiss_paths = paths.clone();
     app.dismisser = Some(Box::new(move |ids| recovery::dismiss(&dismiss_paths, ids, now_ms()).map_err(|e| e.to_string())));
+    let remove_plan_paths = paths.clone();
+    app.remove_planner = Some(Box::new(move |targets, sessions| removal::plan(&remove_plan_paths, Path::new(PROC), targets, sessions)));
+    let remove_paths = paths.clone();
+    app.remover = Some(Box::new(move |plan, sessions| removal::execute(&remove_paths, Path::new(PROC), plan, sessions)));
     app.set_sessions(cached);
 
     let updates = spawn_refresher(catalog);
