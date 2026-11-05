@@ -48,6 +48,24 @@ pub fn has_unreadable_entry(sessions_dir: &Path, proc_root: &Path) -> bool {
     })
 }
 
+/// The text of the background jobs still running, to search for a session ID. The roster file
+/// stays behind when its jobs die, so a job only counts if its process is alive. Anything that
+/// can't be understood is kept, because a wrong "running" only blocks a delete.
+pub fn live_roster(roster_file: &Path, proc_root: &Path) -> String {
+    let text = std::fs::read_to_string(roster_file).unwrap_or_default();
+    let Some(workers) = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|r| r.get("workers")?.as_object().cloned()) else {
+        return text;
+    };
+    let mut live = String::new();
+    for (key, worker) in workers {
+        let dead = serde_json::from_value::<Entry>(worker.clone()).is_ok_and(|e| !is_live(&e, proc_root));
+        if !dead {
+            live.push_str(&format!("{key} {worker}\n"));
+        }
+    }
+    live
+}
+
 fn is_running(pid: u32, proc_root: &Path) -> bool {
     if cfg!(any(target_os = "linux", test)) {
         return proc_root.join(pid.to_string()).exists();
@@ -133,6 +151,45 @@ mod tests {
 
     fn entry(pid: u32, proc_start: Option<&str>) -> Entry {
         Entry { pid, session_id: "s".into(), proc_start: proc_start.map(str::to_owned) }
+    }
+
+    fn roster(f: &Fake, body: &str) -> String {
+        let file = f.sessions.join("roster.json");
+        fs::write(&file, body).unwrap();
+        live_roster(&file, &f.proc)
+    }
+
+    #[test]
+    fn a_roster_keeps_only_jobs_whose_process_is_alive() {
+        let f = fake();
+        process(&f, 10, "100", "claude");
+        process(&f, 11, "999", "claude");
+        let live = roster(
+            &f,
+            r#"{"workers":{
+                "aaaaaaaa":{"pid":10,"procStart":"100","sessionId":"aaaaaaaa-1"},
+                "bbbbbbbb":{"pid":11,"procStart":"100","sessionId":"bbbbbbbb-1","dispatch":"cccccccc-1"},
+                "dddddddd":{"pid":12,"procStart":"100","sessionId":"dddddddd-1"}
+            }}"#,
+        );
+        assert!(live.contains("aaaaaaaa"), "alive");
+        assert!(!live.contains("bbbbbbbb"), "the PID was reused");
+        assert!(!live.contains("cccccccc"), "only mentioned by a job that's gone");
+        assert!(!live.contains("dddddddd"), "the process is gone");
+    }
+
+    #[test]
+    fn a_roster_that_cannot_be_understood_counts_as_running() {
+        let f = fake();
+        assert!(roster(&f, "not json aaaaaaaa").contains("aaaaaaaa"));
+        assert!(roster(&f, r#"{"jobs":["aaaaaaaa"]}"#).contains("aaaaaaaa"));
+        assert!(roster(&f, r#"{"workers":{"aaaaaaaa":{"pid":"unknown"}}}"#).contains("aaaaaaaa"));
+    }
+
+    #[test]
+    fn a_missing_roster_means_no_jobs() {
+        let f = fake();
+        assert!(live_roster(&f.sessions.join("none.json"), &f.proc).is_empty());
     }
 
     fn lstart_of(pid: u32) -> String {
