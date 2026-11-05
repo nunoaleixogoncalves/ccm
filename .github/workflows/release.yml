@@ -1,0 +1,77 @@
+# Publishes a release when a version tag is pushed. A pull request that changes this file only
+# builds, so the builds can be tried without publishing anything.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths: ['.github/workflows/release.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-15-intel }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+        if: runner.os == 'Linux'
+      - run: rustup update stable && rustup default stable && rustup target add "$TARGET"
+      - run: cargo test --locked --workspace --no-fail-fast --target "$TARGET"
+      - run: cargo build --release --locked -p ccm --target "$TARGET"
+      - name: Check the program runs and is the tagged version
+        run: |
+          version="$("target/$TARGET/release/ccm" --version)"
+          echo "$version"
+          case "$GITHUB_REF" in
+            refs/tags/v*) test "$version" = "ccm ${GITHUB_REF_NAME#v}" ;;
+          esac
+      - name: Check the Linux build is static
+        if: runner.os == 'Linux'
+        run: file "target/$TARGET/release/ccm" | grep -E 'static(-pie|ally) linked'
+      - name: Package
+        run: |
+          mkdir dist
+          tar -czf "dist/ccm-$TARGET.tar.gz" -C "target/$TARGET/release" ccm
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "ccm-$TARGET.tar.gz" > "ccm-$TARGET.tar.gz.sha256"
+          else
+            shasum -a 256 "ccm-$TARGET.tar.gz" > "ccm-$TARGET.tar.gz.sha256"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ccm-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

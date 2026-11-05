@@ -29,12 +29,21 @@ If you run a lot of Claude Code sessions, they pile up:
 
 ## Install
 
-You need:
+You need [Claude Code](https://claude.com/claude-code). On Linux or macOS, run:
 
-- [Claude Code](https://claude.com/claude-code)
-- Git
-- [Rust](https://rustup.rs), current stable
-- A C compiler, to build the bundled SQLite
+```sh
+curl -fsSL https://raw.githubusercontent.com/nunoaleixogoncalves/ccm/main/install.sh | sh
+```
+
+This downloads the ready-made program for your system from the [latest release](https://github.com/nunoaleixogoncalves/ccm/releases/latest), checks its checksum and puts it in `~/.local/bin`. To use another folder, set `CCM_INSTALL_DIR`. The script tells you if that folder isn't on your `PATH`. You can [read the script](install.sh) first, or download the program from the releases page yourself.
+
+It then runs `ccm setup`, which shows the changes it would make to Claude Code's settings and applies them only if you answer `y`. Those changes are only needed for crash recovery and exact context window sizes. Everything else works without them.
+
+The Linux programs are static, so they work on any distribution. The macOS ones aren't signed: installing with the command above is fine, but macOS may refuse one you download with a browser until you allow it in **System Settings → Privacy & Security**.
+
+### Build from source
+
+You need Git, [Rust](https://rustup.rs) (current stable) and a C compiler to build the bundled SQLite. Open a new terminal after installing Rust, so `cargo` is found.
 
 | System | C compiler |
 |---|---|
@@ -43,17 +52,11 @@ You need:
 | Debian, Ubuntu | `sudo apt install build-essential` |
 | Fedora | `sudo dnf install gcc` |
 
-Then run:
-
 ```sh
 git clone https://github.com/nunoaleixogoncalves/ccm.git
 cd ccm
 ./install.sh
 ```
-
-This puts `ccm` in `~/.local/bin`. To use another folder, set `CCM_INSTALL_DIR`. The script tells you if that folder isn't on your `PATH`.
-
-It then runs `ccm setup`, which shows the changes it would make to Claude Code's settings and applies them only if you answer `y`. Those changes are only needed for crash recovery and exact context window sizes. Everything else works without them.
 
 If you use mise, install with this script and not `cargo install`. `cargo install` puts `ccm` where mise creates a shim that fails outside this repository.
 
@@ -66,7 +69,9 @@ If you use mise, install with this script and not `cargo install`. `cargo instal
 
 ## Update
 
-From the repository folder:
+Run the install command again. `ccm --version` shows which version you have.
+
+If you built from source, run this from the repository folder instead:
 
 ```sh
 git pull
@@ -82,6 +87,7 @@ Run `ccm` from anywhere.
 | `ccm` | Opens the list |
 | `ccm setup` | Installs the hooks crash recovery needs, after showing the changes |
 | `ccm --help` | Shows the commands |
+| `ccm --version` | Shows the version |
 
 `ccm hook` and `ccm hook status-line` are also there, but Claude Code runs those. You won't need to.
 
