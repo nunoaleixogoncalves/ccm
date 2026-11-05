@@ -16,3 +16,4 @@ pub mod resume;
 pub mod setup;
 pub mod transcript;
 pub mod window;
+pub mod worktree;
