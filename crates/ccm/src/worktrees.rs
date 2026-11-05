@@ -1,9 +1,11 @@
 //! What the worktree view shows. Git runs on another thread, so this only holds results.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ccm_core::model::Session;
+use ccm_core::removal::Target;
 use ccm_core::worktree::{connect, Link, Scan, Worktree};
 use ratatui::widgets::TableState;
 
@@ -30,6 +32,8 @@ pub struct Worktrees {
     pub scanning: bool,
     last_scan: Option<Instant>,
     selected_path: Option<PathBuf>,
+    /// Worktrees picked for a removal, which otherwise acts on the selected one.
+    pub marked: HashSet<PathBuf>,
 }
 
 impl Worktrees {
@@ -50,8 +54,56 @@ impl Worktrees {
     pub fn finish(&mut self, scan: Scan, sessions: &[Session]) {
         self.scanning = false;
         self.last_scan = Some(Instant::now());
+        let present: HashSet<&Path> = scan.worktrees.iter().filter(|w| w.is_linked()).map(|w| w.path.as_path()).collect();
+        self.marked.retain(|p| present.contains(p.as_path()));
         self.scan = Some(scan);
         self.relink(sessions);
+    }
+
+    /// Drops removed worktrees at once, rather than waiting for the next scan.
+    pub fn forget(&mut self, removed: &[PathBuf], sessions: &[Session]) {
+        if let Some(scan) = self.scan.as_mut() {
+            scan.worktrees.retain(|w| !removed.contains(&w.path));
+        }
+        self.marked.retain(|p| !removed.contains(p));
+        self.relink(sessions);
+        self.refresh_soon();
+    }
+
+    fn shown(&self) -> impl Iterator<Item = &Worktree> {
+        self.rows.iter().filter_map(|r| match r {
+            Row::Item(i) => self.worktrees().get(*i),
+            Row::Header { .. } => None,
+        })
+    }
+
+    pub fn marked_shown(&self) -> Vec<&Worktree> {
+        self.shown().filter(|w| self.marked.contains(&w.path)).collect()
+    }
+
+    pub fn toggle_mark(&mut self) {
+        let Some(path) = self.selected().map(|(w, _)| w.path.clone()) else { return };
+        if !self.marked.remove(&path) {
+            self.marked.insert(path);
+        }
+        self.move_selection(1);
+    }
+
+    /// Marks every row, or clears the marks if they're all set already.
+    pub fn mark_all(&mut self) {
+        let shown: Vec<PathBuf> = self.shown().map(|w| w.path.clone()).collect();
+        if shown.iter().all(|p| self.marked.contains(p)) {
+            self.marked.clear();
+        } else {
+            self.marked.extend(shown);
+        }
+    }
+
+    /// The marked worktrees, or the selected one when none are marked.
+    pub fn targets(&self) -> Vec<Target> {
+        let marked = self.marked_shown();
+        let picked: Vec<&Worktree> = if marked.is_empty() { self.selected().map(|(w, _)| w).into_iter().collect() } else { marked };
+        picked.into_iter().map(|w| Target { path: w.path.clone(), repo: w.repo.clone() }).collect()
     }
 
     /// Connections follow the conversations, which change far more often than worktrees.

@@ -1,7 +1,8 @@
 //! The worktree view. It's laid out like the conversation list, with the conversations that
 //! worked in the selected worktree where the preview would be.
 
-use ccm_core::format::{ago, sanitize};
+use ccm_core::format::{ago, bytes, sanitize};
+use ccm_core::removal::{Planned, NAMED_IGNORED};
 use ccm_core::model::Session;
 use ccm_core::worktree::{Link, State, Worktree};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -10,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use super::{display_name, draw_dialog, draw_footer, fit_end, fit_start, footer_rows, header_only_lines, short_path, COLUMN_SPACING, MIN_HEIGHT_FOR_PREVIEW};
+use super::{display_name, draw_dialog, Dialog, draw_footer, fit_end, fit_start, footer_rows, header_only_lines, short_path, COLUMN_SPACING, MIN_HEIGHT_FOR_PREVIEW};
 use crate::app::App;
 use crate::worktrees::Row as ListRow;
 
@@ -79,6 +80,10 @@ fn summary_line(app: &App) -> Line<'static> {
     if unpushed > 0 {
         text.push_str(&format!("  {unpushed} with unpushed commits"));
     }
+    let marked = w.marked_shown().len();
+    if marked > 0 {
+        text.push_str(&format!("  {marked} marked"));
+    }
     if w.scanning {
         text.push_str("  checking…");
     }
@@ -112,6 +117,9 @@ fn status(app: &App, w: &Worktree, links: &[Link]) -> &'static str {
 fn cell_text(app: &App, field: Field, w: &Worktree, links: &[Link], width: usize) -> String {
     let unknown = if w.prunable { "-" } else { "?" };
     match field {
+        Field::Folder if app.worktrees.marked.contains(&w.path) => {
+            format!("● {}", fit_start(&sanitize(&short_path(&w.path.to_string_lossy(), &app.home)), width.saturating_sub(2)))
+        }
         Field::Folder => fit_start(&sanitize(&short_path(&w.path.to_string_lossy(), &app.home)), width),
         Field::Branch => fit_end(&w.branch.as_deref().map_or("(detached)".to_string(), sanitize), width),
         Field::Changes => match w.state {
@@ -158,6 +166,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
                 let w = &wt.worktrees()[*i];
                 let links = wt.links.get(*i).map_or(&[][..], Vec::as_slice);
                 let style = match status(app, w, links) {
+                    _ if wt.marked.contains(&w.path) => Style::new().fg(Color::Yellow),
                     "missing" => Style::new().fg(Color::DarkGray),
                     "open" => Style::new().fg(Color::Green),
                     _ => Style::new(),
@@ -231,6 +240,70 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         text.push(Line::from("Locked in Git, so Git won't remove it until it's unlocked."));
     }
     f.render_widget(Paragraph::new(text).block(block), area);
+}
+
+/// The removal popup. Each worktree says what goes with it and which conversations worked there,
+/// so nothing about it is a surprise.
+pub(super) fn remove_dialog(app: &App) -> Dialog {
+    let confirm = app.confirm_remove.as_ref().expect("checked by the caller");
+    let plan = &confirm.plan;
+    let plain = Style::new();
+    let bold = plain.add_modifier(Modifier::BOLD);
+    let warn = Style::new().fg(Color::Yellow);
+    let count = plan.items.len();
+    let mut top = vec![(format!("{count} worktree{} will be removed. Branches stay, so commits are kept.", if count == 1 { "" } else { "s" }), bold)];
+    let ignored: u64 = plan.items.iter().map(|i| i.ignored_bytes).sum();
+    if plan.items.iter().any(|i| !i.ignored.is_empty()) {
+        let at_least = if plan.items.iter().any(|i| i.ignored_more) { "at least " } else { "" };
+        top.push((format!("Files Git ignores go too, {at_least}{}. This can't be undone.", bytes(ignored)), warn.add_modifier(Modifier::BOLD)));
+    }
+
+    let mut body = Vec::new();
+    for item in &plan.items {
+        body.extend(item_lines(app, item, bold, warn, plain));
+    }
+    body.extend(plan.refused.iter().map(|r| {
+        let path = sanitize(&short_path(&r.path.to_string_lossy(), &app.home));
+        (format!("Skipping {path}: {}", sanitize(&r.reason)), plain)
+    }));
+    if body.last().is_some_and(|(l, _): &(String, Style)| l.is_empty()) {
+        body.pop();
+    }
+    let bottom = "y or Del remove   any other key cancels   or click Remove again".into();
+    Dialog { title: " Remove worktrees? ", top, body, bottom }
+}
+
+fn item_lines(app: &App, item: &Planned, bold: Style, warn: Style, plain: Style) -> Vec<(String, Style)> {
+    let path = sanitize(&short_path(&item.target.path.to_string_lossy(), &app.home));
+    let branch = item.branch.as_deref().map_or("(detached)".to_string(), sanitize);
+    let mut lines = vec![(format!("{path}  {branch}"), bold)];
+    if item.gone {
+        lines.push(("  Its folder is already gone. This only clears Git's record of it.".into(), plain));
+    }
+    if !item.ignored.is_empty() {
+        let at_least = if item.ignored_more { "at least " } else { "" };
+        let mut names: Vec<String> = item.ignored.iter().take(NAMED_IGNORED).map(|n| sanitize(n)).collect();
+        if item.ignored.len() > NAMED_IGNORED {
+            names.push(format!("and {} more", item.ignored.len() - NAMED_IGNORED));
+        }
+        lines.push((format!("  Deletes ignored files, {at_least}{}: {}", bytes(item.ignored_bytes), names.join(", ")), warn));
+    }
+    match item.links.len() {
+        0 => {}
+        1 => lines.push(("  1 conversation worked here:".into(), plain)),
+        n => lines.push((format!("  {n} conversations worked here:"), warn)),
+    }
+    let mut links: Vec<&Link> = item.links.iter().collect();
+    links.sort_by_key(|l| std::cmp::Reverse(l.last_ms));
+    for l in links {
+        let name = session(app, &l.id).map_or(l.id.clone(), |s| sanitize(&display_name(s)));
+        lines.push((format!("    {name}  ({} of its activity)", share(l)), plain));
+        if l.started_here {
+            lines.push(("      It started here, so resuming it later recreates this folder empty.".into(), plain));
+        }
+    }
+    lines.push((String::new(), plain));
+    lines
 }
 
 /// How much of a conversation happened here, which tells working here from passing through.
@@ -440,10 +513,13 @@ mod tests {
     #[test]
     fn w_and_esc_go_back_and_nothing_else_reaches_the_conversations() {
         let mut a = app();
-        for key in ['d', 'R', ' ', 'a', '/', 'J'] {
+        for key in ['R', '/', 'J', 'o', 'g', 'y'] {
             a.on_key(KeyCode::Char(key));
         }
-        assert!(a.confirm_delete.is_none() && a.renaming.is_none() && a.marked.is_empty() && !a.typing && !a.filters.junk);
+        assert!(a.renaming.is_none() && !a.typing && !a.filters.junk && !a.filters.open && !a.grouped && a.status.is_none());
+        a.on_key(KeyCode::Char('a'));
+        assert!(a.marked.is_empty() && !a.worktrees.marked.is_empty(), "marks go on worktrees here, not conversations");
+        a.on_key(KeyCode::Esc);
         a.on_key(KeyCode::Esc);
         assert_eq!(a.view, View::Conversations);
         assert!(!a.quit);
@@ -500,6 +576,185 @@ mod tests {
         assert!(render(&mut a, 100, 20).contains("No worktrees found"));
         a.finish_worktree_scan(Scan { errors: vec!["Git wasn't found, so worktrees can't be listed.".into()], ..Scan::default() });
         assert!(render(&mut a, 100, 20).contains("Git wasn't found"));
+    }
+
+    type Calls = std::rc::Rc<std::cell::RefCell<Vec<Vec<std::path::PathBuf>>>>;
+
+    /// Planning refuses the api worktree and accepts the rest. Removal records what it was given.
+    fn removable(a: &mut App, fail: bool) -> (Calls, Calls) {
+        use ccm_core::removal::{Outcome, Plan, Refused};
+        let (planned, removed): (Calls, Calls) = Default::default();
+        let (p, r) = (planned.clone(), removed.clone());
+        let links = a.worktrees.links.clone();
+        let worktrees = a.worktrees.worktrees().to_vec();
+        a.remove_planner = Some(Box::new(move |targets, _| {
+            p.borrow_mut().push(targets.iter().map(|t| t.path.clone()).collect());
+            let mut plan = Plan::default();
+            for t in targets {
+                if t.path.ends_with("shop-api") {
+                    plan.refused.push(Refused { path: t.path.clone(), reason: "it has 4 unpushed commits".into() });
+                    continue;
+                }
+                let at = worktrees.iter().position(|w| w.path == t.path).unwrap();
+                plan.items.push(Planned {
+                    target: t.clone(),
+                    branch: worktrees[at].branch.clone(),
+                    gone: worktrees[at].prunable,
+                    ignored: if t.path.ends_with("shop-login") { vec![".env".into(), "node_modules/".into()] } else { Vec::new() },
+                    ignored_bytes: if t.path.ends_with("shop-login") { 3 * 1024 * 1024 } else { 0 },
+                    ignored_more: false,
+                    links: links[at].clone(),
+                });
+            }
+            plan
+        }));
+        a.remover = Some(Box::new(move |plan, _| {
+            let paths: Vec<std::path::PathBuf> = plan.items.iter().map(|i| i.target.path.clone()).collect();
+            r.borrow_mut().push(paths.clone());
+            if fail {
+                Outcome { failures: paths.into_iter().map(|path| Refused { path, reason: "Git refused: no".into() }).collect(), ..Outcome::default() }
+            } else {
+                Outcome { removed: paths, ..Outcome::default() }
+            }
+        }));
+        (planned, removed)
+    }
+
+    fn select(a: &mut App, name: &str) {
+        a.on_key(KeyCode::Home);
+        while !a.worktrees.selected().unwrap().0.path.ends_with(name) {
+            a.on_key(KeyCode::Down);
+        }
+    }
+
+    #[test]
+    fn the_popup_says_what_goes_and_which_conversations_worked_there() {
+        let mut a = app();
+        removable(&mut a, false);
+        select(&mut a, "shop-login");
+        a.on_key(KeyCode::Char('d'));
+        let screen = render(&mut a, 140, 40);
+        for text in [
+            "Remove worktrees?",
+            "1 worktree will be removed. Branches stay, so commits are kept.",
+            "Files Git ignores go too, 3M. This can't be undone.",
+            "~/shop-login  login-fix",
+            "Deletes ignored files, 3M: .env, node_modules/",
+            "2 conversations worked here:",
+            "Coordinator  (5% of its activity)",
+            "Login fix  (100% of its activity)",
+            "resuming it later recreates this folder empty",
+            "y or Del remove",
+        ] {
+            assert!(screen.contains(text), "{text} missing:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn y_removes_and_the_row_goes() {
+        let mut a = app();
+        let (_, removed) = removable(&mut a, false);
+        select(&mut a, "shop-login");
+        a.on_key(KeyCode::Char('d'));
+        a.on_key(KeyCode::Char('y'));
+        assert_eq!(a.status.as_deref(), Some("Removing…"));
+        a.perform_delete();
+        assert_eq!(removed.borrow().len(), 1);
+        assert_eq!(a.status.as_deref(), Some("Removed 1 worktree. Their branches are kept."));
+        assert!(!render(&mut a, 140, 30).contains("~/shop-login"));
+        assert!(a.worktree_request().is_some(), "it looks again straight away");
+    }
+
+    #[test]
+    fn any_other_key_cancels_and_a_quick_second_del_waits() {
+        let mut a = app();
+        let (_, removed) = removable(&mut a, false);
+        select(&mut a, "shop-login");
+        a.on_key(KeyCode::Delete);
+        a.on_key(KeyCode::Char('x'));
+        assert!(a.confirm_remove.is_none());
+        assert_eq!(a.status.as_deref(), Some("Cancelled. Nothing was removed."));
+        a.on_key(KeyCode::Delete);
+        a.on_key(KeyCode::Delete);
+        assert!(a.confirm_remove.is_some() && !a.has_pending_delete(), "held Del");
+        a.age_removal();
+        a.on_key(KeyCode::Delete);
+        a.perform_delete();
+        assert_eq!(removed.borrow().len(), 1);
+    }
+
+    #[test]
+    fn marks_pick_what_goes_and_refusals_are_listed() {
+        let mut a = app();
+        let (planned, _) = removable(&mut a, false);
+        select(&mut a, "shop-api");
+        a.on_key(KeyCode::Char(' '));
+        assert!(a.worktrees.selected().unwrap().0.path.ends_with("shop-login"), "space moves on");
+        a.on_key(KeyCode::Char(' '));
+        let screen = render(&mut a, 140, 40);
+        assert!(line(&screen, "ccm  worktrees").contains("2 marked") && line(&screen, "~/shop-api").contains("● "), "{screen}");
+        a.on_key(KeyCode::Char('d'));
+        assert_eq!(planned.borrow()[0].len(), 2);
+        let screen = render(&mut a, 140, 40);
+        assert!(screen.contains("Skipping ~/shop-api: it has 4 unpushed commits"), "{screen}");
+        a.on_key(KeyCode::Char('n'));
+
+        a.on_key(KeyCode::Esc);
+        assert!(a.worktrees.marked.is_empty() && a.view == View::Worktrees, "Esc clears the marks first");
+        a.on_key(KeyCode::Char('a'));
+        assert_eq!(a.worktrees.marked.len(), 4);
+        a.on_key(KeyCode::Char('a'));
+        assert!(a.worktrees.marked.is_empty());
+    }
+
+    #[test]
+    fn when_everything_is_refused_it_says_why_without_a_popup() {
+        let mut a = app();
+        removable(&mut a, false);
+        select(&mut a, "shop-api");
+        a.on_key(KeyCode::Char('d'));
+        assert!(a.confirm_remove.is_none());
+        assert_eq!(a.status.as_deref(), Some("Can't remove: it has 4 unpushed commits."));
+    }
+
+    #[test]
+    fn a_failure_is_reported_until_a_key_is_pressed() {
+        let mut a = app();
+        removable(&mut a, true);
+        select(&mut a, "shop-login");
+        a.on_key(KeyCode::Char('d'));
+        a.on_key(KeyCode::Char('y'));
+        a.perform_delete();
+        let screen = render(&mut a, 140, 30);
+        assert!(screen.contains("Remove finished") && screen.contains("Removed 0 worktrees") && screen.contains("Not removed /home/me/shop-login: Git refused: no"), "{screen}");
+        a.on_key(KeyCode::Char('j'));
+        a.on_key(KeyCode::Char('x'));
+        assert!(a.report.is_none());
+    }
+
+    #[test]
+    fn with_the_mouse_the_second_click_on_remove_confirms_and_elsewhere_cancels() {
+        let mut a = app();
+        let (_, removed) = removable(&mut a, false);
+        select(&mut a, "shop-login");
+        let screen = render(&mut a, 140, 30);
+        let y = screen.lines().position(|l| l.contains("d Remove")).unwrap() as u16;
+        let x = line(&screen, "d Remove").find("d Remove").unwrap() as u16 + 1;
+        a.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(a.confirm_remove.is_some());
+        render(&mut a, 140, 30);
+        a.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        assert!(a.confirm_remove.is_some(), "the tail of a double-click doesn't confirm");
+        a.age_removal();
+        a.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        a.perform_delete();
+        assert_eq!(removed.borrow().len(), 1);
+
+        select(&mut a, "shop-old");
+        render(&mut a, 140, 30);
+        a.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        a.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, 2);
+        assert!(a.confirm_remove.is_none() && removed.borrow().len() == 1);
     }
 
     #[test]

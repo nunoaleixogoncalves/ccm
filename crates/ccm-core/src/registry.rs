@@ -16,6 +16,29 @@ struct Entry {
     pid: u32,
     session_id: String,
     proc_start: Option<String>,
+    /// The folder the session is in now.
+    cwd: Option<String>,
+}
+
+/// A running session and the folder it's in now, if its registry file says.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Live {
+    pub id: String,
+    pub cwd: Option<String>,
+}
+
+/// Running sessions with their current folders. A brand new one may have no transcript yet.
+pub fn live_sessions(sessions_dir: &Path, proc_root: &Path) -> Vec<Live> {
+    let Ok(entries) = std::fs::read_dir(sessions_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| serde_json::from_slice::<Entry>(&std::fs::read(e.path()).ok()?).ok())
+        .filter(|e| is_live(e, proc_root))
+        .map(|e| Live { id: e.session_id, cwd: e.cwd })
+        .collect()
 }
 
 pub fn open_sessions(sessions_dir: &Path, proc_root: &Path) -> HashSet<String> {
@@ -150,7 +173,7 @@ mod tests {
     }
 
     fn entry(pid: u32, proc_start: Option<&str>) -> Entry {
-        Entry { pid, session_id: "s".into(), proc_start: proc_start.map(str::to_owned) }
+        Entry { pid, session_id: "s".into(), proc_start: proc_start.map(str::to_owned), cwd: None }
     }
 
     fn roster(f: &Fake, body: &str) -> String {
@@ -236,6 +259,15 @@ mod tests {
         register(&f, 42, "a", Some("500"));
         process(&f, 42, "500", "claude\n");
         assert!(open_sessions(&f.sessions, &f.proc).contains("a"));
+    }
+
+    #[test]
+    fn live_sessions_carry_their_current_folder() {
+        let f = fake();
+        fs::write(f.sessions.join("42.json"), r#"{"pid":42,"sessionId":"a","procStart":"500","cwd":"/w/x"}"#).unwrap();
+        process(&f, 42, "500", "claude");
+        register(&f, 43, "b", Some("1"));
+        assert_eq!(live_sessions(&f.sessions, &f.proc), [Live { id: "a".into(), cwd: Some("/w/x".into()) }], "b's process is gone");
     }
 
     #[test]

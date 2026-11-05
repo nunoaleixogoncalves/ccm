@@ -22,7 +22,7 @@ use crate::registry::{has_unreadable_entry, live_roster, open_sessions};
 use crate::transcript::read_capped_line;
 
 /// A transcript written this recently may belong to a session the registry doesn't list.
-const RECENT_WRITE: Duration = Duration::from_secs(60);
+pub(crate) const RECENT_WRITE: Duration = Duration::from_secs(60);
 /// Claude Code's own settings for this lock. A holder refreshes the lock's time well inside this.
 const LOCK_STALE: Duration = Duration::from_secs(10);
 const LOCK_WAIT: Duration = Duration::from_secs(3);
@@ -160,7 +160,7 @@ impl Busy {
     }
 }
 
-fn written_since(path: &Path, now: SystemTime, window: Duration) -> bool {
+pub(crate) fn written_since(path: &Path, now: SystemTime, window: Duration) -> bool {
     fs::symlink_metadata(path)
         .and_then(|m| m.modified())
         .is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age < window))
@@ -176,18 +176,20 @@ fn project_dirs(paths: &Paths) -> Vec<PathBuf> {
         .collect()
 }
 
-struct Job {
-    dir: PathBuf,
-    session_id: String,
-    isolation: Option<String>,
+pub(crate) struct Job {
+    pub(crate) dir: PathBuf,
+    pub(crate) session_id: String,
+    pub(crate) isolation: Option<String>,
+    pub(crate) cwd: Option<String>,
 }
 
-fn jobs(paths: &Paths) -> Vec<Job> {
+pub(crate) fn jobs(paths: &Paths) -> Vec<Job> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct State {
         session_id: Option<String>,
         bg_isolation: Option<String>,
+        cwd: Option<String>,
     }
     let Ok(entries) = fs::read_dir(paths.claude.join("jobs")) else { return Vec::new() };
     entries
@@ -195,7 +197,7 @@ fn jobs(paths: &Paths) -> Vec<Job> {
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .filter_map(|e| {
             let state: State = serde_json::from_slice(&fs::read(e.path().join("state.json")).ok()?).ok()?;
-            Some(Job { dir: e.path(), session_id: state.session_id?, isolation: state.bg_isolation })
+            Some(Job { dir: e.path(), session_id: state.session_id?, isolation: state.bg_isolation, cwd: state.cwd })
         })
         .collect()
 }

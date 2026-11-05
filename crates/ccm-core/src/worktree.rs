@@ -88,14 +88,23 @@ pub struct Link {
 }
 
 #[derive(Debug)]
-enum Failure {
+pub(crate) enum Failure {
     /// Git isn't installed.
     Missing,
     Failed,
 }
 
-/// Runs Git. `dir` is passed with `-C`, so a folder that's gone is a Git error, not a missing Git.
-fn git<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<Vec<u8>, Failure> {
+/// Runs Git and returns its output. `dir` is passed with `-C`, so a folder that's gone is a Git
+/// error, not a missing Git.
+pub(crate) fn git<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<Vec<u8>, Failure> {
+    match run(dir, args)? {
+        (true, out, _) => Ok(out),
+        _ => Err(Failure::Failed),
+    }
+}
+
+/// Runs Git and returns whether it succeeded, its output and its error text.
+pub(crate) fn run<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<(bool, Vec<u8>, Vec<u8>), Failure> {
     let mut cmd = Command::new("git");
     for (key, _) in std::env::vars_os() {
         if key.as_bytes().starts_with(b"GIT_") {
@@ -111,20 +120,24 @@ fn git<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<Vec<u8>, Failure> {
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { Failure::Missing } else { Failure::Failed })?;
-    let mut stdout = child.stdout.take().ok_or(Failure::Failed)?;
-    // Read meanwhile, so a large output can't fill the pipe and stall Git.
-    let reader = thread::spawn(move || {
-        let mut out = Vec::new();
-        stdout.read_to_end(&mut out).map(|_| out)
-    });
+    // Read meanwhile, so a large output can't fill a pipe and stall Git.
+    let read = |mut pipe: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut out = Vec::new();
+            pipe.read_to_end(&mut out).map(|_| out)
+        })
+    };
+    let reader = read(Box::new(child.stdout.take().ok_or(Failure::Failed)?));
+    let errors = read(Box::new(child.stderr.take().ok_or(Failure::Failed)?));
     let started = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let out = reader.join().map_err(|_| Failure::Failed)?.map_err(|_| Failure::Failed)?;
-                return if status.success() { Ok(out) } else { Err(Failure::Failed) };
+                let err = errors.join().map_err(|_| Failure::Failed)?.unwrap_or_default();
+                return Ok((status.success(), out, err));
             }
             Ok(None) if started.elapsed() < TIMEOUT => thread::sleep(Duration::from_millis(5)),
             _ => {
@@ -136,11 +149,11 @@ fn git<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<Vec<u8>, Failure> {
     }
 }
 
-fn text(out: &[u8]) -> &str {
+pub(crate) fn text(out: &[u8]) -> &str {
     std::str::from_utf8(out).unwrap_or("").trim_end_matches('\n')
 }
 
-fn path_of(bytes: &[u8]) -> PathBuf {
+pub(crate) fn path_of(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes.to_vec()))
 }
 
@@ -153,7 +166,7 @@ fn common_dir(folder: &Path) -> Option<PathBuf> {
 }
 
 /// Parses `git worktree list --porcelain -z`. The first entry is the main worktree.
-fn parse_list(out: &[u8]) -> Vec<Worktree> {
+pub(crate) fn parse_list(out: &[u8]) -> Vec<Worktree> {
     let mut list: Vec<Worktree> = Vec::new();
     let mut current: Option<Worktree> = None;
     for field in out.split(|b| *b == 0) {
@@ -221,7 +234,7 @@ fn count(out: &[u8]) -> Option<u64> {
     text(out).parse().ok()
 }
 
-fn inspect(w: &Worktree) -> Option<State> {
+pub(crate) fn inspect(w: &Worktree) -> Option<State> {
     let dir = &w.path;
     let changes = count_changes(&git(dir, &["status", "--porcelain=v2", "-z"]).ok()?);
     let has_remote = !text(&git(dir, &["remote"]).ok()?).is_empty();

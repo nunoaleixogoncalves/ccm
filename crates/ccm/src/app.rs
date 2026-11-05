@@ -12,6 +12,7 @@ use ccm_core::resume::{decide, is_safe_folder, manual_command, Decision};
 use ccm_core::query::{group_by_folder, select, status_rank, Filters, GroupRow, SortKey};
 use ccm_core::window::{context_label, window_size};
 use ccm_core::format::sanitize;
+use ccm_core::removal::{self, Target};
 use crossterm::event::{KeyCode, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
@@ -62,6 +63,10 @@ pub type DeleteFn = Box<dyn FnMut(&Plan, bool) -> Result<Outcome, String>>;
 pub type RenameFn = Box<dyn FnMut(&str, &Path, &str) -> Result<String, String>>;
 /// Stops these conversations showing as crashed.
 pub type DismissFn = Box<dyn FnMut(&[String]) -> Result<(), String>>;
+/// Works out what removing these worktrees would do, without changing anything.
+pub type RemovePlanFn = Box<dyn FnMut(&[Target], &[Session]) -> removal::Plan>;
+/// Removes the worktrees of a plan, checking each again first.
+pub type RemoveFn = Box<dyn FnMut(&removal::Plan, &[Session]) -> removal::Outcome>;
 /// Copies text and returns what to tell the user.
 pub type CopyFn = Box<dyn FnMut(&str) -> Result<String, String>>;
 
@@ -75,6 +80,7 @@ const DEL_PAUSE: Duration = Duration::from_secs(1);
 const RESUME_COOLDOWN: Duration = Duration::from_secs(20);
 const DELETE_REPORT: &str = " Delete finished ";
 const REOPEN_REPORT: &str = " Reopen finished ";
+const REMOVE_REPORT: &str = " Remove finished ";
 
 pub type SearchFn = Box<dyn FnMut(&str) -> Result<Option<HashSet<String>>, String>>;
 
@@ -99,6 +105,12 @@ pub struct Hit {
 pub struct ConfirmDelete {
     pub plan: Plan,
     pub include_notes: bool,
+    opened: Instant,
+}
+
+/// A worktree removal waiting for an answer. Nothing has changed yet.
+pub struct ConfirmRemove {
+    pub plan: removal::Plan,
     opened: Instant,
 }
 
@@ -173,6 +185,10 @@ pub struct App {
     selected_id: Option<String>,
     pub view: View,
     pub worktrees: Worktrees,
+    pub remove_planner: Option<RemovePlanFn>,
+    pub remover: Option<RemoveFn>,
+    pub confirm_remove: Option<ConfirmRemove>,
+    pending_remove: Option<ConfirmRemove>,
 }
 
 impl App {
@@ -219,6 +235,10 @@ impl App {
             selected_id: None,
             view: View::Conversations,
             worktrees: Worktrees::default(),
+            remove_planner: None,
+            remover: None,
+            confirm_remove: None,
+            pending_remove: None,
         }
     }
 
@@ -265,9 +285,97 @@ impl App {
             KeyCode::PageDown => w.move_selection(page),
             KeyCode::Home => w.select_first(),
             KeyCode::End => w.select_last(),
+            KeyCode::Char('d') | KeyCode::Delete => self.run(Action::Delete),
+            KeyCode::Char(' ') => self.run(Action::Mark),
+            KeyCode::Char('a') => self.run(Action::MarkAll),
+            KeyCode::Esc if !self.worktrees.marked.is_empty() => self.worktrees.marked.clear(),
             KeyCode::Char('w') | KeyCode::Esc => self.run(Action::Worktrees),
             KeyCode::Char('q') => self.run(Action::Quit),
             _ => {}
+        }
+    }
+
+    /// Whether the delete or remove button can do anything in the current view.
+    pub fn can_press_delete(&self) -> bool {
+        match self.view {
+            View::Conversations => self.can_change() || !self.marked_shown().is_empty(),
+            View::Worktrees => self.worktrees.selected().is_some() || !self.worktrees.marked_shown().is_empty(),
+        }
+    }
+
+    fn start_remove(&mut self) {
+        let targets = self.worktrees.targets();
+        if targets.is_empty() {
+            return;
+        }
+        let Some(planner) = self.remove_planner.as_mut() else { return };
+        let plan = planner(&targets, &self.sessions);
+        if plan.items.is_empty() {
+            let reason = plan.refused.first().map_or("nothing to remove".to_string(), |r| sanitize(&r.reason));
+            self.status = Some(format!("Can't remove: {reason}."));
+            return;
+        }
+        self.dialog_scroll = 0;
+        self.confirm_remove = Some(ConfirmRemove { plan, opened: Instant::now() });
+    }
+
+    fn answer_remove(&mut self, key: KeyCode) {
+        if self.scroll_dialog(key) {
+            return;
+        }
+        let Some(confirm) = self.confirm_remove.as_mut() else { return };
+        match key {
+            KeyCode::Char('y') => self.confirm_removal(),
+            KeyCode::Delete if confirm.opened.elapsed() < DEL_PAUSE => {
+                confirm.opened = Instant::now();
+                self.status = Some("Too quick. Wait a moment, then press Del again.".into());
+            }
+            KeyCode::Delete => self.confirm_removal(),
+            _ => self.cancel_removal(),
+        }
+    }
+
+    fn cancel_removal(&mut self) {
+        self.confirm_remove = None;
+        self.status = Some("Cancelled. Nothing was removed.".into());
+    }
+
+    fn confirm_removal(&mut self) {
+        self.pending_remove = self.confirm_remove.take();
+        self.status = Some("Removing…".into());
+    }
+
+    fn perform_remove(&mut self) {
+        let Some(ConfirmRemove { plan, .. }) = self.pending_remove.take() else { return };
+        let Some(remover) = self.remover.as_mut() else { return };
+        self.status = None;
+        let outcome = remover(&plan, &self.sessions);
+        let count = outcome.removed.len();
+        let summary = format!("Removed {count} worktree{}. Their branches are kept.", if count == 1 { "" } else { "s" });
+        let path = |p: &std::path::Path| sanitize(&p.display().to_string());
+        let mut lines = Vec::new();
+        for f in &outcome.failures {
+            lines.push(format!("Not removed {}: {}", path(&f.path), sanitize(&f.reason)));
+        }
+        for s in plan.refused.iter().chain(&outcome.skipped) {
+            lines.push(format!("Skipped {}: {}", path(&s.path), sanitize(&s.reason)));
+        }
+        self.worktrees.forget(&outcome.removed, &self.sessions);
+        if lines.is_empty() {
+            self.status = Some(summary);
+        } else {
+            lines.insert(0, summary);
+            self.dialog_scroll = 0;
+            self.report_title = REMOVE_REPORT;
+            self.report = Some(lines);
+        }
+    }
+
+    /// Lets a test act as if the pause before a second Del has passed.
+    #[cfg(test)]
+    pub fn age_removal(&mut self) {
+        if let Some(confirm) = self.confirm_remove.as_mut() {
+            confirm.opened -= DEL_PAUSE;
         }
     }
 
@@ -432,11 +540,14 @@ impl App {
     }
 
     pub fn has_pending_delete(&self) -> bool {
-        self.pending_delete.is_some()
+        self.pending_delete.is_some() || self.pending_remove.is_some()
     }
 
     /// Runs a confirmed delete. Called after a draw, so "Deleting…" is on screen meanwhile.
     pub fn perform_delete(&mut self) {
+        if self.pending_remove.is_some() {
+            return self.perform_remove();
+        }
         let Some(ConfirmDelete { plan, include_notes, .. }) = self.pending_delete.take() else { return };
         let Some(deleter) = self.deleter.as_mut() else { return };
         self.status = None;
@@ -767,6 +878,7 @@ impl App {
             Action::ReverseSort => self.descending = !self.descending,
             Action::Search => self.typing = true,
             Action::Resume => self.resume_selected(),
+            Action::Delete if self.view == View::Worktrees => self.start_remove(),
             Action::Delete => self.start_delete(),
             Action::Rename => self.start_rename(),
             Action::CopyId => {
@@ -779,6 +891,8 @@ impl App {
                     self.copy(command);
                 }
             }
+            Action::Mark if self.view == View::Worktrees => self.worktrees.toggle_mark(),
+            Action::MarkAll if self.view == View::Worktrees => self.worktrees.mark_all(),
             Action::Mark => self.toggle_mark(),
             Action::MarkAll => self.mark_all(),
             Action::Worktrees => self.toggle_view(),
@@ -856,6 +970,9 @@ impl App {
         if self.confirm_delete.is_some() {
             return self.answer_delete(key);
         }
+        if self.confirm_remove.is_some() {
+            return self.answer_remove(key);
+        }
         if self.reopen.is_some() {
             return self.on_reopen_key(key);
         }
@@ -909,7 +1026,7 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, kind: MouseEventKind, x: u16, y: u16) {
-        let waiting = self.confirm_delete.is_some() || self.renaming.is_some() || self.report.is_some() || self.reopen.is_some();
+        let waiting = self.confirm_delete.is_some() || self.confirm_remove.is_some() || self.renaming.is_some() || self.report.is_some() || self.reopen.is_some();
         if waiting && !matches!(kind, MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
             match kind {
                 MouseEventKind::ScrollUp if self.reopen.is_some() => self.on_reopen_key(KeyCode::Up),
@@ -967,6 +1084,14 @@ impl App {
                 self.confirm_delete = None;
                 self.status = Some("Cancelled. Nothing was deleted.".into());
             }
+            return;
+        }
+        if let Some(confirm) = &self.confirm_remove {
+            let on_remove = self.hit.buttons.iter().any(|(r, a)| *a == Action::Delete && inside(r));
+            if on_remove && confirm.opened.elapsed() < DOUBLE_CLICK {
+                return;
+            }
+            if on_remove { self.confirm_removal() } else { self.cancel_removal() }
             return;
         }
         if self.renaming.take().is_some() || self.reopen.take().is_some() {

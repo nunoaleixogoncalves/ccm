@@ -26,7 +26,7 @@ If you run a lot of Claude Code sessions, they pile up:
 - **Rename:** the new name also shows in Claude Code's own `/resume`.
 - **Clean up:** filter for conversations Claude never replied to, ones whose folder is gone, and large ones.
 - **Recover:** after a crash, see what was running and reopen it all at once.
-- **Worktrees:** see the Git worktrees of the repositories your conversations used, with their uncommitted changes, unpushed commits and the conversations that worked in each.
+- **Worktrees:** see the Git worktrees of the repositories your conversations used, with their uncommitted changes, unpushed commits and the conversations that worked in each, and remove the ones you're done with.
 
 ## Install
 
@@ -146,7 +146,20 @@ Press `w` to see the Git worktrees of every repository a conversation worked in.
 - `ccm` asks Git which folders are worktrees, so it finds them wherever they are, including beside the main repository. A repository's main worktree isn't listed.
 - A conversation counts as having worked in a worktree if it was in that folder, or a folder inside it, at any point. Conversations often change folder, so the list says how recently each one was there, how much of its activity happened there, and whether it started or stopped there.
 - Unpushed commits are the ones on no remote branch. In a repository without a remote, they're the ones on no other branch. Remote branches are as of your last fetch, because `ccm` never uses the network. When a branch's remote branch was deleted, its commits count as unpushed, and the details say it was probably merged.
-- The view is read-only, so nothing in it changes a worktree. `ccm` checks Git again each time you open it, then every 20 seconds while it's open.
+- `ccm` checks Git again each time you open the view, then every 20 seconds while it's open.
+
+The keys work like the conversation list: Space marks, `a` marks everything, Esc clears the marks and then goes back, and `d` or Del removes the selected or marked worktrees after a popup. Confirm with `y` or Del, or click Remove twice.
+
+Removing runs `git worktree remove`, never with `--force`. The branch stays, so its commits are kept. Everything is checked again just before each removal, and a worktree is refused if:
+
+- it has uncommitted changes or unpushed commits
+- a conversation is open in it, or an open one was last working in it
+- a conversation that worked in it was written to in the last minute, or runs in the background
+- a background job may own it, which `claude rm` removes instead
+- it's locked or has submodules, which Git won't remove either
+- Git couldn't read its state, or a running session's registry file can't be read
+
+The popup lists the conversations that worked in each worktree. It also warns when a conversation started there, because resuming that conversation later recreates the folder empty. **Files Git ignores, such as `.env` or build output, are deleted with the worktree.** The popup lists them with their size, and if new ones appear after you confirm, that worktree is skipped.
 
 ## Configuration
 
@@ -171,7 +184,7 @@ On macOS, set `terminal` to a terminal that can run a command, such as `["alacri
 
 `ccm` reads Claude Code's files in `~/.claude`, or in `CLAUDE_CONFIG_DIR` if that's set. It sends nothing over the network.
 
-While the [worktree view](#worktrees) is open, it runs Git in the repositories your conversations worked in, only with commands that read. It ignores `GIT_*` variables from its own environment, stops a repository's `core.fsmonitor` setting from running a program, takes no optional locks and never fetches.
+While the [worktree view](#worktrees) is open, it runs Git in the repositories your conversations worked in. Only `git worktree remove` changes anything, and only after you confirm. It ignores `GIT_*` variables from its own environment, stops a repository's `core.fsmonitor` setting from running a program, takes no optional locks and never fetches.
 
 It writes these files of its own:
 
