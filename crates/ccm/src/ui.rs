@@ -11,7 +11,9 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, HighlightSpacing, Paragraph,
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{Action, App};
+use crate::app::{Action, App, View};
+
+mod worktrees;
 
 const COLUMN_SPACING: u16 = 1;
 const MIN_NAME_WIDTH: usize = 10;
@@ -51,6 +53,9 @@ const COLUMNS: [Column; 9] = [
 ];
 
 pub fn draw(f: &mut Frame, app: &mut App, now_ms: i64) {
+    if app.view == View::Worktrees {
+        return worktrees::draw(f, app, now_ms);
+    }
     let bar = if app.typing || !app.query.is_empty() { 1 } else { 0 };
     let preview_height = if f.area().height >= MIN_HEIGHT_FOR_PREVIEW { Constraint::Fill(1) } else { Constraint::Length(0) };
     let [summary, search, table, detail, preview, footer] = Layout::vertical([
@@ -528,6 +533,9 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 type Button = (&'static str, &'static str, Action, bool);
 
 fn footer_groups(app: &App) -> [(&'static str, Vec<Button>); 2] {
+    if app.view == View::Worktrees {
+        return [("Actions", vec![("q", "Quit", Action::Quit, false)]), ("View", vec![("w", "Conversations", Action::Worktrees, false)])];
+    }
     [
         (
             "Actions",
@@ -556,6 +564,7 @@ fn footer_groups(app: &App) -> [(&'static str, Vec<Button>); 2] {
                 ("g", "Group", Action::ToggleGroup, app.grouped),
                 ("s", "Sort", Action::NextSort, false),
                 ("r", "Reverse", Action::ReverseSort, false),
+                ("w", "Worktrees", Action::Worktrees, false),
             ],
         ),
     ]
@@ -691,6 +700,7 @@ mod tests {
             size_bytes: 2 * 1024 * 1024,
             name: name.into(),
             folder: Some(folder.into()),
+            folders: Vec::new(),
             branch: Some("main".into()),
             model: Some("claude-opus-5-5".into()),
             started_at_ms: Some(0),

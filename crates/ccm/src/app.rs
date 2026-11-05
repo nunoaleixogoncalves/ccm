@@ -16,6 +16,8 @@ use crossterm::event::{KeyCode, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 
+use crate::worktrees::{folders_of, Worktrees};
+
 /// An action reachable from both a key and a footer button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -37,7 +39,16 @@ pub enum Action {
     Mark,
     MarkAll,
     Reopen,
+    /// Switches between the conversations and the worktrees.
+    Worktrees,
     Quit,
+}
+
+/// Which list is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Conversations,
+    Worktrees,
 }
 
 /// Runs a query. `None` means the query has nothing to search for.
@@ -160,6 +171,8 @@ pub struct App {
     pub loading: bool,
     pub quit: bool,
     selected_id: Option<String>,
+    pub view: View,
+    pub worktrees: Worktrees,
 }
 
 impl App {
@@ -204,6 +217,8 @@ impl App {
             loading: true,
             quit: false,
             selected_id: None,
+            view: View::Conversations,
+            worktrees: Worktrees::default(),
         }
     }
 
@@ -212,6 +227,48 @@ impl App {
         let present: HashSet<&str> = self.sessions.iter().map(|s| s.id.as_str()).collect();
         self.marked.retain(|id| present.contains(id.as_str()));
         self.run_search();
+        self.worktrees.relink(&self.sessions);
+    }
+
+    /// The folders to scan for worktrees, when a scan is due. The caller runs Git elsewhere and
+    /// hands the result to `finish_worktree_scan`.
+    pub fn worktree_request(&mut self) -> Option<Vec<String>> {
+        if self.view != View::Worktrees || !self.worktrees.due() {
+            return None;
+        }
+        self.worktrees.start();
+        Some(folders_of(&self.sessions))
+    }
+
+    pub fn finish_worktree_scan(&mut self, scan: ccm_core::worktree::Scan) {
+        self.worktrees.finish(scan, &self.sessions);
+    }
+
+    fn toggle_view(&mut self) {
+        self.view = match self.view {
+            View::Conversations => {
+                // Fresh on every visit, as Git's state changes without anything `ccm` watches.
+                self.worktrees.refresh_soon();
+                View::Worktrees
+            }
+            View::Worktrees => View::Conversations,
+        };
+    }
+
+    fn on_worktree_key(&mut self, key: KeyCode) {
+        let page = self.hit.body.height.max(1) as isize;
+        let w = &mut self.worktrees;
+        match key {
+            KeyCode::Up | KeyCode::Char('k') => w.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => w.move_selection(1),
+            KeyCode::PageUp => w.move_selection(-page),
+            KeyCode::PageDown => w.move_selection(page),
+            KeyCode::Home => w.select_first(),
+            KeyCode::End => w.select_last(),
+            KeyCode::Char('w') | KeyCode::Esc => self.run(Action::Worktrees),
+            KeyCode::Char('q') => self.run(Action::Quit),
+            _ => {}
+        }
     }
 
     /// Recomputes the rows and keeps the selection on the same conversation where possible.
@@ -724,6 +781,7 @@ impl App {
             }
             Action::Mark => self.toggle_mark(),
             Action::MarkAll => self.mark_all(),
+            Action::Worktrees => self.toggle_view(),
             Action::Quit => self.quit = true,
         }
         self.rebuild();
@@ -804,6 +862,9 @@ impl App {
         if self.renaming.is_some() {
             return self.on_rename_key(key);
         }
+        if self.view == View::Worktrees {
+            return self.on_worktree_key(key);
+        }
         if self.typing {
             return self.on_search_key(key);
         }
@@ -840,6 +901,7 @@ impl App {
             KeyCode::Char('g') => self.run(Action::ToggleGroup),
             KeyCode::Char('s') => self.run(Action::NextSort),
             KeyCode::Char('r') => self.run(Action::ReverseSort),
+            KeyCode::Char('w') => self.run(Action::Worktrees),
             KeyCode::Esc => self.status = Some("Press q to quit.".into()),
             KeyCode::Char('q') => self.run(Action::Quit),
             _ => {}
@@ -854,6 +916,15 @@ impl App {
                 MouseEventKind::ScrollDown if self.reopen.is_some() => self.on_reopen_key(KeyCode::Down),
                 MouseEventKind::ScrollUp => self.dialog_scroll = self.dialog_scroll.saturating_sub(3),
                 MouseEventKind::ScrollDown => self.dialog_scroll = self.dialog_scroll.saturating_add(3),
+                _ => {}
+            }
+            return;
+        }
+        if self.view == View::Worktrees {
+            match kind {
+                MouseEventKind::ScrollUp => self.worktrees.move_selection(-3),
+                MouseEventKind::ScrollDown => self.worktrees.move_selection(3),
+                MouseEventKind::Down(crossterm::event::MouseButton::Left) => self.click(x, y),
                 _ => {}
             }
             return;
@@ -905,6 +976,11 @@ impl App {
         if let Some((_, action)) = self.hit.buttons.iter().find(|(r, _)| inside(r)) {
             let action = *action;
             self.run(action);
+        } else if self.view == View::Worktrees {
+            if inside(&self.hit.body) {
+                let row = self.worktrees.table.offset() + (y - self.hit.body.y) as usize;
+                self.worktrees.click_row(row);
+            }
         } else if inside(&self.hit.header) {
             if let Some((_, key)) = self.hit.columns.iter().find(|(r, _)| x >= r.x && x < r.x + r.width) {
                 let key = *key;

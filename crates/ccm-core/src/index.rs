@@ -11,7 +11,7 @@ use rusqlite::{params, Connection, OpenFlags};
 use crate::model::Session;
 
 /// Bump when the stored data or the parser changes, so old rows are rebuilt.
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 /// Contentless, because the text already lives in the transcripts. This also keeps the index
 /// small and limits how much conversation text it copies.
@@ -177,6 +177,7 @@ mod tests {
             size_bytes: 0,
             name: String::new(),
             folder: None,
+            folders: Vec::new(),
             branch: None,
             model: None,
             started_at_ms: None,

@@ -1,10 +1,11 @@
 mod app;
 mod clipboard;
 mod ui;
+mod worktrees;
 
 use std::io::{stdin, stdout, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ use ccm_core::recovery;
 use ccm_core::rename;
 use ccm_core::resume::{self, Launch};
 use ccm_core::setup;
+use ccm_core::worktree::{self, Scan};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use ratatui::DefaultTerminal;
@@ -201,7 +203,30 @@ fn spawn_refresher(mut catalog: Catalog) -> Receiver<Update> {
 fn run(terminal: &mut DefaultTerminal, app: &mut App, updates: Receiver<Update>) -> Result<()> {
     let mut dirty = true;
     let mut last_draw = Instant::now();
+    let mut worktree_scan: Option<Receiver<Scan>> = None;
     while !app.quit {
+        if worktree_scan.is_none()
+            && let Some(folders) = app.worktree_request()
+        {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(worktree::scan(&folders));
+            });
+            worktree_scan = Some(rx);
+            dirty = true;
+        }
+        if let Some(rx) = &worktree_scan {
+            let finished = match rx.try_recv() {
+                Ok(scan) => Some(scan),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(Scan { errors: vec!["Looking for worktrees stopped unexpectedly.".into()], ..Scan::default() }),
+            };
+            if let Some(scan) = finished {
+                app.finish_worktree_scan(scan);
+                worktree_scan = None;
+                dirty = true;
+            }
+        }
         for update in updates.try_iter() {
             match update {
                 Ok(sessions) => {

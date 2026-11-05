@@ -168,6 +168,7 @@ fn read_session(f: &Found) -> Option<(Session, SearchDoc)> {
         size_bytes: f.size + dir_size(&companion_dir(&f.path)),
         name: p.name,
         folder: p.folder,
+        folders: p.folders,
         branch: p.branch,
         model: p.model,
         started_at_ms: p.started_at_ms,

@@ -147,6 +147,7 @@ mod tests {
             size_bytes: 0,
             name: id.into(),
             folder: Some("/f".into()),
+            folders: Vec::new(),
             branch: None,
             model: None,
             started_at_ms: None,

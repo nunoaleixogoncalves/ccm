@@ -300,6 +300,7 @@ mod tests {
             size_bytes: 0,
             name: String::new(),
             folder: folder.map(str::to_owned),
+            folders: Vec::new(),
             branch: None,
             model: None,
             started_at_ms: None,

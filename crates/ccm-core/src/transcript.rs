@@ -1,7 +1,7 @@
 //! Parses a transcript. The format is undocumented and can change, so unknown records are
 //! skipped and bad lines are counted rather than treated as errors.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::BufRead;
 
@@ -10,6 +10,7 @@ use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::Deserialize;
 
 use crate::format::{sanitize, sanitize_lines};
+use crate::model::FolderVisit;
 
 pub(crate) const SYNTHETIC_MODEL: &str = "<synthetic>";
 /// A limit per field, so one enormous transcript can't bloat the index.
@@ -21,11 +22,15 @@ const MAX_LABEL: usize = 1024;
 /// The longest path Linux and macOS accept. A longer folder can't be real.
 const MAX_FOLDER: usize = 4096;
 const MAX_RECAPS: usize = 3;
+/// Folders kept per conversation. Later ones are ignored, so a script that visits thousands
+/// can't bloat the index.
+const MAX_FOLDERS: usize = 256;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Parsed {
     pub name: String,
     pub folder: Option<String>,
+    pub folders: Vec<FolderVisit>,
     pub branch: Option<String>,
     pub model: Option<String>,
     pub started_at_ms: Option<i64>,
@@ -197,6 +202,8 @@ pub fn parse<R: BufRead>(mut reader: R) -> std::io::Result<Parsed> {
     let mut anonymous_replies = 0;
     let mut recaps = Vec::new();
     let mut line = Vec::new();
+    let mut visits: HashMap<String, usize> = HashMap::new();
+    let mut with_folder = 0u64;
 
     while let Some(fits) = read_capped_line(&mut reader, &mut line)? {
         if !fits {
@@ -224,8 +231,23 @@ pub fn parse<R: BufRead>(mut reader: R) -> std::io::Result<Parsed> {
             continue;
         }
         let kind = r.kind.as_deref();
-        if p.folder.is_none() {
-            p.folder = r.cwd.filter(|f| f.len() <= MAX_FOLDER);
+        if let Some(cwd) = r.cwd.filter(|f| f.len() <= MAX_FOLDER) {
+            with_folder += 1;
+            let at = r.timestamp.as_deref().and_then(parse_ms);
+            match visits.get(&cwd) {
+                Some(&i) => {
+                    let v = &mut p.folders[i];
+                    v.records += 1;
+                    v.last_record = with_folder;
+                    v.last_ms = at.or(v.last_ms);
+                }
+                None if p.folders.len() < MAX_FOLDERS => {
+                    visits.insert(cwd.clone(), p.folders.len());
+                    p.folders.push(FolderVisit { path: cwd.clone(), records: 1, last_record: with_folder, last_ms: at });
+                }
+                None => {}
+            }
+            p.folder.get_or_insert(cwd);
         }
         if matches!(kind, Some("user" | "assistant" | "system")) {
             if let Some(t) = r.timestamp.as_deref().and_then(parse_ms) {
@@ -334,6 +356,25 @@ mod tests {
         assert_eq!((p.prompts, p.replies), (1, 1));
         assert_eq!(p.name, "fix the bug");
         assert_eq!(p.last_active_ms.unwrap() - p.started_at_ms.unwrap(), 5000);
+    }
+
+    #[test]
+    fn every_folder_is_kept_with_how_much_happened_there_and_when() {
+        let side = r#"{"type":"assistant","isSidechain":true,"cwd":"/sub","message":{"id":"s1"}}"#;
+        let summary = r#"{"type":"summary","cwd":"/work/a"}"#;
+        let p = run(&[USER, REPLY, side, summary, REPLY]);
+        let seen: Vec<(&str, u64, u64)> = p.folders.iter().map(|v| (v.path.as_str(), v.records, v.last_record)).collect();
+        assert_eq!(seen, [("/work/a", 2, 3), ("/work/b", 2, 4)], "first-seen order, and subagents don't count");
+        assert_eq!(p.folders[0].last_ms, Some(p.started_at_ms.unwrap()), "a record without a time keeps the last one");
+        assert_eq!(p.folders[1].last_ms, p.last_active_ms);
+    }
+
+    #[test]
+    fn folders_are_capped() {
+        let lines: Vec<String> = (0..MAX_FOLDERS + 10).map(|i| format!(r#"{{"type":"user","cwd":"/f{i}"}}"#)).collect();
+        let p = run(&lines.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(p.folders.len(), MAX_FOLDERS);
+        assert_eq!(p.folder.as_deref(), Some("/f0"));
     }
 
     #[test]

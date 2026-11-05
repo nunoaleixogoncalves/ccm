@@ -21,6 +21,10 @@ pub struct Session {
     /// First recorded folder, which is where a resume must start. Kept exact, so sanitize it
     /// before display.
     pub folder: Option<String>,
+    /// Every folder the conversation worked in, in the order first seen. A conversation can
+    /// change folder, and often only passes through a worktree.
+    #[serde(default)]
+    pub folders: Vec<FolderVisit>,
     pub branch: Option<String>,
     pub model: Option<String>,
     pub started_at_ms: Option<i64>,
@@ -51,6 +55,18 @@ pub struct Session {
     pub folder_exists: bool,
 }
 
+/// How much of a conversation happened in one folder. Kept exact, so sanitize before display.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FolderVisit {
+    pub path: String,
+    /// Records written in this folder.
+    pub records: u64,
+    /// Position of the last record written here, counting only records with a folder. The
+    /// highest one across visits is the folder the conversation was last in.
+    pub last_record: u64,
+    pub last_ms: Option<i64>,
+}
+
 fn yes() -> bool {
     true
 }
@@ -67,5 +83,15 @@ impl Session {
 
     pub fn is_folder_missing(&self) -> bool {
         self.folder.is_some() && !self.folder_exists
+    }
+
+    /// All records that recorded a folder.
+    pub fn folder_records(&self) -> u64 {
+        self.folders.iter().map(|v| v.records).sum()
+    }
+
+    /// The folder the conversation was last working in.
+    pub fn last_folder(&self) -> Option<&str> {
+        self.folders.iter().max_by_key(|v| v.last_record).map(|v| v.path.as_str())
     }
 }
