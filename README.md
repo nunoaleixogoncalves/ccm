@@ -196,7 +196,7 @@ Only sessions started after `ccm setup` are tracked.
 | Platform | Status |
 |---|---|
 | Linux | Built and tested. Used in `foot` and `herdr-app` |
-| macOS | Should work, but it has never been run on a Mac |
+| macOS | Built and tested on Intel and Apple Silicon by automated checks, but not yet used by hand |
 | Windows | Not supported |
 
 Tested with Claude Code 2.1.296. Claude Code's file format isn't documented and can change, so `ccm` skips anything it doesn't recognise and warns you rather than crashing.
