@@ -243,7 +243,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, updates: Receiver<Update>)
             dirty = true;
         }
         // Keeps the "last active" ages current while nothing else changes.
-        if dirty || last_draw.elapsed() >= Duration::from_secs(30) {
+        if dirty || app.counting_down() || last_draw.elapsed() >= Duration::from_secs(30) {
             app.ensure_preview();
             terminal.draw(|f| ui::draw(f, app, now_ms()))?;
             last_draw = Instant::now();

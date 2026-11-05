@@ -43,6 +43,11 @@ pub struct Planned {
     pub ignored_more: bool,
     /// Conversations that worked here.
     pub links: Vec<Link>,
+    /// Commits on no remote branch, or with no remote, on no other branch. The branch stays, so
+    /// they're kept, but only on this machine. The popup always warns about them.
+    pub unpushed: u64,
+    pub has_remote: bool,
+    pub upstream_gone: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,6 +193,9 @@ fn check(target: &Target, busy: &Busy, sessions: &[Session]) -> Result<Planned, 
         ignored_bytes: 0,
         ignored_more: false,
         links,
+        unpushed: 0,
+        has_remote: false,
+        upstream_gone: false,
     };
     if w.prunable {
         return Ok(planned);
@@ -197,10 +205,19 @@ fn check(target: &Target, busy: &Busy, sessions: &[Session]) -> Result<Planned, 
         let plural = if state.changes == 1 { "file" } else { "files" };
         return Err(format!("it has {} uncommitted {plural}", state.changes));
     }
-    if state.unpushed > 0 {
-        let plural = if state.unpushed == 1 { "commit" } else { "commits" };
-        return Err(format!("it has {} unpushed {plural}", state.unpushed));
+    if w.detached() {
+        // No branch stays to hold these, so removing the worktree would strand them.
+        let out = git(&w.path, &["rev-list", "--count", "HEAD", "--not", "--branches", "--tags", "--remotes"]).map_err(|_| "Git couldn't count its commits".to_string())?;
+        match text(&out).parse::<u64>() {
+            Ok(0) => {}
+            Ok(1) => return Err("it has 1 commit that's on no branch. Create a branch for it first".into()),
+            Ok(n) => return Err(format!("it has {n} commits that are on no branch. Create a branch for them first")),
+            Err(_) => return Err("Git couldn't count its commits".into()),
+        }
     }
+    planned.unpushed = state.unpushed;
+    planned.has_remote = state.has_remote;
+    planned.upstream_gone = state.upstream_gone;
     if fs::symlink_metadata(w.path.join(".gitmodules")).is_ok() {
         return Err("it has submodules, which Git won't remove".into());
     }
@@ -238,6 +255,10 @@ pub fn execute(paths: &Paths, proc_root: &Path, plan: &Plan, sessions: &[Session
                 continue;
             }
         };
+        if now.unpushed > item.unpushed {
+            outcome.skipped.push(Refused { path, reason: "it has more unpushed commits than when you confirmed".into() });
+            continue;
+        }
         let shown: HashSet<&String> = item.ignored.iter().collect();
         if now.ignored.iter().any(|n| !shown.contains(n)) {
             outcome.skipped.push(Refused { path, reason: "new ignored files appeared after you confirmed".into() });
@@ -422,17 +443,11 @@ mod tests {
     }
 
     #[test]
-    fn changes_unpushed_commits_locks_and_submodules_refuse() {
+    fn changes_locks_and_submodules_refuse() {
         let f = Fixture::new();
         let dirty = f.worktree("dirty");
         fs::write(dirty.path.join("new"), "x").unwrap();
         assert_eq!(reason(&f.plan(&[dirty], &[])), "it has 1 uncommitted file");
-
-        let ahead = f.worktree("ahead");
-        fs::write(ahead.path.join("b"), "b").unwrap();
-        sh(&ahead.path, &["add", "b"]);
-        sh(&ahead.path, &["commit", "-qm", "b"]);
-        assert_eq!(reason(&f.plan(&[ahead], &[])), "it has 1 unpushed commit");
 
         let held = f.worktree("held");
         sh(&f.repo, &["worktree", "lock", "../held"]);
@@ -444,6 +459,56 @@ mod tests {
         sh(&sub.path, &["commit", "-qm", "m"]);
         sh(&sub.path, &["push", "-q", "-u", "origin", "sub"]);
         assert!(reason(&f.plan(&[sub], &[])).contains("submodules"));
+    }
+
+    fn commit(dir: &Path, file: &str) {
+        fs::write(dir.join(file), file).unwrap();
+        sh(dir, &["add", file]);
+        sh(dir, &["commit", "-qm", file]);
+    }
+
+    #[test]
+    fn unpushed_commits_are_allowed_and_counted_for_the_warning() {
+        let f = Fixture::new();
+        let ahead = f.worktree("ahead");
+        commit(&ahead.path, "b");
+        commit(&ahead.path, "c");
+        let plan = f.plan(std::slice::from_ref(&ahead), &[]);
+        assert!(plan.refused.is_empty(), "{:?}", plan.refused);
+        let item = &plan.items[0];
+        assert_eq!((item.unpushed, item.has_remote, item.upstream_gone), (2, true, false));
+        assert_eq!(f.execute(&plan, &[]).removed, std::slice::from_ref(&ahead.path));
+        let kept = Command::new("git").arg("-C").arg(&f.repo).args(["rev-list", "--count", "ahead"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&kept.stdout).trim(), "3", "the branch keeps them");
+    }
+
+    #[test]
+    fn a_new_unpushed_commit_after_the_plan_stops_the_removal() {
+        let f = Fixture::new();
+        let ahead = f.worktree("ahead");
+        commit(&ahead.path, "b");
+        let plan = f.plan(std::slice::from_ref(&ahead), &[]);
+        commit(&ahead.path, "c");
+        let outcome = f.execute(&plan, &[]);
+        assert_eq!(outcome.skipped[0].reason, "it has more unpushed commits than when you confirmed");
+        assert!(ahead.path.exists());
+    }
+
+    #[test]
+    fn a_detached_worktree_refuses_only_when_its_commits_are_on_no_branch() {
+        let f = Fixture::new();
+        sh(&f.repo, &["worktree", "add", "-q", "--detach", "../loose"]);
+        let loose = Target { path: f.root.join("loose"), repo: f.repo.clone() };
+        assert!(f.plan(std::slice::from_ref(&loose), &[]).refused.is_empty(), "at a commit main has");
+        commit(&loose.path, "b");
+        assert_eq!(reason(&f.plan(std::slice::from_ref(&loose), &[])), "it has 1 commit that's on no branch. Create a branch for it first");
+        commit(&loose.path, "c");
+        assert_eq!(reason(&f.plan(std::slice::from_ref(&loose), &[])), "it has 2 commits that are on no branch. Create a branch for them first");
+        sh(&f.repo, &["branch", "keep", "HEAD"]);
+        sh(&loose.path, &["branch", "-f", "keep", "HEAD"]);
+        let plan = f.plan(&[loose], &[]);
+        assert!(plan.refused.is_empty(), "a branch holds them now: {:?}", plan.refused);
+        assert_eq!(plan.items[0].unpushed, 2, "still only on this machine");
     }
 
     #[test]

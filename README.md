@@ -152,12 +152,15 @@ The keys work like the conversation list: Space marks, `a` marks everything, Esc
 
 Removing runs `git worktree remove`, never with `--force`. The branch stays, so its commits are kept. Everything is checked again just before each removal, and a worktree is refused if:
 
-- it has uncommitted changes or unpushed commits
+- it has uncommitted changes
+- a commit is checked out directly and some of its commits are on no branch, because nothing would keep them
 - a conversation is open in it, or an open one was last working in it
 - a conversation that worked in it was written to in the last minute, or runs in the background
 - a background job may own it, which `claude rm` removes instead
 - it's locked or has submodules, which Git won't remove either
 - Git couldn't read its state, or a running session's registry file can't be read
+
+Unpushed commits don't stop a removal, because the branch keeps them. They are only on your machine, though, so the popup warns about them in red. **Remove stays locked for 5 seconds**, with a countdown, and pressing `y`, Del or Remove before it ends starts it over. If more commits appear after you confirm, that worktree is skipped.
 
 The popup lists the conversations that worked in each worktree. It also warns when a conversation started there, because resuming that conversation later recreates the folder empty. **Files Git ignores, such as `.env` or build output, are deleted with the worktree.** The popup lists them with their size, and if new ones appear after you confirm, that worktree is skipped.
 
