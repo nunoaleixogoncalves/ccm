@@ -24,6 +24,10 @@ const BAR_OFF: Color = Color::Indexed(244);
 const BAR_NOTICE: Color = Color::Indexed(221);
 const BAR_ON: Color = Color::Indexed(252);
 const BAR_DANGER: Color = Color::Indexed(203);
+const BAR_GROUP: Color = Color::Indexed(109);
+/// Where a group's buttons start, so wrapped ones stay under their group.
+const FOOTER_INDENT: u16 = 9;
+const MAX_FOOTER_ROWS: u16 = 4;
 const MIN_HEIGHT_FOR_PREVIEW: u16 = 18;
 
 struct Column {
@@ -517,43 +521,61 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 /// Every button, in priority order, since the last ones drop off a narrow terminal.
-fn footer_buttons(app: &App) -> [(&'static str, &'static str, Action, bool); 19] {
+type Button = (&'static str, &'static str, Action, bool);
+
+fn footer_groups(app: &App) -> [(&'static str, Vec<Button>); 2] {
     [
-        ("Enter", "Resume", Action::Resume, false),
-        ("/", "Search", Action::Search, !app.query.is_empty()),
-        ("d", "Delete", Action::Delete, app.confirm_delete.is_some()),
-        ("Shift+R", "Rename", Action::Rename, false),
-        ("Space", "Mark", Action::Mark, false),
-        ("a", "All", Action::MarkAll, false),
-        ("y", "Copy ID", Action::CopyId, false),
-        ("Shift+Y", "Copy command", Action::CopyCommand, false),
-        ("Shift+O", "Reopen", Action::Reopen, false),
-        ("o", "Open", Action::ToggleOpen, app.filters.open),
-        ("x", "Crashed", Action::ToggleCrashed, app.filters.crashed),
-        ("Shift+J", "Junk", Action::ToggleJunk, app.filters.junk),
-        ("m", "Missing", Action::ToggleMissing, app.filters.missing),
-        ("l", "Large", Action::ToggleLarge, app.filters.large),
-        ("c", "Clear", Action::ClearFilters, false),
-        ("q", "Quit", Action::Quit, false),
-        ("g", "Group", Action::ToggleGroup, app.grouped),
-        ("s", "Sort", Action::NextSort, false),
-        ("r", "Reverse", Action::ReverseSort, false),
+        (
+            "Actions",
+            vec![
+                ("Enter", "Resume", Action::Resume, false),
+                ("d", "Delete", Action::Delete, app.confirm_delete.is_some()),
+                ("Shift+R", "Rename", Action::Rename, false),
+                ("Space", "Mark", Action::Mark, false),
+                ("a", "All", Action::MarkAll, false),
+                ("y", "Copy ID", Action::CopyId, false),
+                ("Shift+Y", "Copy command", Action::CopyCommand, false),
+                ("Shift+O", "Reopen", Action::Reopen, false),
+                ("q", "Quit", Action::Quit, false),
+            ],
+        ),
+        (
+            "View",
+            vec![
+                ("/", "Search", Action::Search, !app.query.is_empty()),
+                ("o", "Open", Action::ToggleOpen, app.filters.open),
+                ("x", "Crashed", Action::ToggleCrashed, app.filters.crashed),
+                ("Shift+J", "Junk", Action::ToggleJunk, app.filters.junk),
+                ("m", "Missing", Action::ToggleMissing, app.filters.missing),
+                ("l", "Large", Action::ToggleLarge, app.filters.large),
+                ("c", "Clear", Action::ClearFilters, false),
+                ("g", "Group", Action::ToggleGroup, app.grouped),
+                ("s", "Sort", Action::NextSort, false),
+                ("r", "Reverse", Action::ReverseSort, false),
+            ],
+        ),
     ]
 }
 
-/// Lays the buttons out in rows, as `(row, x, text, action, on)`.
-fn footer_layout(app: &App, width: u16) -> Vec<(u16, u16, String, Action, bool)> {
-    let (mut row, mut x) = (0, 0);
+/// Lays out the group names, with no action, and their buttons in rows, as `(row, x, text, action, on)`.
+/// Each group starts its own row.
+fn footer_layout(app: &App, width: u16) -> Vec<(u16, u16, String, Option<Action>, bool)> {
+    let mut row = 0;
     let mut out = Vec::new();
-    for (key, label, action, on) in footer_buttons(app) {
-        let text = format!(" {key} {label} ");
-        let w = text.chars().count() as u16;
-        if x > 0 && x + w > width {
-            row += 1;
-            x = 0;
+    for (name, buttons) in footer_groups(app) {
+        out.push((row, 0, format!(" {name:<0$}", FOOTER_INDENT as usize - 1), None, false));
+        let mut x = FOOTER_INDENT;
+        for (key, label, action, on) in buttons {
+            let text = format!(" {key} {label} ");
+            let w = text.chars().count() as u16;
+            if x > FOOTER_INDENT && x + w > width {
+                row += 1;
+                x = FOOTER_INDENT;
+            }
+            out.push((row, x, text, Some(action), on));
+            x += w + 1;
         }
-        out.push((row, x, text, action, on));
-        x += w + 1;
+        row += 1;
     }
     out
 }
@@ -561,7 +583,7 @@ fn footer_layout(app: &App, width: u16) -> Vec<(u16, u16, String, Action, bool)>
 /// Stays the same whatever the footer is showing, so the table doesn't jump. Narrower terminals
 /// lose the last buttons rather than more of the table.
 fn footer_rows(app: &App, width: u16) -> u16 {
-    footer_layout(app, width).last().map_or(1, |b| b.0 + 1).min(3)
+    footer_layout(app, width).last().map_or(1, |b| b.0 + 1).min(MAX_FOOTER_ROWS)
 }
 
 fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
@@ -601,6 +623,13 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     app.hit.buttons.clear();
     for (row, x, text, action, on) in layout {
         let Some(spans) = rows.get_mut(row as usize) else { break };
+        let Some(action) = action else {
+            spans.push(Span::styled(text, bar.fg(BAR_GROUP).add_modifier(Modifier::BOLD)));
+            continue;
+        };
+        if spans.is_empty() {
+            spans.push(Span::raw(" ".repeat(x as usize)));
+        }
         let width = text.chars().count() as u16;
         let disabled = match action {
             Action::Resume => !app.can_resume(),
@@ -755,7 +784,7 @@ mod tests {
         let (w, h) = (160, 30);
         let screen = render(&mut a, w, h);
         let lines: Vec<&str> = screen.lines().collect();
-        let footer = lines.iter().position(|l| l.contains("/ Search")).unwrap();
+        let footer = lines.iter().position(|l| l.contains("Enter Resume")).unwrap();
         assert!(lines[footer - 1].is_empty(), "{screen}");
         let details = lines.iter().position(|l| l.contains(" Details ")).unwrap();
         assert!(lines[details - 1].is_empty(), "{screen}");
@@ -763,8 +792,10 @@ mod tests {
         let cells = buffer(&mut a, w, h);
         assert_eq!(cells[(w - 1, footer as u16)].bg, BAR, "reaches the right edge");
         assert_eq!(cells[(0, footer as u16 - 1)].bg, Color::Reset);
-        let key = lines[footer].find("/ Search").unwrap() as u16;
-        assert_eq!((cells[(key, footer as u16)].fg, cells[(key + 2, footer as u16)].fg), (BAR_KEY, BAR_LABEL));
+        assert_eq!(cells[(1, footer as u16)].fg, BAR_GROUP);
+        let search = row_of(&screen, "/ Search");
+        let key = lines[search].find("/ Search").unwrap() as u16;
+        assert_eq!((cells[(key, search as u16)].fg, cells[(key + 2, search as u16)].fg), (BAR_KEY, BAR_LABEL));
     }
 
     #[test]
@@ -815,6 +846,40 @@ mod tests {
         for button in ["Shift+R Rename", "Shift+Y Copy command", "Shift+O Reopen", "Shift+J Junk", "q Quit"] {
             assert!(screen.contains(button), "{button} missing from {screen}");
         }
+    }
+
+    #[test]
+    fn actions_and_view_controls_sit_in_their_own_labelled_groups() {
+        let mut a = app();
+        let screen = render(&mut a, 160, 30);
+        let lines: Vec<&str> = screen.lines().collect();
+        let actions = lines[row_of(&screen, "Enter Resume")];
+        let view = lines[row_of(&screen, "o Open")];
+        assert!(actions.starts_with(" Actions") && actions.contains("q Quit") && !actions.contains("o Open"), "{screen}");
+        assert!(view.starts_with(" View") && view.contains("r Reverse") && !view.contains("q Quit"), "{screen}");
+    }
+
+    #[test]
+    fn every_button_fits_at_80_columns_and_wrapped_ones_stay_under_their_group() {
+        let mut a = app();
+        let screen = render(&mut a, 80, 30);
+        let count: usize = footer_groups(&a).iter().map(|(_, buttons)| buttons.len()).sum();
+        assert_eq!(a.hit.buttons.len(), count);
+        assert_eq!(footer_rows(&a, 80), MAX_FOOTER_ROWS);
+        let lines: Vec<&str> = screen.lines().collect();
+        let start = |text| lines[row_of(&screen, text)].find(text).unwrap();
+        assert_eq!(start("y Copy ID"), start("Enter Resume"), "{screen}");
+        assert_eq!(start("c Clear"), start("/ Search"), "{screen}");
+    }
+
+    #[test]
+    fn clicking_a_group_name_does_nothing() {
+        let mut a = app();
+        let screen = render(&mut a, 160, 20);
+        let y = row_of(&screen, "o Open") as u16;
+        assert!(!a.hit.buttons.iter().any(|(r, _)| r.x <= 2 && 2 < r.x + r.width && r.y == y));
+        a.on_mouse(MouseEventKind::Down(MouseButton::Left), 2, y);
+        assert!(!a.quit && a.status.is_none());
     }
 
     #[test]
@@ -1760,7 +1825,7 @@ mod tests {
     fn every_button_is_reachable_on_a_normal_width_and_narrow_does_not_panic() {
         let mut a = app();
         render(&mut a, 120, 30);
-        assert_eq!(a.hit.buttons.len(), footer_buttons(&a).len());
+        assert_eq!(a.hit.buttons.len(), footer_groups(&a).iter().map(|(_, buttons)| buttons.len()).sum::<usize>());
         for width in [160, 120, 100, 60, 20, 5, 1] {
             render(&mut a, width, 30);
             render(&mut a, width, 3);
@@ -1772,7 +1837,7 @@ mod tests {
         let mut a = app();
         let screen = render(&mut a, 100, 30);
         let y = row_of(&screen, "q Quit");
-        assert_eq!(y, 29, "{screen}");
+        assert_eq!(y, 27, "{screen}");
         let x = screen.lines().nth(y).unwrap().find("q Quit").unwrap() as u16;
         a.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y as u16);
         assert!(a.quit);
