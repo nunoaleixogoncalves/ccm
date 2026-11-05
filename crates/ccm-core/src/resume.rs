@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::format::hides_text;
+use crate::format::{hides_text, sanitize};
+use crate::rename::MAX_NAME;
 use crate::model::Session;
 use crate::paths::is_uuid;
 
@@ -47,11 +48,17 @@ pub enum Decision {
 
 /// Transcript content is untrusted, so the folder is checked before it's used for anything.
 pub fn decide(s: &Session) -> Decision {
+    if s.open && is_uuid(&s.id) {
+        return Decision::AlreadyOpen;
+    }
+    decide_fork(s)
+}
+
+/// Like `decide`, but an open conversation can be forked: the copy is a new conversation and the
+/// original carries on untouched.
+pub fn decide_fork(s: &Session) -> Decision {
     if !is_uuid(&s.id) {
         return Decision::InvalidId;
-    }
-    if s.open {
-        return Decision::AlreadyOpen;
     }
     let Some(folder) = s.folder.as_deref() else { return Decision::NoFolder };
     let path = Path::new(folder);
@@ -82,17 +89,52 @@ pub struct Launch {
     pub long_running: bool,
 }
 
-fn claude_args(id: &str) -> Vec<String> {
-    vec!["claude".into(), "--resume".into(), id.into()]
+/// A new conversation that starts as a copy of another. `ccm` picks its ID, so it knows which
+/// conversation is the fork; Claude Code records no link between the two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fork {
+    pub id: String,
+    pub name: String,
 }
 
-/// Opens a new terminal window, using `command` from the config if it's set.
-pub fn terminal_launch(id: &str, folder: &Path, command: Option<&[String]>) -> Launch {
+impl Fork {
+    /// A fork named after the original, with a fresh random ID.
+    pub fn of(original_name: &str) -> io::Result<Self> {
+        let name = sanitize(original_name);
+        let name = name.trim();
+        let name = if name.is_empty() { "(fork)".to_string() } else { format!("{} (fork)", name.chars().take(MAX_NAME - 7).collect::<String>()) };
+        Ok(Self { id: new_session_id()?, name })
+    }
+}
+
+/// A random version 4 UUID, the form Claude Code's session IDs take.
+pub fn new_session_id() -> io::Result<String> {
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]))
+}
+
+/// The command that resumes a conversation, or starts a fork of it. The name is joined to its
+/// option, so one starting with `-` can't be read as another option.
+pub fn claude_args(id: &str, fork: Option<&Fork>) -> Vec<String> {
+    let mut args = vec!["claude".to_string(), "--resume".into(), id.into()];
+    if let Some(f) = fork {
+        args.extend(["--fork-session".into(), "--session-id".into(), f.id.clone(), format!("--name={}", f.name)]);
+    }
+    args
+}
+
+/// Opens a new terminal window, using `command` from the config if it's set. `claude` comes from
+/// `claude_args`.
+pub fn terminal_launch(claude: &[String], folder: &Path, command: Option<&[String]>) -> Launch {
     let (program, mut args) = match command {
         Some([program, rest @ ..]) => (program.clone(), rest.to_vec()),
         _ => ("xdg-terminal-exec".to_string(), vec![format!("--dir={}", folder.display()), "--".to_string()]),
     };
-    args.extend(claude_args(id));
+    args.extend_from_slice(claude);
     Launch { program, args, cwd: folder.to_owned(), long_running: true }
 }
 
@@ -119,7 +161,7 @@ pub fn find_space(terminals: &[HerdrTerminal], folder: &str) -> Option<String> {
 
 /// Adds a tab to `space`, or creates a workspace when there's none. Labels `herdr-app` doesn't
 /// know yet become a new tab or workspace.
-pub fn herdr_launch(id: &str, folder: &Path, space: Option<&str>, tab_id: &str, new_space_id: &str) -> Launch {
+pub fn herdr_launch(claude: &[String], folder: &Path, space: Option<&str>, tab_id: &str, new_space_id: &str) -> Launch {
     let mut args: Vec<String> = ["run", "--bg", "--keep", "--no-parent", "--outlive-parent", "--no-notify", "--cwd"]
         .into_iter()
         .map(str::to_owned)
@@ -130,7 +172,7 @@ pub fn herdr_launch(id: &str, folder: &Path, space: Option<&str>, tab_id: &str, 
     args.push("--label".into());
     args.push(format!("herdr.tab={tab_id}"));
     args.push("--".into());
-    args.extend(claude_args(id));
+    args.extend_from_slice(claude);
     Launch { program: "hc".into(), args, cwd: folder.to_owned(), long_running: false }
 }
 
@@ -249,8 +291,10 @@ pub fn start(launch: &Launch) -> io::Result<()> {
 }
 
 /// What a user can run by hand if starting a terminal fails.
-pub fn manual_command(id: &str, folder: &Path) -> String {
-    format!("cd '{}' && claude --resume {id}", folder.display().to_string().replace('\'', r"'\''"))
+pub fn manual_command(id: &str, fork: Option<&Fork>, folder: &Path) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    let args: Vec<String> = claude_args(id, fork).iter().map(|a| if a.starts_with("--name=") { quote(a) } else { a.clone() }).collect();
+    format!("cd {} && {}", quote(&folder.display().to_string()), args.join(" "))
 }
 
 /// Whether Claude Code has accepted its trust prompt for this folder or a parent of it. An
@@ -358,7 +402,7 @@ mod tests {
 
     #[test]
     fn a_new_terminal_keeps_every_argument_separate() {
-        let l = terminal_launch(ID, Path::new("/work/my dir; rm -rf"), None);
+        let l = terminal_launch(&claude_args(ID, None), Path::new("/work/my dir; rm -rf"), None);
         assert_eq!(l.program, "xdg-terminal-exec");
         assert_eq!(l.args, ["--dir=/work/my dir; rm -rf", "--", "claude", "--resume", ID]);
         assert_eq!(l.cwd, Path::new("/work/my dir; rm -rf"));
@@ -366,12 +410,48 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_gets_a_new_id_and_a_name_that_cannot_pass_for_an_option() {
+        let fork = Fork::of("-rf\u{1b}[2J Fix it").unwrap();
+        assert!(is_uuid(&fork.id) && fork.id.as_bytes()[14] == b'4', "{}", fork.id);
+        assert_ne!(Fork::of("x").unwrap().id, fork.id);
+        assert!(!fork.name.contains('\u{1b}') && fork.name.ends_with("Fix it (fork)"), "{}", fork.name);
+        assert_eq!(Fork::of("  ").unwrap().name, "(fork)");
+        assert_eq!(Fork::of(&"n".repeat(500)).unwrap().name.chars().count(), MAX_NAME);
+        let args = claude_args(ID, Some(&fork));
+        assert_eq!(args[..5], ["claude", "--resume", ID, "--fork-session", "--session-id"]);
+        assert_eq!(args[5], fork.id);
+        assert_eq!(args[6], format!("--name={}", fork.name));
+        let l = terminal_launch(&args, Path::new("/w"), None);
+        assert_eq!(l.args[2..], args[..]);
+    }
+
+    #[test]
+    fn the_manual_command_quotes_the_folder_and_the_name() {
+        assert_eq!(manual_command(ID, None, Path::new("/w/it's")), format!("cd '/w/it'\\''s' && claude --resume {ID}"));
+        let fork = Fork { id: "new".into(), name: "a'b (fork)".into() };
+        assert_eq!(
+            manual_command(ID, Some(&fork), Path::new("/w")),
+            format!("cd '/w' && claude --resume {ID} --fork-session --session-id new '--name=a'\\''b (fork)'")
+        );
+    }
+
+    #[test]
+    fn an_open_conversation_can_be_forked_but_not_resumed() {
+        let mut s = session(Some("/work/a"));
+        s.open = true;
+        assert_eq!(decide(&s), Decision::AlreadyOpen);
+        assert_eq!(decide_fork(&s), Decision::Go("/work/a".into()));
+        s.id = "--dangerous".into();
+        assert_eq!(decide_fork(&s), Decision::InvalidId);
+    }
+
+    #[test]
     fn a_configured_terminal_replaces_the_default() {
         let cmd = ["foot".to_string(), "-e".to_string()];
-        let l = terminal_launch(ID, Path::new("/w"), Some(&cmd));
+        let l = terminal_launch(&claude_args(ID, None), Path::new("/w"), Some(&cmd));
         assert_eq!(l.program, "foot");
         assert_eq!(l.args, ["-e", "claude", "--resume", ID]);
-        assert_eq!(terminal_launch(ID, Path::new("/w"), Some(&[])).program, "xdg-terminal-exec");
+        assert_eq!(terminal_launch(&claude_args(ID, None), Path::new("/w"), Some(&[])).program, "xdg-terminal-exec");
     }
 
     fn term(space: &str, created_ms: i64, folder: &str) -> HerdrTerminal {
@@ -394,7 +474,7 @@ mod tests {
 
     #[test]
     fn herdr_adds_a_tab_or_a_workspace_and_outlives_ccm() {
-        let tab = herdr_launch(ID, Path::new("/w x"), Some("sp1"), "tb9", "spnew");
+        let tab = herdr_launch(&claude_args(ID, None), Path::new("/w x"), Some("sp1"), "tb9", "spnew");
         assert_eq!(tab.program, "hc");
         assert!(!tab.long_running);
         assert_eq!(
@@ -402,7 +482,7 @@ mod tests {
             ["run", "--bg", "--keep", "--no-parent", "--outlive-parent", "--no-notify", "--cwd", "/w x",
              "--label", "herdr.space=sp1", "--label", "herdr.tab=tb9", "--", "claude", "--resume", ID]
         );
-        let new = herdr_launch(ID, Path::new("/w"), None, "tb9", "spnew");
+        let new = herdr_launch(&claude_args(ID, None), Path::new("/w"), None, "tb9", "spnew");
         assert!(new.args.contains(&"herdr.space=spnew".to_string()));
     }
 
@@ -439,8 +519,8 @@ mod tests {
 
     #[test]
     fn the_manual_command_is_safe_to_paste() {
-        assert_eq!(manual_command(ID, Path::new("/a b")), format!("cd '/a b' && claude --resume {ID}"));
-        assert_eq!(manual_command(ID, Path::new("/it's")), format!(r"cd '/it'\''s' && claude --resume {ID}"));
+        assert_eq!(manual_command(ID, None, Path::new("/a b")), format!("cd '/a b' && claude --resume {ID}"));
+        assert_eq!(manual_command(ID, None, Path::new("/it's")), format!(r"cd '/it'\''s' && claude --resume {ID}"));
     }
 
     #[test]
@@ -458,7 +538,7 @@ mod tests {
 
     #[test]
     fn session_variables_are_cleared_and_settings_kept() {
-        let cmd = command(&terminal_launch(ID, Path::new("/w"), None));
+        let cmd = command(&terminal_launch(&claude_args(ID, None), Path::new("/w"), None));
         let removed: Vec<_> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_owned()).collect();
         assert!(removed.iter().any(|k| k == "CLAUDECODE"));
         assert!(removed.iter().any(|k| k == "CLAUDE_CODE_SESSION_ID"));

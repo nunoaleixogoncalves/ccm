@@ -8,7 +8,7 @@ use ccm_core::format::bytes;
 use ccm_core::model::Session;
 use ccm_core::preview::{self, Preview};
 use ccm_core::rename::MAX_NAME;
-use ccm_core::resume::{decide, is_safe_folder, manual_command, Decision};
+use ccm_core::resume::{decide, decide_fork, is_safe_folder, manual_command, Decision, Fork};
 use ccm_core::query::{group_by_folder, group_by_repo, select, status_rank, Filters, GroupRow, SortKey};
 use ccm_core::repo::Place;
 use ccm_core::window::{context_label, window_size};
@@ -33,6 +33,7 @@ pub enum Action {
     NextSort,
     ReverseSort,
     Resume,
+    Fork,
     Search,
     Delete,
     Rename,
@@ -83,7 +84,8 @@ pub enum View {
 
 /// Runs a query. `None` means the query has nothing to search for.
 /// Starts a resumed conversation and returns what to tell the user.
-pub type ResumeFn = Box<dyn FnMut(&str, &Path) -> Result<String, String>>;
+/// With a fork, it starts that fork instead.
+pub type ResumeFn = Box<dyn FnMut(&str, Option<&Fork>, &Path) -> Result<String, String>>;
 /// Works out what a delete would remove, without changing anything.
 pub type PlanFn = Box<dyn FnMut(&[String]) -> Plan>;
 /// Carries out a plan, including the memory notes when asked.
@@ -107,6 +109,9 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const DEL_PAUSE: Duration = Duration::from_secs(1);
 /// A resumed session takes a moment to register as open. Until then, block a second launch.
 const RESUME_COOLDOWN: Duration = Duration::from_secs(20);
+/// How long a new fork may take to show up and still be selected when it does. Claude Code may
+/// save it only once the first message is sent.
+const FORK_WAIT: Duration = Duration::from_secs(15 * 60);
 /// How long removing worktrees with unpushed commits stays locked, so the warning gets read.
 pub const UNPUSHED_COUNTDOWN: Duration = Duration::from_secs(5);
 const DELETE_REPORT: &str = " Delete finished ";
@@ -214,8 +219,12 @@ pub struct App {
     /// Lines scrolled back from the newest message.
     pub preview_scroll: usize,
     pub resume: Option<ResumeFn>,
-    /// Waiting for `y` to recreate this folder for this conversation.
-    pub confirm_folder: Option<(String, PathBuf)>,
+    /// Waiting for `y` to recreate this folder for this conversation, and whether to fork it.
+    pub confirm_folder: Option<(String, PathBuf, bool)>,
+    /// Each fork `ccm` started, and the conversation it copied.
+    pub forks: HashMap<String, String>,
+    /// A fork just started, to select once Claude Code saves it.
+    awaiting_fork: Option<(String, Instant)>,
     /// Conversations picked for a delete, which otherwise acts on the selected row.
     pub marked: HashSet<String>,
     pub planner: Option<PlanFn>,
@@ -277,6 +286,8 @@ impl App {
             preview_scroll: 0,
             resume: None,
             confirm_folder: None,
+            forks: HashMap::new(),
+            awaiting_fork: None,
             marked: HashSet::new(),
             planner: None,
             deleter: None,
@@ -307,6 +318,13 @@ impl App {
 
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
         self.sessions = sessions;
+        if let Some((id, started)) = self.awaiting_fork.take() {
+            if self.sessions.iter().any(|s| s.id == id) {
+                self.selected_id = Some(id);
+            } else if started.elapsed() < FORK_WAIT {
+                self.awaiting_fork = Some((id, started));
+            }
+        }
         let present: HashSet<&str> = self.sessions.iter().map(|s| s.id.as_str()).collect();
         self.marked.retain(|id| present.contains(id.as_str()));
         self.run_search();
@@ -537,6 +555,20 @@ impl App {
         self.selected().is_some_and(|s| !s.open && !self.recently_resumed(&s.id))
     }
 
+    /// The original of a fork `ccm` started, and whether it still exists.
+    pub fn forked_from(&self, id: &str) -> Option<Option<&Session>> {
+        let from = self.forks.get(id)?;
+        Some(self.sessions.iter().find(|s| &s.id == from))
+    }
+
+    /// The forks of a conversation that still exist.
+    pub fn forks_of(&self, id: &str) -> Vec<&Session> {
+        let mut out: Vec<&Session> =
+            self.sessions.iter().filter(|s| self.forks.get(&s.id).is_some_and(|from| from == id)).collect();
+        out.sort_by_key(|s| s.started_at_ms);
+        out
+    }
+
     /// Delete and rename need the conversation closed, and a just-resumed one soon won't be.
     pub fn can_change(&self) -> bool {
         self.selected().is_some_and(|s| !s.open && !self.recently_resumed(&s.id))
@@ -756,7 +788,7 @@ impl App {
     /// A control character in it could end the paste early, whatever the quoting.
     fn resume_command(s: &Session) -> String {
         match s.folder.as_deref().filter(|f| is_safe_folder(f)) {
-            Some(folder) => manual_command(&s.id, Path::new(folder)),
+            Some(folder) => manual_command(&s.id, None, Path::new(folder)),
             None => format!("claude --resume {}", s.id),
         }
     }
@@ -778,8 +810,47 @@ impl App {
             Decision::NoFolder => self.status = Some("No folder is recorded for this conversation.".into()),
             Decision::UnsafeFolder => self.status = Some("The recorded folder isn't a safe path, so it won't be used.".into()),
             Decision::InvalidId => self.status = Some("This conversation's ID isn't valid.".into()),
-            Decision::FolderMissing(folder) => self.confirm_folder = Some((id, folder)),
+            Decision::FolderMissing(folder) => self.confirm_folder = Some((id, folder, false)),
         }
+    }
+
+    /// Starts a new conversation as a copy of the selected one, in the same folder, which is
+    /// where Claude Code looks for the original.
+    fn fork_selected(&mut self) {
+        let Some(s) = self.selected() else { return };
+        let id = s.id.clone();
+        if self.recently_resumed(&fork_key(&id)) {
+            self.status = Some("A fork of this conversation is already starting.".into());
+            return;
+        }
+        match decide_fork(s) {
+            Decision::Go(folder) => self.launch_fork(id, &folder),
+            Decision::FolderMissing(folder) => self.confirm_folder = Some((id, folder, true)),
+            Decision::NoFolder => self.status = Some("No folder is recorded for this conversation.".into()),
+            Decision::UnsafeFolder => self.status = Some("The recorded folder isn't a safe path, so it won't be used.".into()),
+            Decision::InvalidId | Decision::AlreadyOpen => self.status = Some("This conversation's ID isn't valid.".into()),
+        }
+    }
+
+    fn launch_fork(&mut self, id: String, folder: &Path) {
+        let Some(original) = self.sessions.iter().find(|s| s.id == id) else { return };
+        let fork = match Fork::of(&original.name) {
+            Ok(fork) => fork,
+            Err(e) => {
+                self.status = Some(format!("Couldn't make an ID for the fork: {e}"));
+                return;
+            }
+        };
+        let Some(resume) = self.resume.as_mut() else { return };
+        self.status = Some(match resume(&id, Some(&fork), folder) {
+            Ok(message) => {
+                self.just_resumed.insert(fork_key(&id), Instant::now());
+                self.forks.insert(fork.id.clone(), id);
+                self.awaiting_fork = Some((fork.id, Instant::now()));
+                format!("Started a fork. {message} It shows here once Claude Code saves it.")
+            }
+            Err(e) => e,
+        });
     }
 
     fn launch(&mut self, id: String, folder: &Path) {
@@ -791,7 +862,7 @@ impl App {
 
     fn start_resume(&mut self, id: &str, folder: &Path) -> Result<String, String> {
         let Some(resume) = self.resume.as_mut() else { return Err("Resume isn't available.".into()) };
-        match resume(id, folder) {
+        match resume(id, None, folder) {
             Ok(message) => {
                 self.just_resumed.insert(id.to_string(), Instant::now());
                 Ok(message)
@@ -879,12 +950,13 @@ impl App {
 
     /// Answers the "recreate this folder?" question. Any key but `y` cancels.
     fn answer_folder(&mut self, key: KeyCode) {
-        let Some((id, folder)) = self.confirm_folder.take() else { return };
+        let Some((id, folder, fork)) = self.confirm_folder.take() else { return };
         if key != KeyCode::Char('y') {
             self.status = Some("Cancelled.".into());
             return;
         }
         match std::fs::create_dir_all(&folder) {
+            Ok(()) if fork => self.launch_fork(id, &folder),
             Ok(()) => self.launch(id, &folder),
             Err(e) => self.status = Some(format!("Couldn't create {}: {e}", sanitize(&folder.display().to_string()))),
         }
@@ -996,6 +1068,7 @@ impl App {
             Action::ReverseSort => self.descending = !self.descending,
             Action::Search => self.typing = true,
             Action::Resume => self.resume_selected(),
+            Action::Fork => self.fork_selected(),
             Action::Delete if self.view == View::Worktrees => self.start_remove(),
             Action::Delete => self.start_delete(),
             Action::Rename => self.start_rename(),
@@ -1111,6 +1184,7 @@ impl App {
             KeyCode::Char(']') => self.preview_scroll = self.preview_scroll.saturating_sub(3),
             KeyCode::Char('d') | KeyCode::Delete => self.run(Action::Delete),
             KeyCode::Char('R') => self.run(Action::Rename),
+            KeyCode::Char('f') => self.run(Action::Fork),
             KeyCode::Char('y') => self.run(Action::CopyId),
             KeyCode::Char('Y') => self.run(Action::CopyCommand),
             KeyCode::Char(' ') => self.run(Action::Mark),
@@ -1245,4 +1319,9 @@ impl App {
             }
         }
     }
+}
+
+/// Keeps a fork's cooldown apart from a resume's, so one doesn't block the other.
+fn fork_key(id: &str) -> String {
+    format!("fork:{id}")
 }

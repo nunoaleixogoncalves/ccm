@@ -447,6 +447,16 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     if let Some(next) = &s.continued_in {
         notes.push(format!("Continued in {}", sanitize(next)));
     }
+    match app.forked_from(&s.id) {
+        Some(Some(original)) => notes.push(format!("Forked from {}", sanitize(&display_name(original)))),
+        Some(None) => notes.push("Forked from a deleted conversation".into()),
+        None => {}
+    }
+    let forks = app.forks_of(&s.id);
+    if !forks.is_empty() {
+        let names: Vec<String> = forks.iter().map(|f| sanitize(&display_name(f))).collect();
+        notes.push(format!("Forks: {}", names.join(", ")));
+    }
     if s.bad_lines > 0 {
         notes.push(format!("{} unreadable lines", s.bad_lines));
     }
@@ -583,6 +593,7 @@ fn footer_groups(app: &App) -> [(&'static str, Vec<Button>); 2] {
             "Actions",
             vec![
                 ("Enter", "Resume", Action::Resume, false),
+                ("f", "Fork", Action::Fork, false),
                 ("d", "Delete", Action::Delete, app.confirm_delete.is_some()),
                 ("Shift+R", "Rename", Action::Rename, false),
                 ("Space", "Mark", Action::Mark, false),
@@ -651,10 +662,14 @@ fn footer_rows(app: &App, width: u16) -> u16 {
 
 fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     let bar = Style::new().bg(BAR).fg(BAR_LABEL);
-    if let Some((_, folder)) = &app.confirm_folder {
+    if let Some((_, folder, fork)) = &app.confirm_folder {
         app.hit.buttons.clear();
         // The end of a path is the telling part, and the keys must stay on screen.
-        let rest = " no longer exists. Press y to recreate it and resume, any other key to cancel.";
+        let rest = if *fork {
+            " no longer exists. Press y to recreate it and fork, any other key to cancel."
+        } else {
+            " no longer exists. Press y to recreate it and resume, any other key to cancel."
+        };
         let room = (area.width as usize).saturating_sub(rest.width() + 1).max(MIN_NAME_WIDTH);
         let text = format!(" {}{rest}", fit_start(&sanitize(&folder.display().to_string()), room));
         f.render_widget(Paragraph::new(text).style(bar.fg(BAR_NOTICE).add_modifier(Modifier::BOLD)), area);
@@ -696,6 +711,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
         let width = text.chars().count() as u16;
         let disabled = match action {
             Action::Resume => !app.can_resume(),
+            Action::Fork => app.selected().is_none(),
             Action::Rename => !app.can_change(),
             Action::Delete => !app.can_press_delete(),
             _ => false,
@@ -728,6 +744,8 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
 mod tests {
     use super::*;
     use crate::app::RepoRequest;
+    use ccm_core::resume::Fork;
+    use std::path::PathBuf;
     use ccm_core::config::Config;
     use ccm_core::delete::{Failure, Note, Outcome, Plan, Skipped};
     use ccm_core::model::Source;
@@ -933,7 +951,7 @@ mod tests {
         assert_eq!(footer_rows(&a, 80), MAX_FOOTER_ROWS);
         let lines: Vec<&str> = screen.lines().collect();
         let start = |text| lines[row_of(&screen, text)].find(text).unwrap();
-        assert_eq!(start("y Copy ID"), start("Enter Resume"), "{screen}");
+        assert_eq!(start("a All"), start("Enter Resume"), "{screen}");
         assert_eq!(start("c Clear"), start("/ Search"), "{screen}");
     }
 
@@ -1467,7 +1485,7 @@ mod tests {
     fn resumable(a: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<(String, std::path::PathBuf)>>> {
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let seen = calls.clone();
-        a.resume = Some(Box::new(move |id, folder| {
+        a.resume = Some(Box::new(move |id, _, folder| {
             seen.borrow_mut().push((id.to_string(), folder.to_owned()));
             Ok("Opened in a new terminal.".to_string())
         }));
@@ -1484,6 +1502,81 @@ mod tests {
         s.open = open;
         a.set_sessions(vec![s]);
         a
+    }
+
+    type ForkCalls = Rc<RefCell<Vec<(String, Option<Fork>, PathBuf)>>>;
+
+    /// Records resumes and forks instead of starting anything.
+    fn forkable(a: &mut App) -> ForkCalls {
+        let calls: ForkCalls = Rc::new(RefCell::new(Vec::new()));
+        let seen = calls.clone();
+        a.resume = Some(Box::new(move |id, fork, folder| {
+            seen.borrow_mut().push((id.to_string(), fork.cloned(), folder.to_owned()));
+            Ok("Opened in a new terminal.".to_string())
+        }));
+        calls
+    }
+
+    #[test]
+    fn f_starts_a_named_fork_in_the_same_folder_even_while_the_original_is_open() {
+        let mut a = resume_app("/work/a", true, true);
+        let calls = forkable(&mut a);
+        a.on_key(KeyCode::Char('f'));
+        let (id, fork, folder) = calls.borrow()[0].clone();
+        let fork = fork.expect("a fork, not a resume");
+        assert_eq!((id.as_str(), folder.as_path(), fork.name.as_str()), (VALID_A, Path::new("/work/a"), "Chat (fork)"));
+        assert_ne!(fork.id, VALID_A);
+        assert!(render(&mut a, 200, 30).contains("Started a fork. Opened in a new terminal."));
+
+        a.on_key(KeyCode::Char('f'));
+        assert_eq!(calls.borrow().len(), 1, "a second press doesn't start a second fork");
+        assert!(a.status.as_deref().unwrap().contains("already starting"));
+    }
+
+    #[test]
+    fn a_fork_is_selected_when_it_appears_and_both_sides_name_each_other() {
+        let mut a = resume_app("/work/a", true, false);
+        let calls = forkable(&mut a);
+        let mut other = session("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "Other", "/work/b", 0);
+        other.started_at_ms = Some(5);
+        let original = a.sessions[0].clone();
+        a.set_sessions(vec![original.clone(), other.clone()]);
+        while a.selected().unwrap().id != VALID_A {
+            a.on_key(KeyCode::Down);
+        }
+        a.on_key(KeyCode::Char('f'));
+        let fork_id = calls.borrow()[0].1.clone().unwrap().id;
+
+        a.set_sessions(vec![original.clone(), other.clone()]);
+        assert_eq!(a.selected().unwrap().id, VALID_A, "nothing to select until Claude Code saves it");
+        let fork = session(&fork_id, "Chat (fork)", "/work/a", 0);
+        a.set_sessions(vec![original.clone(), other.clone(), fork.clone()]);
+        assert_eq!(a.selected().unwrap().id, fork_id);
+        assert!(render(&mut a, 200, 40).contains("Forked from Chat"));
+
+        a.on_key(KeyCode::Down);
+        while a.selected().unwrap().id != VALID_A {
+            a.on_key(KeyCode::Down);
+        }
+        assert!(render(&mut a, 200, 40).contains("Forks: Chat (fork)"));
+
+        a.set_sessions(vec![other, fork]);
+        while a.selected().unwrap().id != fork_id {
+            a.on_key(KeyCode::Up);
+        }
+        assert!(render(&mut a, 200, 40).contains("Forked from a deleted conversation"));
+    }
+
+    #[test]
+    fn forking_into_a_missing_folder_asks_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("gone");
+        let mut a = resume_app(folder.to_str().unwrap(), false, false);
+        let calls = forkable(&mut a);
+        a.on_key(KeyCode::Char('f'));
+        assert!(render(&mut a, 200, 30).contains("Press y to recreate it and fork"));
+        a.on_key(KeyCode::Char('y'));
+        assert!(folder.is_dir() && calls.borrow()[0].1.is_some());
     }
 
     #[test]
@@ -1509,7 +1602,7 @@ mod tests {
     #[test]
     fn a_failed_start_can_be_retried() {
         let mut a = resume_app("/work/a", true, false);
-        a.resume = Some(Box::new(|_, _| Err("no terminal".to_string())));
+        a.resume = Some(Box::new(|_, _, _| Err("no terminal".to_string())));
         a.on_key(KeyCode::Enter);
         assert_eq!(a.status.as_deref(), Some("no terminal"));
         assert!(a.can_resume());
@@ -2304,7 +2397,7 @@ mod tests {
     #[test]
     fn one_failure_does_not_stop_the_others_and_is_reported() {
         let mut a = crashed_app();
-        a.resume = Some(Box::new(|id, _| if id == JUNK_ID { Err("no terminal".into()) } else { Ok("Opened.".into()) }));
+        a.resume = Some(Box::new(|id, _, _| if id == JUNK_ID { Err("no terminal".into()) } else { Ok("Opened.".into()) }));
         a.on_key(KeyCode::Char('O'));
         a.on_key(KeyCode::Enter);
         let screen = render(&mut a, 120, 30);
