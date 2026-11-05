@@ -174,7 +174,11 @@ fn reopen_dialog(app: &App) -> Dialog {
             let folder = session.and_then(|s| s.folder.as_deref()).map_or("-".to_string(), |p| sanitize(&short_path(p, &app.home)));
             let missing = if session.is_some_and(Session::is_folder_missing) { "  (folder missing, recreated if ticked)" } else { "" };
             let mark = if row.ticked { "[x]" } else { "[ ]" };
-            // A long name mustn't push out where it reopens, or the warning about that folder.
+            // A long name or folder mustn't push out the warning about that folder. The end of a
+            // path is the telling part.
+            let name_room = name.width().min(MIN_NAME_WIDTH);
+            let folder_room = width.saturating_sub(mark.len() + 3 + name_room + missing.width()).max(MIN_NAME_WIDTH);
+            let folder = fit_start(&folder, folder_room);
             let room = width.saturating_sub(mark.len() + 3 + folder.width() + missing.width()).max(MIN_NAME_WIDTH);
             let text = fit_end(&format!("{mark} {}  {folder}{missing}", fit_end(&name, room)), width);
             let style = if i == reopen.cursor { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
@@ -2065,6 +2069,19 @@ mod tests {
         a.on_key(KeyCode::Enter);
         assert!(gone.is_dir());
         assert_eq!(resumes.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_long_missing_folder_keeps_its_warning_and_its_end() {
+        let gone = format!("/somewhere{}/gone-folder", "/very-long-part".repeat(12));
+        let mut a = resume_app(&gone, false, false);
+        a.sessions[0].crashed = true;
+        a.sessions[0].folder_exists = false;
+        a.run(Action::ClearFilters);
+        a.on_key(KeyCode::Char('O'));
+        let screen = render(&mut a, 150, 30);
+        let row = screen.lines().find(|l| l.contains("[ ]")).unwrap();
+        assert!(row.contains("gone-folder  (folder missing, recreated if ticked)"), "{screen}");
     }
 
     #[test]

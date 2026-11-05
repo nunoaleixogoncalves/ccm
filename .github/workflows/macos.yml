@@ -15,7 +15,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup update stable && rustup default stable
-      - run: cargo test --locked
+      - run: cargo test --locked --workspace --no-fail-fast
       - run: ./install.sh </dev/null
         env:
           CCM_INSTALL_DIR: ${{ runner.temp }}/bin

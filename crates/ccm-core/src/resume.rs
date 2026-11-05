@@ -468,14 +468,16 @@ mod tests {
     #[test]
     fn a_started_program_runs_in_its_own_session() {
         let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("sid");
+        let out = dir.path().join("ids");
         let script = dir.path().join("s.sh");
-        std::fs::write(&script, format!("#!/bin/sh\nps -o sid= -p $$ > '{}'\n", out.display())).unwrap();
+        // A new session makes it the leader of a new process group. `sid` isn't in macOS's `ps`.
+        std::fs::write(&script, format!("#!/bin/sh\necho $$ $(ps -o pgid= -p $$) > '{}'\n", out.display())).unwrap();
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let l = Launch { program: script.display().to_string(), args: vec![], cwd: dir.path().into(), long_running: false };
         start(&l).unwrap();
-        let child_sid: i32 = std::fs::read_to_string(&out).unwrap().trim().parse().unwrap();
-        assert_ne!(child_sid, unsafe { libc::getsid(0) });
+        let ids = std::fs::read_to_string(&out).unwrap();
+        let (pid, group) = ids.trim().split_once(' ').unwrap();
+        assert_eq!(pid, group.trim());
     }
 
     #[test]
