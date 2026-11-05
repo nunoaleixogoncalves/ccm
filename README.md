@@ -87,23 +87,37 @@ Run `ccm` from anywhere.
 
 ### Keys
 
-Most actions are also buttons in the footer, so you can click them.
+Most keys are also buttons in the footer, so you can click them. The footer splits them into **Actions**, which do something to a conversation, and **View**, which only change what the list shows.
 
-| Key | Action |
+Moving around:
+
+| Key | What it does |
 |---|---|
 | Up, Down, or `k`, `j` | Move the selection |
 | Page Up, Page Down, Home, End | Move further |
-| Enter | Resume the selected conversation |
-| `/` | Search. Enter keeps the results, Esc clears them |
 | `[`, `]` | Scroll the preview back and forward |
-| Space | Mark or unmark, then move to the next row |
-| `a` | Mark everything shown, or clear those marks |
+
+Actions:
+
+| Key | What it does |
+|---|---|
+| Enter | Resume the selected conversation |
 | `d`, then `y` | Delete the selected or marked conversations |
 | `m`, while confirming a delete | Choose whether to delete memory notes too. It only appears when there are notes to delete |
 | `Shift+R` | Rename |
+| Space | Mark or unmark, then move to the next row |
+| `a` | Mark everything shown, or clear those marks |
 | `y` | Copy the conversation's ID |
 | `Shift+Y` | Copy the command that resumes it |
 | `Shift+O` | Open the list of crashed conversations to reopen |
+| Esc | Clear the marks, then the search, then quit |
+| `q`, Ctrl-C | Quit |
+
+View:
+
+| Key | What it does |
+|---|---|
+| `/` | Search. Enter keeps the results, Esc clears them |
 | `o` | Show only open conversations |
 | `x` | Show only crashed conversations |
 | `Shift+J` | Show only junk, meaning conversations Claude never replied to |
@@ -113,8 +127,6 @@ Most actions are also buttons in the footer, so you can click them.
 | `g` | Group by folder |
 | `s` | Change the sort column |
 | `r` | Reverse the sort |
-| Esc | Clear the marks, then the search, then quit |
-| `q`, Ctrl-C | Quit |
 
 With the mouse, you can click a row to select it, double-click to resume, click a column heading to sort, and use the wheel to scroll.
 
