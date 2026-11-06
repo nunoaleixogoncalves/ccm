@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 use rayon::prelude::*;
 use serde::Deserialize;
 
+use crate::model::Source;
 use crate::paths::{is_uuid, Paths};
 use crate::recovery;
 use crate::registry::{has_unreadable_entry, live_roster, open_sessions};
@@ -32,6 +33,8 @@ const MEMORY_INDEX: &str = "MEMORY.md";
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
     pub id: String,
+    /// Which tool's conversation this is. Each tool's conversations are deleted its own way.
+    pub source: Source,
     /// Removed first.
     pub side: Vec<PathBuf>,
     /// Removed last, and only if everything in `side` went.
@@ -126,7 +129,7 @@ pub fn plan(paths: &Paths, proc_root: &Path, ids: &[String]) -> Plan {
         }
         let side = side_paths(paths, id, &projects, &jobs, &mut plan.warnings);
         let bytes = side.iter().chain(&transcripts).map(|p| size_of(p)).sum();
-        plan.items.push(Item { id: id.clone(), side, transcripts, bytes });
+        plan.items.push(Item { id: id.clone(), source: Source::ClaudeCode, side, transcripts, bytes });
     }
     plan.notes = sole_notes(&plan.items.iter().collect::<Vec<_>>(), &projects);
     plan
@@ -407,7 +410,8 @@ pub fn execute(paths: &Paths, proc_root: &Path, plan: &Plan, include_notes: bool
     // The plan may have sat on screen for a while.
     let busy = Busy::read(paths, proc_root);
     let mut items = Vec::new();
-    for item in &plan.items {
+    // Other tools' conversations are deleted by their own code.
+    for item in plan.items.iter().filter(|i| i.source == Source::ClaudeCode) {
         let reason = busy.reason(&item.id).map(str::to_owned).or_else(|| {
             item.transcripts
                 .iter()

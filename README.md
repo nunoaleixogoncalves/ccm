@@ -29,7 +29,7 @@ If you run a lot of Claude Code sessions, they pile up:
 - **Clean up:** one screen lists what could be cleaned up and how much space it would free, and deletes it after asking: conversations Claude never replied to, ones whose folder is gone, large ones you haven't used for a while, worktrees nothing needs, and leftover background job folders.
 - **Recover:** after a crash, see what was running and reopen it all at once.
 - **Worktrees:** see the Git worktrees of the repositories your conversations used, with their uncommitted changes, unpushed commits and the conversations that worked in each, and remove the ones you're done with.
-- **Codex:** Codex conversations show in the same list, with search and preview. See [Codex](#codex).
+- **Codex:** Codex conversations show in the same list, and can be searched, previewed, resumed, forked and deleted. See [Codex](#codex).
 
 ## Install
 
@@ -217,7 +217,13 @@ The popup lists the conversations that worked in each worktree. It also warns wh
 
 Only conversations you typed in are listed. Runs of `codex exec`, and the conversations Codex starts for itself, such as subagents and reviews, are left out. A name you gave with `/rename` in Codex is shown.
 
-For now `ccm` only reads Codex conversations: browse, search and preview. Resume, fork, delete, rename and crash recovery are greyed out for them and come in later versions. `Shift+Y` copies the command to resume one yourself. Files Codex compressed (`.jsonl.zst`) aren't read yet.
+Codex conversations can be resumed, forked and deleted, through Codex's own commands, so the `codex` command must be installed:
+
+- **Resume** runs `codex resume -C <folder> <id>` in a new terminal, the same way as for Claude Code. `-C` keeps Codex from asking which folder to use.
+- **Fork** runs `codex fork -C <folder> <id>`. Codex gives the fork its own ID and records which conversation it came from, and `ccm` shows that.
+- **Delete** runs `codex delete --force <id>`. That also clears the records Codex keeps of the conversation in its own databases. Codex refuses to delete a conversation that's running, or one a fork still needs, and `ccm` shows its reason. Then `ccm` takes the conversation's prompts out of Codex's `history.jsonl`, which `codex delete` leaves, holding the same lock Codex uses for that file.
+
+Rename and crash recovery are greyed out for Codex conversations and come in later versions. Files Codex compressed (`.jsonl.zst`) aren't read yet.
 
 ## Configuration
 
@@ -251,7 +257,7 @@ On WSL, `ccm` opens a new Windows Terminal tab when `terminal` isn't set. It sta
 
 ## What it touches on your machine
 
-`ccm` reads Claude Code's files in `~/.claude`, or in `CLAUDE_CONFIG_DIR` if that's set, and Codex's conversation files in `~/.codex/sessions` and its `session_index.jsonl`, or in `CODEX_HOME`. It never changes Codex's files and never opens its databases. It sends nothing over the network.
+`ccm` reads Claude Code's files in `~/.claude`, or in `CLAUDE_CONFIG_DIR` if that's set, and Codex's conversation files in `~/.codex/sessions` and its `session_index.jsonl`, or in `CODEX_HOME`. It only changes Codex's data through `codex delete`, plus the prompt history edit described in [Codex](#codex), and never opens its databases. It sends nothing over the network.
 
 While the [worktree view](#worktrees) is open, it runs Git in the repositories your conversations worked in. While [grouping by repository](#grouping), it asks Git which repository each folder belongs to. The [clean-up screen](#cleaning-up) runs the same Git checks as the worktree view, and measures the size of the worktrees it suggests. Only `git worktree remove` changes anything, and only after you confirm. It ignores `GIT_*` variables from its own environment, stops a repository's `core.fsmonitor` setting from running a program, takes no optional locks and never fetches.
 
@@ -282,6 +288,8 @@ It writes these files of its own:
 | **Edited** | `history.jsonl` loses that conversation's lines, using Claude Code's own lock. A pasted-content file goes only if nothing else uses it |
 | **Kept unless you press `m`** | Memory notes that only this conversation wrote |
 | **Always kept** | Other conversations, including forks and continuations, plus memory notes edited by hand, `plans/`, the folder's trust setting, and a background job that may have a worktree, which `ccm` tells you to remove with `claude rm` |
+
+A Codex conversation is deleted by Codex itself. See [Codex](#codex).
 
 ## Crash recovery
 

@@ -6,7 +6,8 @@ Every release of `ccm` and what changed in it. Each section is also used as the 
 
 ### Added
 
-- **Codex conversations.** They show in the list with search and preview, next to Claude Code's. A Tool column and the `t` filter appear when both tools have conversations. Runs of `codex exec` and conversations Codex starts for itself are left out. For now they can only be read: resume, fork, delete, rename and crash recovery come later. ([#37](https://github.com/nunoaleixogoncalves/ccm/issues/37))
+- **Codex conversations.** They show in the list with search and preview, next to Claude Code's. A Tool column and the `t` filter appear when both tools have conversations. Runs of `codex exec` and conversations Codex starts for itself are left out. Rename and crash recovery come later. ([#37](https://github.com/nunoaleixogoncalves/ccm/issues/37))
+- **Resume, fork and delete Codex conversations,** through Codex's own `codex resume`, `codex fork` and `codex delete` commands. A delete also takes the conversation's prompts out of Codex's prompt history, and Codex conversations are now suggested on the clean-up screen. A fork made in Codex shows which conversation it came from. ([#38](https://github.com/nunoaleixogoncalves/ccm/issues/38))
 - New setting `tools` in `config.toml` to choose which tools to read. By default, every tool whose folder exists is read.
 
 ## [1.1.1] - 2026-11-06

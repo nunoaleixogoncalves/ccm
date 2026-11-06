@@ -388,6 +388,7 @@ mod tests {
                 lines_removed: None,
                 pr_url: None,
                 continued_in: None,
+                forked_from: None,
                 recaps: Vec::new(),
                 bad_lines: 0,
                 open: false,

@@ -9,7 +9,7 @@ use ccm_core::model::{Session, Source};
 use ccm_core::preview::Preview;
 use ccm_core::tools::{self, Features};
 use ccm_core::rename::MAX_NAME;
-use ccm_core::resume::{decide, decide_fork, is_safe_folder, manual_command, Decision, Fork};
+use ccm_core::resume::{decide, decide_fork, is_safe_folder, manual_command_for, Decision, Fork};
 use ccm_core::jobs::{self, Leftover};
 use ccm_core::query::{group_by_folder, group_by_repo, select, status_rank, Filters, GroupRow, SortKey, Suggestion};
 use ccm_core::repo::Place;
@@ -120,9 +120,9 @@ pub enum View {
 /// Runs a query. `None` means the query has nothing to search for.
 /// Starts a resumed conversation and returns what to tell the user.
 /// With a fork, it starts that fork instead.
-pub type ResumeFn = Box<dyn FnMut(&str, Option<&Fork>, &Path) -> Result<String, String>>;
+pub type ResumeFn = Box<dyn FnMut(&str, Source, Option<&Fork>, &Path) -> Result<String, String>>;
 /// Works out what a delete would remove, without changing anything.
-pub type PlanFn = Box<dyn FnMut(&[String]) -> Plan>;
+pub type PlanFn = Box<dyn FnMut(&[Session]) -> Plan>;
 /// Carries out a plan, including the memory notes when asked.
 pub type DeleteFn = Box<dyn FnMut(&Plan, bool) -> Result<Outcome, String>>;
 /// Takes the ID, transcript path and new name, and returns the name as saved.
@@ -401,6 +401,11 @@ impl App {
 
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
         self.sessions = sessions;
+        for s in &self.sessions {
+            if let Some(from) = &s.forked_from {
+                self.forks.entry(s.id.clone()).or_insert_with(|| from.clone());
+            }
+        }
         if let Some((id, started)) = self.awaiting_fork.take() {
             if self.sessions.iter().any(|s| s.id == id) {
                 self.selected_id = Some(id);
@@ -1011,7 +1016,7 @@ impl App {
             .into_iter()
             .map(|s| Skipped { id: s.id.clone(), reason: "it was just resumed".into() })
             .collect();
-        let ids: Vec<String> = ids.into_iter().map(|s| s.id.clone()).collect();
+        let ids: Vec<Session> = ids.into_iter().cloned().collect();
         let Some(planner) = self.planner.as_mut() else { return Plan::default() };
         let mut plan = if ids.is_empty() { Plan::default() } else { planner(&ids) };
         plan.skipped.extend(starting);
@@ -1200,14 +1205,11 @@ impl App {
     /// This gets pasted into a shell, so a folder that isn't safe is left out rather than quoted.
     /// A control character in it could end the paste early, whatever the quoting.
     fn resume_command(s: &Session) -> String {
-        if s.source == Source::Codex {
-            return match s.folder.as_deref().filter(|f| is_safe_folder(f)) {
-                Some(folder) => format!("cd '{}' && codex resume {}", folder.replace('\'', r"'\''"), s.id),
-                None => format!("codex resume {}", s.id),
-            };
+        if s.source == Source::Codex && !s.folder.as_deref().is_some_and(is_safe_folder) {
+            return format!("codex resume {}", s.id);
         }
         match s.folder.as_deref().filter(|f| is_safe_folder(f)) {
-            Some(folder) => manual_command(&s.id, None, Path::new(folder)),
+            Some(folder) => manual_command_for(s.source, &s.id, None, Path::new(folder)),
             None => format!("claude --resume {}", s.id),
         }
     }
@@ -1266,13 +1268,19 @@ impl App {
                 return;
             }
         };
+        let source = original.source;
         let Some(resume) = self.resume.as_mut() else { return };
-        self.status = Some(match resume(&id, Some(&fork), folder) {
-            Ok(message) => {
+        self.status = Some(match resume(&id, source, Some(&fork), folder) {
+            Ok(message) if source == Source::ClaudeCode => {
                 self.just_resumed.insert(fork_key(&id), Instant::now());
                 self.forks.insert(fork.id.clone(), id);
                 self.awaiting_fork = Some((fork.id, Instant::now()));
                 format!("Started a fork. {message} It shows here once Claude Code saves it.")
+            }
+            // Codex picks the fork's ID itself and records the original in it.
+            Ok(message) => {
+                self.just_resumed.insert(fork_key(&id), Instant::now());
+                format!("Started a fork. {message} It shows here once {} saves it.", source.label())
             }
             Err(e) => e,
         });
@@ -1286,8 +1294,9 @@ impl App {
     }
 
     fn start_resume(&mut self, id: &str, folder: &Path) -> Result<String, String> {
+        let source = self.sessions.iter().find(|s| s.id == id).map_or(Source::ClaudeCode, |s| s.source);
         let Some(resume) = self.resume.as_mut() else { return Err("Resume isn't available.".into()) };
-        match resume(id, None, folder) {
+        match resume(id, source, None, folder) {
             Ok(message) => {
                 self.just_resumed.insert(id.to_string(), Instant::now());
                 Ok(message)
