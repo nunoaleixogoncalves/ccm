@@ -68,10 +68,19 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
-      - run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+      # The release notes are this version's section of CHANGELOG.md, then GitHub's list of pull
+      # requests. A version with no section stops here, so a release can't go out without one.
+      - name: Take the notes from the changelog
+        run: |
+          awk -v head="## [${GITHUB_REF_NAME#v}]" 'index($0, "## [") == 1 { if (found) exit; found = index($0, head) == 1; next } found' CHANGELOG.md > notes.md
+          grep -q '[^[:space:]]' notes.md || { echo "CHANGELOG.md has no section for ${GITHUB_REF_NAME#v}"; exit 1; }
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --notes "$(cat notes.md)"
         env:
           GH_TOKEN: ${{ github.token }}
