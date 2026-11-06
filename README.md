@@ -73,7 +73,7 @@ If you use mise, install with this script and not `cargo install`. `cargo instal
 
 ## Update
 
-Run the install command again. `ccm --version` shows which version you have.
+Run the install command again. `ccm --version` shows which version you have, and the [changelog](CHANGELOG.md) what changed in each.
 
 If you built from source, run this from the repository folder instead:
 
