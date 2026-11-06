@@ -68,7 +68,8 @@ If you use mise, install with this script and not `cargo install`. `cargo instal
 | Tool | What it's for | Without it |
 |---|---|---|
 | `wl-copy` or `xclip` | Copying on Linux | `ccm` asks your terminal to copy, which not every terminal allows |
-| `xdg-terminal-exec` | Resuming in a new terminal on Linux | Set `terminal` in the [configuration](#configuration), or run the command `ccm` shows you |
+| `xdg-terminal-exec` | Resuming in a new terminal on Linux, outside WSL | Set `terminal` in the [configuration](#configuration), or run the command `ccm` shows you |
+| Windows Terminal | Resuming in a new tab on WSL | The same as above |
 | Git 2.36 or later | The [worktree view](#worktrees) and [grouping by repository](#grouping) | The view says Git wasn't found, and conversations stay grouped by folder |
 
 ## Update
@@ -220,7 +221,8 @@ large_threshold_mb = 200
 old_after_days = 60
 
 # The command that opens a terminal. "claude --resume <id>" is added to the end,
-# and it runs in the conversation's folder. The default is xdg-terminal-exec.
+# and it runs in the conversation's folder. The default is xdg-terminal-exec, or
+# Windows Terminal on WSL.
 terminal = ["foot", "-e"]
 
 # Context window sizes by model, for models that show "?".
@@ -228,7 +230,9 @@ terminal = ["foot", "-e"]
 claude-opus-4-8 = 200000
 ```
 
-On macOS, set `terminal` to a terminal that can run a command, such as `["alacritty", "-e"]`. If no terminal can be started, `ccm` shows the command to run yourself.
+On macOS, set `terminal` to a terminal that can run a command, such as `["alacritty", "-e"]`. If no terminal can be started, `ccm` shows the command to run yourself, and why it couldn't.
+
+On WSL, `ccm` opens a new Windows Terminal tab when `terminal` isn't set. It starts the conversation with `wsl.exe --cd`, so the folder is the Linux one. That tab runs `claude` directly, without your shell's startup files, so `ccm` passes the full path of the `claude` it finds and carries `CLAUDE_CONFIG_DIR` over if you set it. If Windows Terminal isn't found, it uses `xdg-terminal-exec` as on Linux.
 
 ## What it touches on your machine
 
@@ -244,6 +248,7 @@ It writes these files of its own:
 | `~/.config/ccm/config.toml` | Your configuration, if you create one. `ccm` only reads it |
 | `~/.local/state/ccm/sessions.jsonl` | When sessions start and end, as IDs and times only |
 | `~/.local/state/ccm/forks.jsonl` | Which conversations are forks `ccm` started, and of which, as IDs and times only |
+| `~/.local/state/ccm/launch.log` | Error messages from the last terminal `ccm` started, so a failure to start can say why. Emptied each time |
 | `~/.local/state/ccm/windows/` | Each session's context window size |
 | `~/.local/state/ccm/backups/` | Your original settings files, from before `ccm setup` changed them |
 
@@ -275,7 +280,8 @@ Only sessions started after `ccm setup` are tracked.
 |---|---|
 | Linux | Built and tested. Used in `foot`, GNOME Terminal and `herdr-app`, and it should work in most modern terminals |
 | macOS | Built and tested on Intel and Apple Silicon by automated checks, but not yet used by hand |
-| Windows | Not supported |
+| WSL | Works like Linux. Resuming opens a Windows Terminal tab, which hasn't yet been checked by hand |
+| Windows | Not supported outside WSL |
 
 Tested with Claude Code 2.1.318. Claude Code's file format isn't documented and can change, so `ccm` skips anything it doesn't recognise and warns you rather than crashing.
 
