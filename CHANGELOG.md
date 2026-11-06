@@ -2,6 +2,13 @@
 
 Every release of `ccm` and what changed in it. Each section is also used as the notes of its release on GitHub.
 
+## [Unreleased]
+
+### Fixed
+
+- **Resuming on WSL.** `ccm` now opens a new Windows Terminal tab there, starting the conversation in its Linux folder through `wsl.exe --cd`. Before, it tried `xdg-terminal-exec`, which WSL usually doesn't have, and resuming failed with "No such file or directory".
+- When a terminal can't be started, the message now says why: that the launcher isn't installed, or what it printed before failing.
+
 ## [1.1.0] - 2026-11-06
 
 ### Added

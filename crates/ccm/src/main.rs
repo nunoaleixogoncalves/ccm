@@ -125,12 +125,13 @@ fn browse(paths: Paths) -> Result<()> {
     app.status = config_error;
     let terminal_command = config_terminal.clone();
     let claude_json = paths.claude_json.clone();
+    let launch_log = paths.state.join("launch.log");
     let fork_paths = paths.clone();
     app.resume = Some(Box::new(move |id, fork, folder| {
         if let Some(fork) = fork {
             forks::record(&fork_paths, &fork.id, id, now_ms()).map_err(|e| format!("Couldn't note the fork, so it wasn't started: {e}"))?;
         }
-        resume_conversation(id, fork, folder, terminal_command.as_deref(), &claude_json)
+        resume_conversation(id, fork, folder, terminal_command.as_deref(), &claude_json, &launch_log)
     }));
     app.forks = forks::load(&paths);
     app.search = Some(Box::new(move |q| searcher.search(q).map_err(|e| e.to_string())));
@@ -176,12 +177,30 @@ fn delete_conversations(paths: &Paths, plan: &Plan, notes: bool) -> Result<Outco
 }
 
 /// Opens the conversation in `herdr-app` when running inside it, otherwise in a new terminal.
-fn resume_conversation(id: &str, fork: Option<&Fork>, folder: &Path, terminal: Option<&[String]>, claude_json: &Path) -> Result<String, String> {
-    let in_herdr = resume::in_herdr(|v| std::env::var(v).ok());
+fn resume_conversation(
+    id: &str,
+    fork: Option<&Fork>,
+    folder: &Path,
+    terminal: Option<&[String]>,
+    claude_json: &Path,
+    log: &Path,
+) -> Result<String, String> {
+    let var = |v: &str| std::env::var(v).ok();
     let claude = resume::claude_args(id, fork);
-    let (launch, place) = if in_herdr { herdr_plan(&claude, folder)? } else { (resume::terminal_launch(&claude, folder, terminal), "a new terminal") };
-    if let Err(e) = resume::start(&launch) {
-        return Err(format!("Couldn't start it ({e}). Run: {}", resume::manual_command(id, fork, folder)));
+    let (launch, place) = if resume::in_herdr(var) {
+        herdr_plan(&claude, folder)?
+    } else if let Some(launch) = terminal.is_none().then(|| wsl_plan(&claude, folder)).flatten() {
+        (launch, "a new Windows Terminal tab")
+    } else {
+        (resume::terminal_launch(&claude, folder, terminal), "a new terminal")
+    };
+    if let Err(e) = resume::start(&launch, Some(log)) {
+        let why = if e.kind() == std::io::ErrorKind::NotFound {
+            format!("{} isn't installed. Set terminal in ccm's config.toml to your terminal", ccm_core::format::sanitize(&launch.program))
+        } else {
+            e.to_string()
+        };
+        return Err(format!("Couldn't start it ({why}). Run: {}", resume::manual_command(id, fork, folder)));
     }
     // Claude Code asks this itself, in the new terminal. Only the user may answer it.
     let warning = match resume::is_trusted(claude_json, folder) {
@@ -189,6 +208,18 @@ fn resume_conversation(id: &str, fork: Option<&Fork>, folder: &Path, terminal: O
         _ => "",
     };
     Ok(format!("Opened in {place}.{warning}"))
+}
+
+/// Inside WSL, with Windows Terminal there to open, unless `terminal` says otherwise.
+fn wsl_plan(claude: &[String], folder: &Path) -> Option<Launch> {
+    let distro = resume::wsl_distro(|v| std::env::var(v).ok())?;
+    let path = std::env::var("PATH").unwrap_or_default();
+    resume::find_program("wt.exe", &path)?;
+    let claude_path = resume::find_program("claude", &path).map_or_else(|| "claude".to_string(), |p| p.display().to_string());
+    // The one setting that decides which conversations exist, so the resumed one is found.
+    let env: Vec<(String, String)> =
+        std::env::var("CLAUDE_CONFIG_DIR").ok().filter(|v| !v.is_empty()).map(|v| ("CLAUDE_CONFIG_DIR".to_string(), v)).into_iter().collect();
+    Some(resume::wsl_launch(claude, folder, &distro, &claude_path, &env))
 }
 
 fn herdr_plan(claude: &[String], folder: &Path) -> Result<(Launch, &'static str), String> {

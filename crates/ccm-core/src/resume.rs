@@ -138,6 +138,41 @@ pub fn terminal_launch(claude: &[String], folder: &Path, command: Option<&[Strin
     Launch { program, args, cwd: folder.to_owned(), long_running: true }
 }
 
+/// The WSL distribution `ccm` runs in, given a way to read the environment. WSL sets this in
+/// every session it starts.
+pub fn wsl_distro(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    var("WSL_DISTRO_NAME").filter(|d| !d.is_empty() && !d.chars().any(hides_text))
+}
+
+/// Opens a Windows Terminal tab that starts the conversation inside this WSL distribution.
+///
+/// Windows programs don't understand Linux paths, so the folder goes to `wsl.exe --cd`, which
+/// does. `--exec` starts `claude` directly, without a shell reading the command line, so
+/// `claude` should be its full path: no login scripts run to find it. A Windows Terminal tab
+/// doesn't take on `ccm`'s environment, so variables to carry over are set through `env`.
+pub fn wsl_launch(claude: &[String], folder: &Path, distro: &str, claude_path: &str, env: &[(String, String)]) -> Launch {
+    let mut inner: Vec<String> = vec!["wsl.exe".into(), "--distribution".into(), distro.into(), "--cd".into(), folder.display().to_string(), "--exec".into()];
+    if !env.is_empty() {
+        inner.push("/usr/bin/env".into());
+        inner.extend(env.iter().map(|(k, v)| format!("{k}={v}")));
+    }
+    inner.push(claude_path.into());
+    inner.extend(claude.iter().skip(1).cloned());
+    // Windows Terminal reads a `;` anywhere as the start of its next command, unless escaped.
+    let mut args = vec!["new-tab".to_string(), "--".to_string()];
+    args.extend(inner.into_iter().map(|a| a.replace(';', "\\;")));
+    Launch { program: "wt.exe".into(), args, cwd: folder.to_owned(), long_running: true }
+}
+
+/// The first executable called `name` in a `PATH`-style list of folders.
+pub fn find_program(name: &str, path: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
 /// A live terminal in `herdr-app`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HerdrTerminal {
@@ -264,8 +299,10 @@ fn command(launch: &Launch) -> Command {
     cmd
 }
 
-/// Starts the command detached, so it keeps running after `ccm` closes.
-pub fn start(launch: &Launch) -> io::Result<()> {
+/// Starts the command detached, so it keeps running after `ccm` closes. A terminal launcher's
+/// errors go to `log` when one is given, so a quick failure can say why. A file, not a pipe, as
+/// a terminal still writing to a pipe after `ccm` quits could be killed by it.
+pub fn start(launch: &Launch, log: Option<&Path>) -> io::Result<()> {
     let mut cmd = command(launch);
 
     if !launch.long_running {
@@ -277,17 +314,42 @@ pub fn start(launch: &Launch) -> io::Result<()> {
         };
     }
 
-    let mut child = cmd.stderr(Stdio::null()).spawn()?;
+    let errors = log.and_then(|p| open_log(p).ok());
+    let stderr = match &errors {
+        Some(file) => Stdio::from(file.try_clone()?),
+        None => Stdio::null(),
+    };
+    let mut child = cmd.stderr(stderr).spawn()?;
     thread::sleep(LAUNCH_GRACE);
     if let Some(status) = child.try_wait()? {
         if !status.success() {
-            return Err(io::Error::other(format!("{} exited with {status}", launch.program)));
+            let said = log.filter(|_| errors.is_some()).map(last_lines).unwrap_or_default();
+            let said = if said.is_empty() { String::new() } else { format!(": {said}") };
+            return Err(io::Error::other(format!("{} exited with {status}{said}", launch.program)));
         }
         return Ok(());
     }
     // Collects the exit status later, so a closed terminal doesn't stay a zombie.
     thread::spawn(move || child.wait());
     Ok(())
+}
+
+/// An owner-only log, emptied for each launch.
+fn open_log(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)
+}
+
+/// The end of what a launcher said, cleaned for the screen and kept short.
+fn last_lines(path: &Path) -> String {
+    let text = std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(2)..].join(" ");
+    let tail = sanitize(&tail);
+    if tail.chars().count() > 200 { format!("{}…", tail.chars().take(200).collect::<String>()) } else { tail }
 }
 
 /// What a user can run by hand if starting a terminal fails.
@@ -556,7 +618,7 @@ mod tests {
         // Run through `sh`, because executing a file just written can fail with "text file busy"
         // while another test's fork still holds it open.
         let l = Launch { program: "sh".into(), args: vec![script.display().to_string()], cwd: dir.path().into(), long_running: false };
-        start(&l).unwrap();
+        start(&l, None).unwrap();
         let ids = std::fs::read_to_string(&out).unwrap();
         let (pid, group) = ids.trim().split_once(' ').unwrap();
         assert_eq!(pid, group.trim());
@@ -566,9 +628,68 @@ mod tests {
     fn a_failing_or_missing_program_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let l = |p: &str, long| Launch { program: p.into(), args: vec![], cwd: dir.path().into(), long_running: long };
-        assert!(start(&l("/nonexistent/program", true)).is_err());
-        assert!(start(&l("false", true)).is_err());
-        assert!(start(&l("false", false)).is_err());
-        assert!(start(&l("true", true)).is_ok());
+        assert!(start(&l("/nonexistent/program", true), None).is_err());
+        assert!(start(&l("false", true), None).is_err());
+        assert!(start(&l("false", false), None).is_err());
+        assert!(start(&l("true", true), None).is_ok());
+    }
+
+    #[test]
+    fn a_launcher_that_fails_quickly_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("state/launch.log");
+        let script = "echo 'warming up' >&2; echo 'no terminal found' >&2; exit 22";
+        let l = Launch { program: "sh".into(), args: vec!["-c".into(), script.into()], cwd: dir.path().into(), long_running: true };
+        let e = start(&l, Some(&log)).unwrap_err().to_string();
+        assert!(e.contains("exit status: 22") && e.ends_with(": warming up no terminal found"), "{e}");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+
+        let quiet = Launch { program: "false".into(), args: vec![], cwd: dir.path().into(), long_running: true };
+        assert!(start(&quiet, Some(&log)).unwrap_err().to_string().ends_with("exit status: 1"), "the last launch's words are gone");
+    }
+
+    #[test]
+    fn wsl_is_its_distribution_name() {
+        let env = |name: &'static str| move |v: &str| (v == "WSL_DISTRO_NAME").then(|| name.to_string());
+        assert_eq!(wsl_distro(env("Ubuntu-24.04")), Some("Ubuntu-24.04".into()));
+        assert_eq!(wsl_distro(env("")), None);
+        assert_eq!(wsl_distro(env("Ub\u{1b}untu")), None);
+        assert_eq!(wsl_distro(|_| None), None);
+    }
+
+    #[test]
+    fn on_wsl_windows_terminal_starts_claude_in_the_linux_folder() {
+        let fork = Fork { id: "f0000000-0000-4000-8000-000000000000".into(), name: "a; b (fork)".into() };
+        let l = wsl_launch(&claude_args(ID, Some(&fork)), Path::new("/home/me/my project"), "Ubuntu", "/home/me/.local/bin/claude", &[]);
+        assert_eq!(l.program, "wt.exe");
+        assert_eq!(l.cwd, Path::new("/home/me/my project"));
+        assert!(l.long_running);
+        let expected: Vec<String> = [
+            "new-tab", "--", "wsl.exe", "--distribution", "Ubuntu", "--cd", "/home/me/my project", "--exec", "/home/me/.local/bin/claude",
+            "--resume", ID, "--fork-session", "--session-id", "f0000000-0000-4000-8000-000000000000", "--name=a\\; b (fork)",
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(l.args, expected);
+
+        let env = [("CLAUDE_CONFIG_DIR".to_string(), "/home/me/.claude-work".to_string())];
+        let l = wsl_launch(&claude_args(ID, None), Path::new("/w"), "Ubuntu", "claude", &env);
+        assert_eq!(l.args[8..], ["/usr/bin/env", "CLAUDE_CONFIG_DIR=/home/me/.claude-work", "claude", "--resume", ID].map(String::from));
+    }
+
+    #[test]
+    fn a_program_is_found_on_the_path_only_when_it_can_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("claude"), "").unwrap();
+        std::fs::write(b.join("claude"), "").unwrap();
+        std::fs::set_permissions(b.join("claude"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("relative:{}:{}", a.display(), b.display());
+        assert_eq!(find_program("claude", &path), Some(b.join("claude")), "not the one that can't run, nor a relative folder");
+        assert_eq!(find_program("nothing", &path), None);
     }
 }
