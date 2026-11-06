@@ -6,7 +6,8 @@ use ccm_core::config::Config;
 use ccm_core::delete::{Outcome, Plan, Skipped};
 use ccm_core::format::bytes;
 use ccm_core::model::Session;
-use ccm_core::preview::{self, Preview};
+use ccm_core::preview::Preview;
+use ccm_core::tools;
 use ccm_core::rename::MAX_NAME;
 use ccm_core::resume::{decide, decide_fork, is_safe_folder, manual_command, Decision, Fork};
 use ccm_core::jobs::{self, Leftover};
@@ -1350,7 +1351,7 @@ impl App {
         if self.preview.as_ref().is_some_and(|p| p.id == id && p.mtime_ns == mtime_ns) {
             return;
         }
-        let result = preview::read(Path::new(&s.transcript_path)).map_err(|e| e.to_string());
+        let result = tools::preview(s).map_err(|e| e.to_string());
         if self.preview.as_ref().is_none_or(|p| p.id != id) {
             self.preview_scroll = 0;
         }
