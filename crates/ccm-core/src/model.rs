@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source {
     ClaudeCode,
+    Codex,
 }
 
 /// One conversation. Everything except `open` and `folder_exists` is cached in the index.
@@ -31,6 +32,9 @@ pub struct Session {
     pub last_active_ms: Option<i64>,
     /// Tokens used by the last main-thread response.
     pub context_used: Option<u64>,
+    /// The context window the tool recorded, for tools that record it.
+    #[serde(default)]
+    pub context_window: Option<u64>,
     pub prompts: u64,
     pub replies: u64,
     pub cost_usd: Option<f64>,

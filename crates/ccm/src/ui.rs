@@ -1,6 +1,6 @@
 use ccm_core::delete::Item;
 use ccm_core::format::{ago, bytes, sanitize};
-use ccm_core::model::Session;
+use ccm_core::model::{Session, Source};
 use ccm_core::preview::{Preview, Role};
 use ccm_core::query::{worktree_of, Group, GroupRow, SortKey};
 use ccm_core::repo::Place;
@@ -44,6 +44,9 @@ struct Column {
     /// Dropped first when the terminal is narrow.
     min_terminal_width: u16,
 }
+
+/// Only shown when more than one tool is read.
+const TOOL_COLUMN: Column = Column { title: "Tool", key: SortKey::Tool, width: Constraint::Length(6), min_terminal_width: 0 };
 
 const COLUMNS: [Column; 9] = [
     Column { title: "Name", key: SortKey::Name, width: Constraint::Min(20), min_terminal_width: 0 },
@@ -346,7 +349,8 @@ fn draw_search(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_table(f: &mut Frame, app: &mut App, area: Rect, now_ms: i64) {
-    let columns: Vec<&Column> = COLUMNS.iter().filter(|c| f.area().width >= c.min_terminal_width).collect();
+    let tool = app.many_tools().then_some(&TOOL_COLUMN);
+    let columns: Vec<&Column> = tool.into_iter().chain(COLUMNS.iter().filter(|c| f.area().width >= c.min_terminal_width)).collect();
     let widths: Vec<Constraint> = columns.iter().map(|c| c.width).collect();
 
     let header = Row::new(columns.iter().map(|c| {
@@ -441,6 +445,7 @@ fn column_text(app: &App, s: &Session, key: SortKey, width: usize, now_ms: i64) 
         SortKey::Model => fit_end(s.model.as_deref().unwrap_or("-").trim_start_matches("claude-"), width),
         SortKey::Branch => fit_end(s.branch.as_deref().unwrap_or("-"), width),
         SortKey::Status => App::status_text(s).to_string(),
+        SortKey::Tool => s.source.short().to_string(),
     }
 }
 
@@ -566,7 +571,7 @@ fn draw_preview(f: &mut Frame, app: &mut App, area: Rect) {
         None => Vec::new(),
         Some(Err(e)) => vec![Line::from(format!("Couldn't read this conversation: {}", sanitize(e)))],
         Some(Ok(p)) if p.turns.is_empty() => vec![Line::from("No messages.")],
-        Some(Ok(p)) => message_lines(p, width),
+        Some(Ok(p)) => message_lines(p, app.selected().map_or("Claude", |s| s.source.short()), width),
     };
     // Starts at the newest message and scrolls back from there.
     let visible = rest.height as usize;
@@ -585,7 +590,7 @@ fn recap_lines(recaps: &[String], width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn message_lines(p: &Preview, width: usize) -> Vec<Line<'static>> {
+fn message_lines(p: &Preview, agent: &'static str, width: usize) -> Vec<Line<'static>> {
     let dim = Style::new().fg(Color::DarkGray);
     let mut out = Vec::new();
     if p.truncated {
@@ -597,7 +602,7 @@ fn message_lines(p: &Preview, width: usize) -> Vec<Line<'static>> {
         }
         let (label, color) = match turn.role {
             Role::You => ("You", Color::Yellow),
-            Role::Claude => ("Claude", Color::Magenta),
+            Role::Agent => (agent, Color::Magenta),
         };
         let mut head = vec![Span::styled(label, Style::new().fg(color).add_modifier(Modifier::BOLD))];
         if turn.tool_calls > 0 {
@@ -684,7 +689,7 @@ fn footer_groups(app: &App) -> [(&'static str, Vec<Button>); 2] {
         let view = vec![("Esc", "Conversations", Action::Cleanup, false), ("w", "Worktrees", Action::Worktrees, false)];
         return [("Actions", actions), ("View", view)];
     }
-    [
+    let mut groups = [
         (
             "Actions",
             vec![
@@ -709,6 +714,7 @@ fn footer_groups(app: &App) -> [(&'static str, Vec<Button>); 2] {
                 ("Shift+J", "Junk", Action::ToggleJunk, app.filters.junk),
                 ("m", "Missing", Action::ToggleMissing, app.filters.missing),
                 ("l", "Large", Action::ToggleLarge, app.filters.large),
+                ("t", tool_label(app), Action::ToggleTool, app.filters.tool.is_some()),
                 ("c", "Clear", Action::ClearFilters, false),
                 ("g", group_label(app.grouping), Action::ToggleGroup, app.grouping != Grouping::Off),
                 ("s", "Sort", Action::NextSort, false),
@@ -717,7 +723,19 @@ fn footer_groups(app: &App) -> [(&'static str, Vec<Button>); 2] {
                 ("Shift+C", "Clean up", Action::Cleanup, false),
             ],
         ),
-    ]
+    ];
+    if !app.many_tools() {
+        groups[1].1.retain(|b| b.2 != Action::ToggleTool);
+    }
+    groups
+}
+
+fn tool_label(app: &App) -> &'static str {
+    match app.filters.tool {
+        None => "Tool",
+        Some(Source::ClaudeCode) => "Tool: Claude",
+        Some(Source::Codex) => "Tool: Codex",
+    }
 }
 
 fn group_label(grouping: Grouping) -> &'static str {
@@ -808,8 +826,8 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
         let width = text.chars().count() as u16;
         let disabled = match action {
             Action::Resume => !app.can_resume(),
-            Action::Fork => app.selected().is_none(),
-            Action::Rename => !app.can_change(),
+            Action::Fork => !app.can_fork(),
+            Action::Rename => !app.can_rename(),
             Action::Delete => !app.can_press_delete(),
             _ => false,
         };
@@ -872,6 +890,7 @@ mod tests {
             started_at_ms: Some(0),
             last_active_ms: Some(NOW - hours_ago * HOUR),
             context_used: Some(87_000),
+            context_window: None,
             prompts: 3,
             replies: 3,
             cost_usd: Some(1.5),
@@ -2530,5 +2549,117 @@ mod tests {
         let _ = reopenable(&mut a);
         click_label(&mut a, "O Reopen");
         assert!(a.reopen.is_some());
+    }
+
+    /// The usual app with a Codex conversation added and both tools read.
+    fn with_codex() -> App {
+        let mut a = app();
+        let mut codex = session("019a5a1e-7c3b-7d21-9f4e-2b6c1d8e0a11", "Codex chat", "/home/me/c", 0);
+        codex.source = Source::Codex;
+        codex.model = Some("gpt-5.5-codex".into());
+        codex.context_window = Some(272_000);
+        let mut sessions = a.sessions.clone();
+        sessions.push(codex);
+        a.tools = vec![Source::ClaudeCode, Source::Codex];
+        a.set_sessions(sessions);
+        a
+    }
+
+    fn names_shown(a: &App) -> Vec<String> {
+        let mut names: Vec<String> = a.shown().map(|s| s.name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn the_tool_column_and_filter_only_show_when_more_than_one_tool_is_read() {
+        let mut a = app();
+        let screen = render(&mut a, 140, 30);
+        assert!(!screen.contains("Tool"), "{screen}");
+        a.on_key(KeyCode::Char('t'));
+        assert_eq!(a.filters.tool, None);
+
+        let mut a = with_codex();
+        let screen = render(&mut a, 140, 30);
+        assert!(screen.lines().any(|l| l.trim_start().starts_with("Tool")), "{screen}");
+        assert!(screen.lines().any(|l| l.contains("Codex ") && l.contains("Codex chat")), "{screen}");
+        assert!(screen.contains("t Tool "), "{screen}");
+        assert!(screen.contains("87k/272k"), "Codex records its window: {screen}");
+        assert_eq!(names_shown(&a).len(), 4);
+
+        a.on_key(KeyCode::Char('t'));
+        assert_eq!(names_shown(&a), ["Junk one", "Old model", "Open one"]);
+        a.on_key(KeyCode::Char('t'));
+        assert_eq!(names_shown(&a), ["Codex chat"]);
+        assert!(render(&mut a, 140, 30).contains("t Tool: Codex"));
+        a.on_key(KeyCode::Char('t'));
+        assert_eq!(names_shown(&a).len(), 4);
+        a.on_key(KeyCode::Char('t'));
+        a.on_key(KeyCode::Char('c'));
+        assert_eq!(a.filters.tool, None, "c clears it with the other filters");
+
+        render(&mut a, 80, 30);
+        assert_eq!(a.hit.buttons.len(), footer_groups(&a).iter().map(|(_, b)| b.len()).sum::<usize>(), "every button still fits at 80 columns");
+    }
+
+    #[test]
+    fn what_ccm_cant_do_with_codex_yet_is_greyed_out_and_says_so() {
+        let mut a = with_codex();
+        let resumes = resumable(&mut a);
+        let deletes = deletable(&mut a, &[]);
+        select_named(&mut a, "Codex chat");
+        assert!(!a.can_resume() && !a.can_fork() && !a.can_rename() && !a.can_press_delete());
+        for (key, message) in [
+            (KeyCode::Enter, "ccm can't resume Codex conversations yet."),
+            (KeyCode::Char('f'), "ccm can't fork Codex conversations yet."),
+            (KeyCode::Char('R'), "ccm can't rename Codex conversations yet."),
+            (KeyCode::Char('d'), "Can't delete: ccm can't delete Codex conversations yet."),
+        ] {
+            a.status = None;
+            a.on_key(key);
+            assert_eq!(a.status.as_deref(), Some(message));
+        }
+        assert!(a.renaming.is_none() && a.confirm_delete.is_none());
+        assert!(resumes.borrow().is_empty());
+
+        // Marked along with others, it's left out of the delete.
+        a.status = None;
+        a.on_key(KeyCode::Char('a'));
+        a.on_key(KeyCode::Char('d'));
+        a.on_key(KeyCode::Char('y'));
+        a.perform_delete();
+        let deleted = &deletes.borrow()[0].0;
+        assert!(!deleted.is_empty());
+        assert!(!deleted.iter().any(|id| id.starts_with("019a")), "{deleted:?}");
+    }
+
+    #[test]
+    fn codex_conversations_are_not_suggested_for_clean_up_since_they_cant_be_deleted_yet() {
+        let mut a = with_codex();
+        let mut sessions = a.sessions.clone();
+        sessions.iter_mut().find(|s| s.name == "Codex chat").unwrap().replies = 0;
+        a.set_sessions(sessions);
+        let junk = a.tally(crate::app::Cleanup::Conversations(ccm_core::query::Suggestion::NoReply)).unwrap();
+        assert_eq!(junk.count, 1, "only the Claude Code one");
+    }
+
+    #[test]
+    fn a_codex_preview_names_codex_and_its_copied_command_resumes_with_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = with_codex();
+        let id = "019a5a1e-7c3b-7d21-9f4e-2b6c1d8e0a11";
+        with_transcript(&mut a, id, dir.path(), 1, concat!(
+            "{\"timestamp\":\"2026-11-05T14:03:20Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"fix the parser\"}}\n",
+            "{\"timestamp\":\"2026-11-05T14:03:41Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"Fixed it.\"}}\n",
+        ));
+        select_named(&mut a, "Codex chat");
+        a.ensure_preview();
+        let screen = render(&mut a, 120, 40);
+        assert!(screen.contains("Codex") && screen.contains("Fixed it.") && screen.contains("fix the parser"), "{screen}");
+        assert!(!screen.lines().any(|l| l.trim() == "Claude"), "{screen}");
+
+        let calls = copyable(&mut a);
+        a.on_key(KeyCode::Char('Y'));
+        assert_eq!(calls.borrow()[0], format!("cd '/home/me/c' && codex resume {id}"));
     }
 }

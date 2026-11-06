@@ -15,10 +15,11 @@ const MAX_TURN_CHARS: usize = 4000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     You,
-    Claude,
+    /// The tool that replied, such as Claude or Codex.
+    Agent,
 }
 
-/// A prompt, or everything Claude did in reply to one, with its tool calls collapsed to a count.
+/// A prompt, or everything the agent did in reply to one, with its tool calls collapsed to a count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
     pub role: Role,
@@ -34,6 +35,15 @@ pub struct Preview {
 }
 
 pub fn read(path: &Path) -> io::Result<Preview> {
+    read_with(path, |turns, line| {
+        if let Ok(r) = serde_json::from_slice::<Record>(line) {
+            add_record(turns, r);
+        }
+    })
+}
+
+/// Reads the end of a JSONL file, handing each whole line to `add`, and keeps the latest turns.
+pub(crate) fn read_with(path: &Path, mut add: impl FnMut(&mut Vec<Turn>, &[u8])) -> io::Result<Preview> {
     let mut file = File::open(path)?;
     let start = file.metadata()?.len().saturating_sub(TAIL_BYTES);
     file.seek(SeekFrom::Start(start))?;
@@ -50,9 +60,7 @@ pub fn read(path: &Path) -> io::Result<Preview> {
         if reader.read_until(b'\n', &mut line)? == 0 {
             break;
         }
-        if let Ok(r) = serde_json::from_slice::<Record>(&line) {
-            add_record(&mut turns, r);
-        }
+        add(&mut turns, &line);
     }
 
     let hidden = turns.len().saturating_sub(MAX_TURNS);
@@ -61,6 +69,21 @@ pub fn read(path: &Path) -> io::Result<Preview> {
         t.text = limit(sanitize_lines(t.text.trim()));
     }
     Ok(Preview { turns, truncated: start > 0 || hidden > 0 })
+}
+
+/// Adds reply text and tool calls to the agent's turn, starting one if a prompt came last.
+pub(crate) fn push_reply(turns: &mut Vec<Turn>, text: Option<&str>, tool_calls: u32) {
+    if !matches!(turns.last(), Some(t) if t.role == Role::Agent) {
+        turns.push(Turn { role: Role::Agent, text: String::new(), tool_calls: 0 });
+    }
+    let turn = turns.last_mut().expect("just ensured");
+    turn.tool_calls += tool_calls;
+    if let Some(text) = text {
+        if !turn.text.is_empty() {
+            turn.text.push('\n');
+        }
+        turn.text.push_str(text);
+    }
 }
 
 fn add_record(turns: &mut Vec<Turn>, r: Record) {
@@ -84,23 +107,16 @@ fn add_record(turns: &mut Vec<Turn>, r: Record) {
         }
         Some("assistant") if m.model.as_deref() != Some(SYNTHETIC_MODEL) => {
             let content = m.content.unwrap_or_default();
-            if !matches!(turns.last(), Some(t) if t.role == Role::Claude) {
-                turns.push(Turn { role: Role::Claude, text: String::new(), tool_calls: 0 });
-            }
-            let turn = turns.last_mut().expect("just ensured");
-            turn.tool_calls += content.tool_uses;
+            push_reply(turns, None, content.tool_uses);
             for text in content.texts {
-                if !turn.text.is_empty() {
-                    turn.text.push('\n');
-                }
-                turn.text.push_str(&text);
+                push_reply(turns, Some(&text), 0);
             }
         }
         _ => {}
     }
 }
 
-fn push_prompt(turns: &mut Vec<Turn>, text: String) {
+pub(crate) fn push_prompt(turns: &mut Vec<Turn>, text: String) {
     turns.push(Turn { role: Role::You, text, tool_calls: 0 });
 }
 
@@ -142,7 +158,7 @@ mod tests {
             p.turns,
             [
                 Turn { role: Role::You, text: "go".into(), tool_calls: 0 },
-                Turn { role: Role::Claude, text: "first\nsecond".into(), tool_calls: 3 },
+                Turn { role: Role::Agent, text: "first\nsecond".into(), tool_calls: 3 },
                 Turn { role: Role::You, text: "thanks".into(), tool_calls: 0 },
             ]
         );

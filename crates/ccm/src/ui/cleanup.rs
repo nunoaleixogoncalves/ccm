@@ -254,6 +254,7 @@ mod tests {
             started_at_ms: None,
             last_active_ms: Some(NOW - days_ago * DAY),
             context_used: None,
+            context_window: None,
             prompts: 1,
             replies: 1,
             cost_usd: None,

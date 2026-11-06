@@ -29,6 +29,7 @@ If you run a lot of Claude Code sessions, they pile up:
 - **Clean up:** one screen lists what could be cleaned up and how much space it would free, and deletes it after asking: conversations Claude never replied to, ones whose folder is gone, large ones you haven't used for a while, worktrees nothing needs, and leftover background job folders.
 - **Recover:** after a crash, see what was running and reopen it all at once.
 - **Worktrees:** see the Git worktrees of the repositories your conversations used, with their uncommitted changes, unpushed commits and the conversations that worked in each, and remove the ones you're done with.
+- **Codex:** Codex conversations show in the same list, with search and preview. See [Codex](#codex).
 
 ## Install
 
@@ -135,6 +136,7 @@ View:
 | `Shift+J` | Show only junk, meaning conversations Claude never replied to |
 | `m` | Show only conversations whose folder is missing |
 | `l` | Show only large conversations |
+| `t` | Show only one tool's conversations, one tool after another. Only there when [Codex](#codex) conversations are found too |
 | `c` | Clear the filters |
 | `g` | Group by folder, then by repository, then not at all. See [Grouping](#grouping) |
 | `s` | Change the sort column |
@@ -209,6 +211,14 @@ Unpushed commits don't stop a removal, because the branch keeps them. They are o
 
 The popup lists the conversations that worked in each worktree. It also warns when a conversation started there, because resuming that conversation later recreates the folder empty. **Files Git ignores, such as `.env` or build output, are deleted with the worktree.** The popup lists them with their size, and if new ones appear after you confirm, that worktree is skipped.
 
+## Codex
+
+`ccm` also lists [Codex](https://github.com/openai/codex) conversations, from `~/.codex/sessions`, or from `CODEX_HOME` if that's set. When both tools have conversations, a Tool column says which one each belongs to, and `t` shows one tool at a time.
+
+Only conversations you typed in are listed. Runs of `codex exec`, and the conversations Codex starts for itself, such as subagents and reviews, are left out. A name you gave with `/rename` in Codex is shown.
+
+For now `ccm` only reads Codex conversations: browse, search and preview. Resume, fork, delete, rename and crash recovery are greyed out for them and come in later versions. `Shift+Y` copies the command to resume one yourself. Files Codex compressed (`.jsonl.zst`) aren't read yet.
+
 ## Configuration
 
 Everything is optional. The file is `~/.config/ccm/config.toml`:
@@ -226,6 +236,10 @@ old_after_days = 60
 # Windows Terminal on WSL.
 terminal = ["foot", "-e"]
 
+# Which tools to read: "claude", "codex" or both. By default, every tool whose
+# folder exists is read.
+tools = ["claude", "codex"]
+
 # Context window sizes by model, for models that show "?".
 [windows]
 claude-opus-4-8 = 200000
@@ -237,7 +251,7 @@ On WSL, `ccm` opens a new Windows Terminal tab when `terminal` isn't set. It sta
 
 ## What it touches on your machine
 
-`ccm` reads Claude Code's files in `~/.claude`, or in `CLAUDE_CONFIG_DIR` if that's set. It sends nothing over the network.
+`ccm` reads Claude Code's files in `~/.claude`, or in `CLAUDE_CONFIG_DIR` if that's set, and Codex's conversation files in `~/.codex/sessions` and its `session_index.jsonl`, or in `CODEX_HOME`. It never changes Codex's files and never opens its databases. It sends nothing over the network.
 
 While the [worktree view](#worktrees) is open, it runs Git in the repositories your conversations worked in. While [grouping by repository](#grouping), it asks Git which repository each folder belongs to. The [clean-up screen](#cleaning-up) runs the same Git checks as the worktree view, and measures the size of the worktrees it suggests. Only `git worktree remove` changes anything, and only after you confirm. It ignores `GIT_*` variables from its own environment, stops a repository's `core.fsmonitor` setting from running a program, takes no optional locks and never fetches.
 
