@@ -1,32 +1,20 @@
-//! Keeps the index in step with Claude Code's files.
+//! Keeps the index in step with each tool's files.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::BufReader;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
 
 use crate::index::{Index, SearchDoc};
-use crate::model::{Session, Source};
-use crate::paths::{session_id_of, Paths};
-use crate::recovery;
-use crate::registry::{live_roster, open_sessions};
-use crate::transcript;
+use crate::model::Session;
+use crate::paths::Paths;
+use crate::tools::claude::ClaudeCode;
+use crate::tools::{Found, Live, Tool};
 
 pub struct Catalog {
-    paths: Paths,
-    proc_root: PathBuf,
+    tools: Vec<Box<dyn Tool>>,
     index: Index,
     known: HashMap<String, Session>,
-}
-
-struct Found {
-    id: String,
-    path: PathBuf,
-    size: u64,
-    mtime_ns: i64,
 }
 
 impl Catalog {
@@ -35,9 +23,14 @@ impl Catalog {
     }
 
     pub fn with_proc_root(paths: Paths, proc_root: PathBuf) -> rusqlite::Result<Self> {
-        let index = Index::open(&paths.index)?;
+        let index = paths.index.clone();
+        Self::with_tools(&index, vec![Box::new(ClaudeCode::new(paths, proc_root))])
+    }
+
+    pub fn with_tools(index: &Path, tools: Vec<Box<dyn Tool>>) -> rusqlite::Result<Self> {
+        let index = Index::open(index)?;
         let known = index.load()?.into_iter().map(|s| (s.id.clone(), s)).collect();
-        Ok(Self { paths, proc_root, index, known })
+        Ok(Self { tools, index, known })
     }
 
     /// What the index held at the last scan, for an instant first screen.
@@ -45,20 +38,23 @@ impl Catalog {
         self.annotated()
     }
 
-    /// Stats every transcript, parses those that changed and returns the full list.
+    /// Stats every conversation file, parses those that changed and returns the full list.
     /// `resize_all` also re-measures unchanged conversations, whose subagent folders can grow
     /// after the transcript's last write.
     pub fn refresh(&mut self, resize_all: bool) -> rusqlite::Result<Vec<Session>> {
-        let found = find_transcripts(&self.paths.projects());
-        let present: HashSet<&str> = found.iter().map(|f| f.id.as_str()).collect();
+        // Conversations of a tool that is no longer scanned leave the list too.
+        let found: Vec<(&dyn Tool, Found)> =
+            self.tools.iter().flat_map(|t| t.find().into_iter().map(move |f| (t.as_ref(), f))).collect();
+        let present: HashSet<&str> = found.iter().map(|(_, f)| f.id.as_str()).collect();
         let remove: Vec<String> =
             self.known.keys().filter(|id| !present.contains(id.as_str())).cloned().collect();
 
-        let changed: Vec<&Found> = found
+        let changed: Vec<&(&dyn Tool, Found)> = found
             .iter()
-            .filter(|f| {
+            .filter(|(t, f)| {
                 self.known.get(&f.id).is_none_or(|s| {
-                    s.transcript_size != f.size
+                    s.source != t.source()
+                        || s.transcript_size != f.size
                         || s.transcript_mtime_ns != f.mtime_ns
                         || s.transcript_path != f.path.to_string_lossy()
                 })
@@ -66,18 +62,18 @@ impl Catalog {
             .collect();
         let mut upsert: Vec<(Session, Option<SearchDoc>)> = changed
             .par_iter()
-            .filter_map(|f| read_session(f))
+            .filter_map(|(t, f)| t.read(f))
             .map(|(s, doc)| (s, Some(doc)))
             .collect();
 
         if resize_all {
-            let changed_ids: HashSet<&str> = changed.iter().map(|f| f.id.as_str()).collect();
+            let changed_ids: HashSet<&str> = changed.iter().map(|(_, f)| f.id.as_str()).collect();
             let resized: Vec<(Session, Option<SearchDoc>)> = found
                 .par_iter()
-                .filter(|f| !changed_ids.contains(f.id.as_str()))
-                .filter_map(|f| {
+                .filter(|(_, f)| !changed_ids.contains(f.id.as_str()))
+                .filter_map(|(t, f)| {
                     let s = self.known.get(&f.id)?;
-                    let size = f.size + dir_size(&companion_dir(&f.path));
+                    let size = t.measure(f);
                     (size != s.size_bytes).then(|| (Session { size_bytes: size, ..s.clone() }, None))
                 })
                 .collect();
@@ -95,18 +91,15 @@ impl Catalog {
     }
 
     fn annotated(&self) -> Vec<Session> {
-        let open = open_sessions(&self.paths.sessions(), &self.proc_root);
-        let roster = live_roster(&self.paths.claude.join("daemon/roster.json"), &self.proc_root);
-        let crashed = recovery::crashed(&self.paths, &open, &roster, chrono::Utc::now().timestamp_millis());
-        let windows = recovery::saved_windows(&self.paths);
+        let live: Vec<Live> = self.tools.iter().map(|t| t.live()).collect();
         let mut folders: HashMap<&str, bool> = HashMap::new();
         self.known
             .values()
             .map(|s| {
                 let mut s = s.clone();
-                s.open = open.contains(&s.id);
-                s.crashed = crashed.contains(&s.id);
-                s.window_size = windows.get(&s.id).copied();
+                s.open = live.iter().any(|l| l.open.contains(&s.id));
+                s.crashed = live.iter().any(|l| l.crashed.contains(&s.id));
+                s.window_size = live.iter().find_map(|l| l.windows.get(&s.id).copied());
                 s.folder_exists = match self.known[&s.id].folder.as_deref() {
                     Some(f) => *folders.entry(f).or_insert_with(|| Path::new(f).is_dir()),
                     None => true,
@@ -117,102 +110,12 @@ impl Catalog {
     }
 }
 
-/// When the same ID is in two project folders, the newest transcript wins.
-fn find_transcripts(projects: &Path) -> Vec<Found> {
-    let mut by_id: HashMap<String, Found> = HashMap::new();
-    let Ok(dirs) = fs::read_dir(projects) else {
-        return Vec::new();
-    };
-    for dir in dirs.flatten() {
-        let Ok(files) = fs::read_dir(dir.path()) else { continue };
-        for file in files.flatten() {
-            let path = file.path();
-            let Some(id) = session_id_of(&path).map(str::to_owned) else { continue };
-            let Ok(meta) = file.metadata() else { continue };
-            if !meta.is_file() {
-                continue;
-            }
-            let found = Found {
-                id: id.clone(),
-                path,
-                size: meta.len(),
-                mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
-            };
-            match by_id.get(&id) {
-                Some(existing) if existing.mtime_ns >= found.mtime_ns => {}
-                _ => {
-                    by_id.insert(id, found);
-                }
-            }
-        }
-    }
-    by_id.into_values().collect()
-}
-
-fn read_session(f: &Found) -> Option<(Session, SearchDoc)> {
-    let file = fs::File::open(&f.path).ok()?;
-    let p = transcript::parse(BufReader::with_capacity(1 << 20, file)).ok()?;
-    let doc = SearchDoc {
-        title: p.name.clone(),
-        path: p.folder.clone().unwrap_or_default(),
-        branch: p.branch.clone().unwrap_or_default(),
-        prompts: p.prompt_text,
-        replies: p.reply_text,
-    };
-    let session = Session {
-        id: f.id.clone(),
-        source: Source::ClaudeCode,
-        transcript_path: f.path.to_string_lossy().into_owned(),
-        transcript_size: f.size,
-        transcript_mtime_ns: f.mtime_ns,
-        size_bytes: f.size + dir_size(&companion_dir(&f.path)),
-        name: p.name,
-        folder: p.folder,
-        folders: p.folders,
-        branch: p.branch,
-        model: p.model,
-        started_at_ms: p.started_at_ms,
-        last_active_ms: p.last_active_ms.or(Some(f.mtime_ns / 1_000_000)),
-        context_used: p.context_used,
-        prompts: p.prompts,
-        replies: p.replies,
-        cost_usd: p.cost_usd,
-        lines_added: p.lines_added,
-        lines_removed: p.lines_removed,
-        pr_url: p.pr_url,
-        continued_in: p.continued_in,
-        recaps: p.recaps,
-        bad_lines: p.bad_lines,
-        open: false,
-        crashed: false,
-        window_size: None,
-        folder_exists: true,
-    };
-    Some((session, doc))
-}
-
-/// `<id>.jsonl` keeps its subagents and tool results in `<id>/`.
-fn companion_dir(transcript: &Path) -> PathBuf {
-    transcript.with_extension("")
-}
-
-/// Total size of regular files, never following symlinks.
-fn dir_size(dir: &Path) -> u64 {
-    let Ok(entries) = fs::read_dir(dir) else { return 0 };
-    entries
-        .flatten()
-        .map(|e| match e.file_type() {
-            Ok(t) if t.is_dir() => dir_size(&e.path()),
-            Ok(t) if t.is_file() => e.metadata().map_or(0, |m| m.len()),
-            _ => 0,
-        })
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::index::Searcher;
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
     use std::time::{Duration, SystemTime};
 
     const A: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -448,5 +351,53 @@ mod tests {
         let t = tree();
         fs::remove_dir_all(t.paths.projects()).unwrap();
         assert!(t.catalog().refresh(true).unwrap().is_empty());
+    }
+
+    /// A second tool that reads Claude Code transcripts from another folder and says which of
+    /// them are running.
+    struct Other {
+        claude: ClaudeCode,
+        open: HashSet<String>,
+    }
+
+    impl Tool for Other {
+        fn source(&self) -> crate::model::Source {
+            self.claude.source()
+        }
+        fn find(&self) -> Vec<Found> {
+            self.claude.find()
+        }
+        fn read(&self, found: &Found) -> Option<(Session, SearchDoc)> {
+            self.claude.read(found)
+        }
+        fn measure(&self, found: &Found) -> u64 {
+            self.claude.measure(found)
+        }
+        fn live(&self) -> Live {
+            Live { open: self.open.clone(), ..Live::default() }
+        }
+    }
+
+    #[test]
+    fn every_tool_is_listed_and_one_no_longer_scanned_leaves_the_list() {
+        let t = tree();
+        t.write("-p1", A, "one", "/x");
+        let other_paths = Paths { claude: t.dir.path().join("other"), ..t.paths.clone() };
+        let d = other_paths.projects().join("-p2");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join(format!("{B}.jsonl")), "{\"type\":\"user\",\"cwd\":\"/y\",\"message\":{\"content\":\"hi\"}}\n").unwrap();
+        let claude = || Box::new(ClaudeCode::new(t.paths.clone(), t.proc.clone())) as Box<dyn Tool>;
+        let other = Other { claude: ClaudeCode::new(other_paths, t.proc.clone()), open: HashSet::from([B.to_string()]) };
+
+        let list = Catalog::with_tools(&t.paths.index, vec![claude(), Box::new(other)]).unwrap().refresh(false).unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(!get(&list, A).open);
+        assert!(get(&list, B).open);
+
+        let mut alone = Catalog::with_tools(&t.paths.index, vec![claude()]).unwrap();
+        assert_eq!(alone.cached().len(), 2, "the cache still holds both until the next scan");
+        let ids: Vec<String> = alone.refresh(false).unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, [A]);
+        assert!(Searcher::open(&t.paths.index).unwrap().search("hi").unwrap().unwrap().len() == 1);
     }
 }

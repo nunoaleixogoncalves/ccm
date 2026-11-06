@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Which agent wrote a conversation. Only Claude Code exists in v1.
+/// Which tool wrote a conversation. See [`crate::tools`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Source {
     ClaudeCode,

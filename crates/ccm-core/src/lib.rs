@@ -1,4 +1,5 @@
-//! Reads Claude Code's local data. Has no UI, so a web version can reuse it later.
+//! Reads the local data of coding tools, starting with Claude Code. Has no UI, so a web version
+//! can reuse it later.
 
 pub mod catalog;
 pub mod config;
@@ -18,6 +19,7 @@ pub mod repo;
 pub mod rename;
 pub mod resume;
 pub mod setup;
+pub mod tools;
 pub mod transcript;
 pub mod window;
 pub mod worktree;
