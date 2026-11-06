@@ -55,21 +55,24 @@ pub enum Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Cleanup {
     Conversations(Suggestion),
+    Worktrees,
 }
 
 impl Cleanup {
-    pub const ALL: [Cleanup; 3] = [
+    pub const ALL: [Cleanup; 4] = [
         Cleanup::Conversations(Suggestion::NoReply),
         Cleanup::Conversations(Suggestion::FolderGone),
         Cleanup::Conversations(Suggestion::LargeOld),
+        Cleanup::Worktrees,
     ];
 }
 
-/// How many items a clean-up line has and what removing them would free.
+/// How many items a clean-up line has and what removing them would free. `bytes` is `None`
+/// when some of them haven't been measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tally {
     pub count: usize,
-    pub bytes: u64,
+    pub bytes: Option<u64>,
 }
 
 /// How the conversation list is grouped. `g` steps through them in this order.
@@ -172,6 +175,8 @@ pub struct ConfirmDelete {
     opened: Instant,
     /// The clean-up lines this delete came from, with what each held when it was asked for.
     pub from: Vec<(Cleanup, Tally)>,
+    /// Worktrees removed along with the conversations, from the clean-up screen.
+    pub worktrees: Option<removal::Plan>,
 }
 
 /// A worktree removal waiting for an answer. Nothing has changed yet.
@@ -372,7 +377,7 @@ impl App {
     /// The folders to scan for worktrees, when a scan is due. The caller runs Git elsewhere and
     /// hands the result to `finish_worktree_scan`.
     pub fn worktree_request(&mut self) -> Option<Vec<String>> {
-        if self.view != View::Worktrees || !self.worktrees.due() {
+        if self.view == View::Conversations || !self.worktrees.due() {
             return None;
         }
         self.worktrees.start();
@@ -408,8 +413,24 @@ impl App {
         self.rebuild();
     }
 
+    /// True when the scan just requested should also measure the worktrees that could be
+    /// cleaned up. Only the clean-up screen needs that, and only once per visit.
+    pub fn worktree_sizes_wanted(&mut self) -> bool {
+        self.view == View::Cleanup && std::mem::take(&mut self.worktrees.measure_due)
+    }
+
     pub fn finish_worktree_scan(&mut self, scan: ccm_core::worktree::Scan) {
         self.worktrees.finish(scan, &self.sessions);
+    }
+
+    pub fn finish_worktree_sizes(&mut self, sizes: HashMap<PathBuf, u64>) {
+        self.worktrees.sizes = sizes;
+    }
+
+    /// Worktrees running sessions are in, found with each scan.
+    pub fn set_busy_worktrees(&mut self, busy: HashSet<PathBuf>) {
+        self.worktrees.busy = busy;
+        self.worktrees.relink(&self.sessions);
     }
 
     fn toggle_view(&mut self) {
@@ -417,6 +438,7 @@ impl App {
             View::Conversations | View::Cleanup => {
                 // Fresh on every visit, as Git's state changes without anything `ccm` watches.
                 self.worktrees.refresh_soon();
+                self.worktrees.show_idle(false, &self.sessions);
                 View::Worktrees
             }
             View::Worktrees => View::Conversations,
@@ -431,12 +453,24 @@ impl App {
         // Marks last only for one visit, as the lines may hold other things by the next.
         self.cleanup_marked.clear();
         self.view = View::Cleanup;
+        self.worktrees.refresh_soon();
+        self.worktrees.measure_due = true;
     }
 
-    /// What a clean-up line holds.
-    pub fn tally(&self, line: Cleanup) -> Tally {
-        let rows = self.cleanup_items(line);
-        Tally { count: rows.len(), bytes: rows.iter().map(|&i| self.sessions[i].size_bytes).sum() }
+    /// What a clean-up line holds. `None` while it's still being checked.
+    pub fn tally(&self, line: Cleanup) -> Option<Tally> {
+        match line {
+            Cleanup::Conversations(_) => {
+                let rows = self.cleanup_conversations(line);
+                Some(Tally { count: rows.len(), bytes: Some(rows.iter().map(|&i| self.sessions[i].size_bytes).sum()) })
+            }
+            Cleanup::Worktrees => {
+                self.worktrees.scan.as_ref()?;
+                let idle = self.worktrees.idle();
+                let bytes = idle.iter().map(|w| if w.prunable { Some(0) } else { self.worktrees.sizes.get(&w.path).copied() }).sum();
+                Some(Tally { count: idle.len(), bytes })
+            }
+        }
     }
 
     /// The suggestion the list is showing, when its filters are exactly one's.
@@ -455,13 +489,19 @@ impl App {
                 self.run_search();
                 self.select_row(self.nearest_item(0));
             }
+            Cleanup::Worktrees => {
+                self.view = View::Worktrees;
+                self.worktrees.show_idle(true, &self.sessions);
+                self.worktrees.select_first();
+            }
         }
     }
 
-    /// The items of a clean-up line, as conversation indexes.
-    fn cleanup_items(&self, line: Cleanup) -> Vec<usize> {
+    /// The conversations on a clean-up line, as indexes. Other lines have none.
+    fn cleanup_conversations(&self, line: Cleanup) -> Vec<usize> {
         match line {
             Cleanup::Conversations(suggestion) => suggestion.select(&self.sessions, self.config.limits((self.clock)())),
+            Cleanup::Worktrees => Vec::new(),
         }
     }
 
@@ -483,7 +523,7 @@ impl App {
 
     /// Marks every line with something in it, or clears the marks when they're all marked.
     fn mark_all_cleanup(&mut self) {
-        let full: Vec<Cleanup> = Cleanup::ALL.into_iter().filter(|&l| self.tally(l).count > 0).collect();
+        let full: Vec<Cleanup> = Cleanup::ALL.into_iter().filter(|&l| self.tally(l).is_some_and(|t| t.count > 0)).collect();
         if !full.is_empty() && full.iter().all(|l| self.cleanup_marked.contains(l)) {
             self.cleanup_marked.clear();
         } else {
@@ -495,16 +535,49 @@ impl App {
     /// lines is deleted once. The usual checks run again before anything goes.
     fn start_cleanup_delete(&mut self) {
         let lines = self.cleanup_targets();
-        let from: Vec<(Cleanup, Tally)> = lines.iter().map(|&l| (l, self.tally(l))).filter(|(_, t)| t.count > 0).collect();
-        let mut picked: Vec<usize> = lines.iter().flat_map(|&l| self.cleanup_items(l)).collect();
+        let from: Vec<(Cleanup, Tally)> =
+            lines.iter().filter_map(|&l| self.tally(l).map(|t| (l, t))).filter(|(_, t)| t.count > 0).collect();
+        let mut picked: Vec<usize> = lines.iter().flat_map(|&l| self.cleanup_conversations(l)).collect();
         picked.sort_unstable();
         picked.dedup();
-        if picked.is_empty() {
-            self.status = Some("Nothing to delete on this line.".into());
+        let worktrees: Vec<Target> = if lines.contains(&Cleanup::Worktrees) {
+            self.worktrees.idle().into_iter().map(|w| Target { path: w.path.clone(), repo: w.repo.clone() }).collect()
+        } else {
+            Vec::new()
+        };
+        if picked.is_empty() && worktrees.is_empty() {
+            let checking = lines.iter().any(|&l| self.tally(l).is_none());
+            self.status = Some(if checking { "Still checking. Try again in a moment." } else { "Nothing to delete on this line." }.into());
             return;
         }
         let targets: Vec<Session> = picked.into_iter().map(|i| self.sessions[i].clone()).collect();
-        self.ask_delete(targets.iter().collect(), from);
+        let plan = if targets.is_empty() { Plan::default() } else { self.plan_delete(targets.iter().collect()) };
+        let remove = if worktrees.is_empty() {
+            None
+        } else {
+            let Some(planner) = self.remove_planner.as_mut() else { return };
+            let mut remove = planner(&worktrees, &self.sessions);
+            // Only worktrees with nothing to lose are suggested. One that gained commits since
+            // goes through the worktree view, where removing it has its own countdown.
+            let (ahead, fine): (Vec<_>, Vec<_>) = remove.items.into_iter().partition(|i| i.unpushed > 0);
+            remove.items = fine;
+            remove.refused.extend(ahead.into_iter().map(|i| removal::Refused {
+                path: i.target.path,
+                reason: "it has unpushed commits now. Remove it from the worktree view".into(),
+            }));
+            Some(remove)
+        };
+        if plan.items.is_empty() && remove.as_ref().is_none_or(|r| r.items.is_empty()) {
+            let reason = plan
+                .skipped
+                .first()
+                .map(|s| s.reason.clone())
+                .or_else(|| remove.as_ref().and_then(|r| r.refused.first()).map(|r| sanitize(&r.reason)));
+            self.status = Some(format!("Can't delete: {}.", reason.as_deref().unwrap_or("nothing to delete")));
+            return;
+        }
+        self.dialog_scroll = 0;
+        self.confirm_delete = Some(ConfirmDelete { plan, include_notes: false, opened: Instant::now(), from, worktrees: remove });
     }
 
     fn on_cleanup_key(&mut self, key: KeyCode) {
@@ -531,7 +604,9 @@ impl App {
         if key == KeyCode::Char('C') {
             return self.run(Action::Cleanup);
         }
-
+        if key == KeyCode::Char('c') && self.worktrees.only_idle {
+            return self.run(Action::ClearFilters);
+        }
         let page = self.hit.body.height.max(1) as isize;
         let w = &mut self.worktrees;
         match key {
@@ -557,7 +632,7 @@ impl App {
             View::Conversations => self.can_change() || !self.marked_shown().is_empty(),
             View::Worktrees if self.confirm_remove.as_ref().is_some_and(|c| c.seconds_left().is_some()) => false,
             View::Worktrees => self.worktrees.selected().is_some() || !self.worktrees.marked_shown().is_empty(),
-            View::Cleanup => self.cleanup_targets().into_iter().any(|l| self.tally(l).count > 0),
+            View::Cleanup => self.cleanup_targets().into_iter().any(|l| self.tally(l).is_some_and(|t| t.count > 0)),
         }
     }
 
@@ -610,31 +685,33 @@ impl App {
 
     fn perform_remove(&mut self) {
         let Some(ConfirmRemove { plan, .. }) = self.pending_remove.take() else { return };
-        let Some(remover) = self.remover.as_mut() else { return };
         self.status = None;
-        let outcome = remover(&plan, &self.sessions);
+        let (summary, lines) = self.run_removal(&plan);
+        self.tell(REMOVE_REPORT, summary, lines);
+    }
+
+    /// Removes the worktrees of a plan and says what happened.
+    fn run_removal(&mut self, plan: &removal::Plan) -> (String, Vec<String>) {
+        let path = |p: &std::path::Path| sanitize(&p.display().to_string());
+        let refused = plan.refused.iter().map(|s| format!("Skipped {}: {}", path(&s.path), sanitize(&s.reason)));
+        if plan.items.is_empty() {
+            return (String::new(), refused.collect());
+        }
+        let Some(remover) = self.remover.as_mut() else { return (String::new(), Vec::new()) };
+        let outcome = remover(plan, &self.sessions);
         let count = outcome.removed.len();
         let summary = match count {
             1 => "Removed 1 worktree. Its branch is kept.".to_string(),
             n => format!("Removed {n} worktrees. Their branches are kept."),
         };
-        let path = |p: &std::path::Path| sanitize(&p.display().to_string());
         let mut lines = Vec::new();
         for f in &outcome.failures {
             lines.push(format!("Not removed {}: {}", path(&f.path), sanitize(&f.reason)));
         }
-        for s in plan.refused.iter().chain(&outcome.skipped) {
-            lines.push(format!("Skipped {}: {}", path(&s.path), sanitize(&s.reason)));
-        }
+        lines.extend(refused);
+        lines.extend(outcome.skipped.iter().map(|s| format!("Skipped {}: {}", path(&s.path), sanitize(&s.reason))));
         self.worktrees.forget(&outcome.removed, &self.sessions);
-        if lines.is_empty() {
-            self.status = Some(summary);
-        } else {
-            lines.insert(0, summary);
-            self.dialog_scroll = 0;
-            self.report_title = REMOVE_REPORT;
-            self.report = Some(lines);
-        }
+        (summary, lines)
     }
 
     /// Lets a test act as if the pause before a second Del has passed.
@@ -765,29 +842,31 @@ impl App {
         let marked = self.marked_shown();
         let targets: Vec<&Session> = if marked.is_empty() { self.selected().into_iter().collect() } else { marked };
         let targets: Vec<Session> = targets.into_iter().cloned().collect();
-        self.ask_delete(targets.iter().collect(), Vec::new());
-    }
-
-    fn ask_delete(&mut self, targets: Vec<&Session>, from: Vec<(Cleanup, Tally)>) {
         if targets.is_empty() {
             return;
         }
-        let (starting, ids): (Vec<&Session>, Vec<&Session>) = targets.into_iter().partition(|s| self.recently_resumed(&s.id));
-        let starting: Vec<Skipped> = starting
-            .into_iter()
-            .map(|s| Skipped { id: s.id.clone(), reason: "it was just resumed".into() })
-            .collect();
-        let ids: Vec<String> = ids.into_iter().map(|s| s.id.clone()).collect();
-        let Some(planner) = self.planner.as_mut() else { return };
-        let mut plan = planner(&ids);
-        plan.skipped.extend(starting);
+        let plan = self.plan_delete(targets.iter().collect());
         if plan.items.is_empty() {
             let reasons: Vec<String> = plan.skipped.iter().map(|s| s.reason.clone()).collect();
             self.status = Some(format!("Can't delete: {}.", reasons.first().map_or("nothing to delete", String::as_str)));
             return;
         }
         self.dialog_scroll = 0;
-        self.confirm_delete = Some(ConfirmDelete { plan, include_notes: false, opened: Instant::now(), from });
+        self.confirm_delete = Some(ConfirmDelete { plan, include_notes: false, opened: Instant::now(), from: Vec::new(), worktrees: None });
+    }
+
+    /// What deleting these would do, leaving out any just resumed.
+    fn plan_delete(&mut self, targets: Vec<&Session>) -> Plan {
+        let (starting, ids): (Vec<&Session>, Vec<&Session>) = targets.into_iter().partition(|s| self.recently_resumed(&s.id));
+        let starting: Vec<Skipped> = starting
+            .into_iter()
+            .map(|s| Skipped { id: s.id.clone(), reason: "it was just resumed".into() })
+            .collect();
+        let ids: Vec<String> = ids.into_iter().map(|s| s.id.clone()).collect();
+        let Some(planner) = self.planner.as_mut() else { return Plan::default() };
+        let mut plan = planner(&ids);
+        plan.skipped.extend(starting);
+        plan
     }
 
     /// True if the key scrolled the dialog that's showing.
@@ -847,20 +926,50 @@ impl App {
         if self.pending_remove.is_some() {
             return self.perform_remove();
         }
-        let Some(ConfirmDelete { plan, include_notes, .. }) = self.pending_delete.take() else { return };
-        let Some(deleter) = self.deleter.as_mut() else { return };
+        let Some(ConfirmDelete { plan, include_notes, worktrees, .. }) = self.pending_delete.take() else { return };
         self.status = None;
-        match deleter(&plan, include_notes) {
-            Ok(outcome) => self.finish_delete(&plan, include_notes, &outcome),
-            Err(e) => {
-                self.dialog_scroll = 0;
-                self.report_title = DELETE_REPORT;
-                self.report = Some(vec![sanitize(&e)]);
+        let mut summaries = Vec::new();
+        let mut lines = Vec::new();
+        if !plan.items.is_empty() {
+            let Some(deleter) = self.deleter.as_mut() else { return };
+            match deleter(&plan, include_notes) {
+                Ok(outcome) => {
+                    let (summary, more) = self.finish_delete(&plan, include_notes, &outcome);
+                    summaries.push(summary);
+                    lines.extend(more);
+                }
+                Err(e) => lines.push(sanitize(&e)),
             }
+        } else {
+            lines.extend(plan.skipped.iter().map(|s| format!("Skipped {}: {}", self.name_of(&s.id), s.reason)));
         }
+        if let Some(remove) = worktrees {
+            let (summary, more) = self.run_removal(&remove);
+            if !remove.items.is_empty() {
+                summaries.push(summary);
+            }
+            lines.extend(more);
+        }
+        self.cleanup_marked.clear();
+        self.tell(DELETE_REPORT, summaries.join(" "), lines);
     }
 
-    fn finish_delete(&mut self, plan: &Plan, include_notes: bool, outcome: &Outcome) {
+    /// Puts a result in the status line, or in a report when there's more to say.
+    fn tell(&mut self, title: &'static str, summary: String, mut lines: Vec<String>) {
+        if lines.is_empty() {
+            self.status = Some(summary);
+            return;
+        }
+        if !summary.is_empty() {
+            lines.insert(0, summary);
+        }
+        self.dialog_scroll = 0;
+        self.report_title = title;
+        self.report = Some(lines);
+    }
+
+    /// Updates the list after a delete, and says what happened.
+    fn finish_delete(&mut self, plan: &Plan, include_notes: bool, outcome: &Outcome) -> (String, Vec<String>) {
         let freed: u64 = plan.items.iter().filter(|i| outcome.deleted.contains(&i.id)).map(|i| i.bytes).sum();
         let freed = freed + if include_notes { plan.note_bytes() } else { 0 };
         let count = outcome.deleted.len();
@@ -877,16 +986,8 @@ impl App {
 
         self.sessions.retain(|s| !outcome.deleted.contains(&s.id));
         self.marked.retain(|id| !outcome.deleted.contains(id));
-        self.cleanup_marked.clear();
         self.run_search();
-        if lines.is_empty() {
-            self.status = Some(summary);
-        } else {
-            lines.insert(0, summary);
-            self.dialog_scroll = 0;
-            self.report_title = DELETE_REPORT;
-            self.report = Some(lines);
-        }
+        (summary, lines)
     }
 
     fn start_rename(&mut self) {
@@ -1208,6 +1309,7 @@ impl App {
             Action::ToggleJunk => self.filters.junk = !self.filters.junk,
             Action::ToggleMissing => self.filters.missing = !self.filters.missing,
             Action::ToggleLarge => self.filters.large = !self.filters.large,
+            Action::ClearFilters if self.view == View::Worktrees => self.worktrees.show_idle(false, &self.sessions),
             Action::ClearFilters => self.filters = Filters::default(),
             Action::ToggleGroup => {
                 self.grouping = self.grouping.next();

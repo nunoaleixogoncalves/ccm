@@ -72,6 +72,10 @@ fn summary_line(app: &App) -> Line<'static> {
     let linked: Vec<&Worktree> = w.worktrees().iter().filter(|w| w.is_linked()).collect();
     let repos = w.rows.iter().filter(|r| matches!(r, ListRow::Header { .. })).count();
     let mut text = format!(" ccm  worktrees  {} in {} {}", linked.len(), repos, if repos == 1 { "repository" } else { "repositories" });
+    if w.only_idle {
+        let shown = w.rows.iter().filter(|r| matches!(r, ListRow::Item(_))).count();
+        text = format!(" ccm  worktrees  showing {shown} with nothing to lose, of {}", linked.len());
+    }
     let changed = linked.iter().filter(|w| w.state.is_some_and(|s| s.changes > 0)).count();
     let unpushed = linked.iter().filter(|w| w.state.is_some_and(|s| s.unpushed > 0)).count();
     if changed > 0 {
@@ -180,6 +184,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         let message = match &wt.scan {
             None => "Looking for worktrees…".to_string(),
             Some(scan) if !scan.errors.is_empty() => sanitize(&scan.errors.join(" ")),
+            Some(_) if wt.only_idle => "None left with nothing to lose. Press c to show all worktrees.".to_string(),
             Some(_) => "No worktrees found. Only repositories that a conversation worked in are checked.".to_string(),
         };
         f.render_widget(Paragraph::new(header_only_lines(message)), area);
@@ -287,7 +292,7 @@ pub(super) fn remove_dialog(app: &App) -> Dialog {
     Dialog { title: " Remove worktrees? ", top, body, bottom }
 }
 
-fn item_lines(app: &App, item: &Planned, bold: Style, warn: Style, plain: Style) -> Vec<(String, Style)> {
+pub(super) fn item_lines(app: &App, item: &Planned, bold: Style, warn: Style, plain: Style) -> Vec<(String, Style)> {
     let path = sanitize(&short_path(&item.target.path.to_string_lossy(), &app.home));
     let branch = item.branch.as_deref().map_or("(detached)".to_string(), sanitize);
     let mut lines = vec![(format!("{path}  {branch}"), bold)];

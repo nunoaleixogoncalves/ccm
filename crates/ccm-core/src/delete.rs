@@ -247,7 +247,7 @@ fn side_paths(paths: &Paths, id: &str, projects: &[PathBuf], jobs: &[Job], warni
 }
 
 /// Total size of what removing this path would free, never following symlinks.
-fn size_of(path: &Path) -> u64 {
+pub fn size_of(path: &Path) -> u64 {
     let Ok(meta) = fs::symlink_metadata(path) else { return 0 };
     if !meta.is_dir() {
         return if meta.is_file() { meta.len() } else { 0 };

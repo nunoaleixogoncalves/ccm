@@ -3,7 +3,7 @@ mod clipboard;
 mod ui;
 mod worktrees;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{stdin, stdout, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -18,6 +18,7 @@ use ccm_core::index::{Index, Searcher};
 use ccm_core::model::Session;
 use ccm_core::paths::Paths;
 use ccm_core::recovery;
+use ccm_core::registry;
 use ccm_core::removal;
 use ccm_core::repo::{self, Place};
 use ccm_core::rename;
@@ -151,7 +152,7 @@ fn browse(paths: Paths) -> Result<()> {
 
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
-    let result = run(&mut terminal, &mut app, updates, paths.index.clone());
+    let result = run(&mut terminal, &mut app, updates, &paths);
     let _ = execute!(stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -199,6 +200,8 @@ fn home() -> String {
 }
 
 type Update = Result<Vec<Session>, String>;
+/// A worktree scan, the sizes it measured when asked to, and the worktrees running sessions are in.
+type ScanResult = (Scan, Option<HashMap<PathBuf, u64>>, HashSet<PathBuf>);
 
 fn spawn_refresher(mut catalog: Catalog) -> Receiver<Update> {
     let (tx, rx) = mpsc::channel();
@@ -237,10 +240,27 @@ fn look_up_repos(index: &Path, request: &RepoRequest) -> HashMap<String, Place> 
     out
 }
 
-fn run(terminal: &mut DefaultTerminal, app: &mut App, updates: Receiver<Update>, index: PathBuf) -> Result<()> {
+/// Sizes of the worktrees removing could lose nothing from, for the clean-up screen. Which of
+/// them no conversation used is only known later, so this measures a few more than needed.
+fn measure_worktrees(scan: &Scan) -> HashMap<PathBuf, u64> {
+    scan.worktrees
+        .iter()
+        .filter(|w| w.is_linked() && !w.prunable && !w.locked && w.state.is_some_and(|s| s.changes == 0 && s.unpushed == 0))
+        .map(|w| (w.path.clone(), delete::size_of(&w.path)))
+        .collect()
+}
+
+/// Linked worktrees a running session is working in, which may have no transcript yet.
+fn busy_worktrees(scan: &Scan, sessions_dir: &Path) -> HashSet<PathBuf> {
+    let cwds: Vec<PathBuf> = registry::live_sessions(sessions_dir, Path::new(PROC)).into_iter().filter_map(|l| l.cwd.map(PathBuf::from)).collect();
+    scan.worktrees.iter().filter(|w| w.is_linked() && cwds.iter().any(|c| c.starts_with(&w.path))).map(|w| w.path.clone()).collect()
+}
+
+fn run(terminal: &mut DefaultTerminal, app: &mut App, updates: Receiver<Update>, paths: &Paths) -> Result<()> {
+    let index = paths.index.clone();
     let mut dirty = true;
     let mut last_draw = Instant::now();
-    let mut worktree_scan: Option<Receiver<Scan>> = None;
+    let mut worktree_scan: Option<Receiver<ScanResult>> = None;
     let mut repo_lookup: Option<Receiver<HashMap<String, Place>>> = None;
     while !app.quit {
         if repo_lookup.is_none()
@@ -268,21 +288,32 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, updates: Receiver<Update>,
         if worktree_scan.is_none()
             && let Some(folders) = app.worktree_request()
         {
+            let measure = app.worktree_sizes_wanted();
+            let sessions_dir = paths.sessions();
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
-                let _ = tx.send(worktree::scan(&folders));
+                let scan = worktree::scan(&folders);
+                let sizes = measure.then(|| measure_worktrees(&scan));
+                let busy = busy_worktrees(&scan, &sessions_dir);
+                let _ = tx.send((scan, sizes, busy));
             });
             worktree_scan = Some(rx);
             dirty = true;
         }
         if let Some(rx) = &worktree_scan {
             let finished = match rx.try_recv() {
-                Ok(scan) => Some(scan),
+                Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some(Scan { errors: vec!["Looking for worktrees stopped unexpectedly.".into()], ..Scan::default() }),
+                Err(TryRecvError::Disconnected) => {
+                    Some((Scan { errors: vec!["Looking for worktrees stopped unexpectedly.".into()], ..Scan::default() }, None, HashSet::new()))
+                }
             };
-            if let Some(scan) = finished {
+            if let Some((scan, sizes, busy)) = finished {
                 app.finish_worktree_scan(scan);
+                app.set_busy_worktrees(busy);
+                if let Some(sizes) = sizes {
+                    app.finish_worktree_sizes(sizes);
+                }
                 worktree_scan = None;
                 dirty = true;
             }
