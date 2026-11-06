@@ -36,7 +36,11 @@ fn summary_line(app: &App) -> Line<'static> {
     let tallies = Cleanup::ALL.map(|l| app.tally(l));
     let count: usize = tallies.iter().map(|t| t.count).sum();
     let freed: u64 = tallies.iter().map(|t| t.bytes).sum();
-    let mut text = format!(" ccm  clean up  {count} suggested, {} could be freed", bytes(freed));
+    let mut text = if count == 0 {
+        " ccm  clean up  nothing to clean up right now".to_string()
+    } else {
+        format!(" ccm  clean up  {count} suggested, {} could be freed", bytes(freed))
+    };
     let marked: Vec<Cleanup> = Cleanup::ALL.into_iter().filter(|l| app.cleanup_marked.contains(l)).collect();
     if !marked.is_empty() {
         let n = marked.len();
@@ -104,6 +108,9 @@ fn explanation(app: &App, line: Cleanup) -> Vec<String> {
             app.config.old_after_days
         ),
     };
+    if app.tally(line).count == 0 {
+        return vec![first, "Open ones aren't suggested.".into(), "Nothing matches this right now, so there's nothing to delete here.".into()];
+    }
     vec![first, "Open ones aren't suggested.".into(), list.into()]
 }
 
@@ -233,6 +240,8 @@ mod tests {
         a.on_key(KeyCode::Char('C'));
         let screen = render(&mut a, 100, 30);
         assert!(line(&screen, "folder is gone").contains(" 0 "), "{screen}");
+        assert!(line(&screen, " ccm ").contains("nothing to clean up right now"), "{screen}");
+        assert!(screen.contains("nothing to delete here"), "{screen}");
     }
 
     #[test]
