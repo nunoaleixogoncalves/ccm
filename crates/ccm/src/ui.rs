@@ -215,7 +215,14 @@ fn delete_dialog(app: &App) -> Dialog {
     let freed = plan.bytes() + if confirm.include_notes { plan.note_bytes() } else { 0 };
     let count = plan.items.len();
     let plural = if count == 1 { "" } else { "s" };
-    let top = vec![(format!("{count} conversation{plural}, {} freed. This can't be undone.", bytes(freed)), bold)];
+    let mut top = vec![(format!("{count} conversation{plural}, {} freed. This can't be undone.", bytes(freed)), bold)];
+    if !confirm.from.is_empty() {
+        top.push(("From the clean-up suggestions:".into(), plain));
+        for (line, tally) in &confirm.from {
+            top.push((format!("  {}: {}, {}", cleanup::label(app, *line), tally.count, bytes(tally.bytes)), plain));
+        }
+        top.push((String::new(), plain));
+    }
 
     // One line each with a short ID, so a long or repeated name can't pass for other rows.
     let width = app.dialog_width.saturating_sub(2) as usize;
@@ -599,7 +606,13 @@ fn footer_groups(app: &App) -> [(&'static str, Vec<Button>); 2] {
         return [("Actions", actions), ("View", view)];
     }
     if app.view == View::Cleanup {
-        let actions = vec![("Enter", "Open", Action::OpenSuggestion, false), ("q", "Quit", Action::Quit, false)];
+        let actions = vec![
+            ("Enter", "Open", Action::OpenSuggestion, false),
+            ("d", "Delete", Action::Delete, app.confirm_delete.is_some()),
+            ("Space", "Mark", Action::Mark, false),
+            ("a", "All", Action::MarkAll, false),
+            ("q", "Quit", Action::Quit, false),
+        ];
         let view = vec![("Esc", "Conversations", Action::Cleanup, false), ("w", "Worktrees", Action::Worktrees, false)];
         return [("Actions", actions), ("View", view)];
     }

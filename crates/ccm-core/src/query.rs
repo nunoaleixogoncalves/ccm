@@ -46,7 +46,7 @@ impl Filters {
 }
 
 /// Conversations worth cleaning up. Each is a set of filters, so the normal list can show them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Suggestion {
     NoReply,
     FolderGone,

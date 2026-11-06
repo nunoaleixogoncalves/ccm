@@ -36,7 +36,12 @@ fn summary_line(app: &App) -> Line<'static> {
     let tallies = Cleanup::ALL.map(|l| app.tally(l));
     let count: usize = tallies.iter().map(|t| t.count).sum();
     let freed: u64 = tallies.iter().map(|t| t.bytes).sum();
-    let text = format!(" ccm  clean up  {count} suggested, {} could be freed", bytes(freed));
+    let mut text = format!(" ccm  clean up  {count} suggested, {} could be freed", bytes(freed));
+    let marked: Vec<Cleanup> = Cleanup::ALL.into_iter().filter(|l| app.cleanup_marked.contains(l)).collect();
+    if !marked.is_empty() {
+        let n = marked.len();
+        text.push_str(&format!("  {n} line{} marked", if n == 1 { "" } else { "s" }));
+    }
     Line::from(Span::styled(text, Style::new().add_modifier(Modifier::BOLD)))
 }
 
@@ -59,8 +64,16 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|&line| {
             let tally = app.tally(line);
-            let style = if tally.count == 0 { Style::new().fg(Color::DarkGray) } else { Style::new() };
-            let cells = [label(app, line), format!("{:>8}", tally.count), format!("{:>10}", bytes(tally.bytes))];
+            let marked = app.cleanup_marked.contains(&line);
+            let style = if marked {
+                Style::new().fg(Color::Yellow)
+            } else if tally.count == 0 {
+                Style::new().fg(Color::DarkGray)
+            } else {
+                Style::new()
+            };
+            let name = if marked { format!("● {}", label(app, line)) } else { label(app, line) };
+            let cells = [name, format!("{:>8}", tally.count), format!("{:>10}", bytes(tally.bytes))];
             Row::new(cells.map(Cell::from)).style(style)
         })
         .collect();
@@ -77,7 +90,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn explanation(app: &App, line: Cleanup) -> Vec<String> {
-    let list = "Enter shows them in the list, where you mark them and delete them the usual way.";
+    let list = "Enter shows them in the list, to look through them or delete only some. d deletes all of them, and Space marks lines to delete several at once.";
     let first = match line {
         Cleanup::Conversations(Suggestion::NoReply) => {
             "Conversations where Claude never replied, often started by mistake or cut off at once.".to_string()
@@ -102,7 +115,9 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let width = inner.width.saturating_sub(1) as usize;
     let mut text: Vec<Line> = explanation(app, line).iter().flat_map(|l| super::wrap(l, width)).map(|l| Line::from(format!(" {l}"))).collect();
     text.push(Line::from(""));
-    text.push(Line::from(Span::styled(" Nothing is deleted from this screen.", Style::new().fg(Color::DarkGray))));
+    let safety = "Nothing is deleted without asking. Each one is checked again just before, and any that opened meanwhile are kept.";
+    let grey = Style::new().fg(Color::DarkGray);
+    text.extend(super::wrap(safety, width).into_iter().map(|l| Line::from(Span::styled(format!(" {l}"), grey))));
     f.render_widget(Paragraph::new(text), inner);
 }
 
@@ -203,7 +218,7 @@ mod tests {
         assert!(line(&screen, "folder is gone").contains("3M"));
         assert!(line(&screen, "over 100M not used for 30 days").contains("300M"), "{screen}");
         assert!(line(&screen, " ccm ").contains("3 suggested, 304M could be freed"), "{screen}");
-        assert!(screen.contains("Nothing is deleted from this screen."));
+        assert!(screen.contains("Nothing is deleted without asking."), "{screen}");
         a.on_key(KeyCode::Esc);
         assert_eq!(a.view, View::Conversations);
         a.run(Action::Cleanup);
@@ -255,12 +270,131 @@ mod tests {
         assert_eq!(names(&a), ["gone"]);
     }
 
+    type Deletes = std::rc::Rc<std::cell::RefCell<Vec<Vec<String>>>>;
+
+    /// A fake core: closed conversations can be deleted, and the delete just succeeds.
+    fn deletable(a: &mut App) -> Deletes {
+        use ccm_core::delete::{Item, Outcome, Plan, Skipped};
+        let sessions = a.sessions.clone();
+        a.planner = Some(Box::new(move |ids| {
+            let mut plan = Plan::default();
+            for id in ids {
+                let s = sessions.iter().find(|s| s.id == *id).unwrap();
+                if s.open {
+                    plan.skipped.push(Skipped { id: id.clone(), reason: "it's open".into() });
+                } else {
+                    plan.items.push(Item { id: id.clone(), side: vec![], transcripts: vec![], bytes: s.size_bytes });
+                }
+            }
+            plan
+        }));
+        let calls: Deletes = Default::default();
+        let log = calls.clone();
+        a.deleter = Some(Box::new(move |plan, _| {
+            let ids: Vec<String> = plan.items.iter().map(|i| i.id.clone()).collect();
+            log.borrow_mut().push(ids.clone());
+            Ok(Outcome { deleted: ids, ..Outcome::default() })
+        }));
+        calls
+    }
+
+    #[test]
+    fn d_deletes_everything_on_the_selected_line_after_asking() {
+        let mut a = app();
+        let calls = deletable(&mut a);
+        a.on_key(KeyCode::Char('C'));
+        a.on_key(KeyCode::End);
+        a.on_key(KeyCode::Char('d'));
+        let screen = render(&mut a, 120, 30);
+        assert!(screen.contains("Delete permanently?"), "{screen}");
+        assert!(screen.contains("From the clean-up suggestions:"), "{screen}");
+        assert!(line(&screen, "not used for 30 days:").contains("1, 300M"), "{screen}");
+        a.on_key(KeyCode::Char('y'));
+        a.perform_delete();
+        assert_eq!(*calls.borrow(), [vec!["big-old".to_string()]]);
+        assert_eq!(a.view, View::Cleanup, "stays on the screen to carry on");
+        let screen = render(&mut a, 120, 30);
+        assert!(line(&screen, "not used for 30 days").contains(" 0 "), "{screen}");
+        assert!(a.sessions.iter().any(|s| s.id == "big-old-open"), "the open one is left alone");
+    }
+
+    #[test]
+    fn marked_lines_go_in_one_delete_and_a_conversation_on_two_lines_goes_once() {
+        let mut a = app();
+        let mut both = session("both", "/home/me/old", 3, 2);
+        both.replies = 0;
+        both.folder_exists = false;
+        let mut sessions = a.sessions.clone();
+        sessions.push(both);
+        a.set_sessions(sessions);
+        let calls = deletable(&mut a);
+        a.on_key(KeyCode::Char('C'));
+        a.on_key(KeyCode::Char(' '));
+        a.on_key(KeyCode::Down);
+        a.on_key(KeyCode::Char(' '));
+        let screen = render(&mut a, 120, 30);
+        assert!(line(&screen, " ccm ").contains("2 lines marked"), "{screen}");
+        assert!(line(&screen, "never replied to").contains("● "), "{screen}");
+        a.on_key(KeyCode::Delete);
+        a.age_confirmation();
+        a.on_key(KeyCode::Delete);
+        a.perform_delete();
+        let mut deleted = calls.borrow()[0].clone();
+        deleted.sort();
+        assert_eq!(deleted, ["both", "gone", "junk"]);
+        assert!(a.cleanup_marked.is_empty());
+    }
+
+    #[test]
+    fn a_marks_every_line_with_something_in_it_and_again_clears_them() {
+        let mut a = app();
+        a.on_key(KeyCode::Char('C'));
+        a.on_key(KeyCode::Char('a'));
+        assert_eq!(a.cleanup_marked.len(), 3);
+        a.on_key(KeyCode::Char('a'));
+        assert!(a.cleanup_marked.is_empty());
+        a.on_key(KeyCode::Char('a'));
+        a.on_key(KeyCode::Esc);
+        assert!(a.cleanup_marked.is_empty() && a.view == View::Cleanup, "Esc clears the marks first");
+        a.on_key(KeyCode::Char('a'));
+        a.on_key(KeyCode::Char('C'));
+        a.on_key(KeyCode::Char('C'));
+        assert!(a.cleanup_marked.is_empty(), "marks last one visit");
+
+        let mut a = app();
+        a.set_sessions(vec![session("big-new", "/home/me/a", 2, 300)]);
+        a.on_key(KeyCode::Char('C'));
+        a.on_key(KeyCode::Char('a'));
+        assert!(a.cleanup_marked.is_empty(), "empty lines aren't marked");
+    }
+
+    #[test]
+    fn an_empty_line_has_nothing_to_delete_and_cancelling_deletes_nothing() {
+        let mut a = app();
+        a.set_sessions(vec![session("big-new", "/home/me/a", 2, 300)]);
+        let calls = deletable(&mut a);
+        a.on_key(KeyCode::Char('C'));
+        a.on_key(KeyCode::Char('d'));
+        assert!(a.confirm_delete.is_none());
+        assert_eq!(a.status.as_deref(), Some("Nothing to delete on this line."));
+
+        let mut a = app();
+        let calls2 = deletable(&mut a);
+        a.on_key(KeyCode::Char('C'));
+        a.on_key(KeyCode::Char('d'));
+        assert!(a.confirm_delete.is_some());
+        a.on_key(KeyCode::Char('n'));
+        a.perform_delete();
+        assert!(calls.borrow().is_empty() && calls2.borrow().is_empty());
+        assert_eq!(a.sessions.len(), 6);
+    }
+
     #[test]
     fn every_button_fits_and_small_terminals_do_not_panic() {
         let mut a = app();
         a.on_key(KeyCode::Char('C'));
         let screen = render(&mut a, 80, 24);
-        for label in ["Enter Open", "q Quit", "Esc Conversations", "w Worktrees"] {
+        for label in ["Enter Open", "d Delete", "Space Mark", "a All", "q Quit", "Esc Conversations", "w Worktrees"] {
             assert!(screen.contains(label), "{label} missing:\n{screen}");
         }
         for (w, h) in [(20, 5), (40, 10), (1, 1)] {
