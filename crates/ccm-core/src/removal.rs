@@ -181,6 +181,9 @@ fn check(target: &Target, busy: &Busy, sessions: &[Session]) -> Result<Planned, 
     if w.locked {
         return Err("it's locked in Git. Unlock it with: git worktree unlock".into());
     }
+    if w.from_windows() {
+        return Err("it was made by Git for Windows, so Git here can't see its folder. Remove it from Windows".into());
+    }
     let links = connect(&list, sessions).into_iter().nth(list.iter().position(|x| x.path == w.path).unwrap_or(0)).unwrap_or_default();
     if let Some(reason) = busy_reason(busy, &w.path, sessions, &links) {
         return Err(reason);
@@ -589,6 +592,23 @@ mod tests {
         assert_eq!(f.execute(&plan, &[]).removed, std::slice::from_ref(&t.path));
         let list = Command::new("git").arg("-C").arg(&f.repo).args(["worktree", "list"]).output().unwrap();
         assert!(!String::from_utf8_lossy(&list.stdout).contains("gone"));
+    }
+
+    #[test]
+    fn a_worktree_made_by_git_for_windows_is_never_removed() {
+        let f = Fixture::new();
+        f.worktree("win");
+        // What Git for Windows writes: the worktree's own path, in Windows form.
+        fs::write(f.repo.join(".git/worktrees/win/gitdir"), "C:/Users/me/win/.git\n").unwrap();
+        let scan = crate::worktree::scan(&[f.repo.display().to_string()]);
+        let w = scan.worktrees.iter().find(|w| w.branch.as_deref() == Some("win")).expect("Git still lists it");
+        assert!(w.from_windows() && !w.prunable && w.state.is_none(), "{w:?}");
+        let target = Target { path: w.path.clone(), repo: f.repo.clone() };
+        let plan = f.plan(std::slice::from_ref(&target), &[]);
+        assert!(plan.items.is_empty());
+        assert!(plan.refused[0].reason.contains("made by Git for Windows"), "{:?}", plan.refused);
+        let list = Command::new("git").arg("-C").arg(&f.repo).args(["worktree", "list"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&list.stdout).contains("[win]"), "Git's record is untouched");
     }
 
     #[test]

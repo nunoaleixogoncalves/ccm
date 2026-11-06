@@ -203,6 +203,7 @@ Removing runs `git worktree remove`, never with `--force`. The branch stays, so 
 - a background job may own it, which `claude rm` removes instead
 - it's locked or has submodules, which Git won't remove either
 - Git couldn't read its state, or a running session's registry file can't be read
+- it was made by Git for Windows. On WSL, Git can't reach a folder recorded as `C:/...`, so it calls the worktree missing even when it exists. `ccm` shows it as "Windows" and leaves it alone
 
 Unpushed commits don't stop a removal, because the branch keeps them. They are only on your machine, though, so the popup warns about them in red. **Remove stays locked for 5 seconds**, with a countdown, and pressing `y`, Del or Remove before it ends starts it over. If more commits appear after you confirm, that worktree is skipped.
 
