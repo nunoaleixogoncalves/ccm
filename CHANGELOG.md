@@ -2,13 +2,13 @@
 
 Every release of `ccm` and what changed in it. Each section is also used as the notes of its release on GitHub.
 
-## [Unreleased]
+## [1.1.1] - 2026-11-06
 
 ### Fixed
 
-- **Resuming on WSL.** `ccm` now opens a new Windows Terminal tab there, starting the conversation in its Linux folder through `wsl.exe --cd`. Before, it tried `xdg-terminal-exec`, which WSL usually doesn't have, and resuming failed with "No such file or directory".
-- When a terminal can't be started, the message now says why: that the launcher isn't installed, or what it printed before failing.
-- **Worktrees made by Git for Windows, seen from WSL.** Git in WSL can't reach a folder recorded as `C:/...`, so it reported such a worktree as missing. `ccm` then suggested it on the clean-up screen and would have cleared Git's record of a worktree that still exists on Windows. It now shows these as "Windows" and never suggests or removes them.
+- **Resuming on WSL.** `ccm` now opens a new Windows Terminal tab there, starting the conversation in its Linux folder through `wsl.exe --cd`. Before, it tried `xdg-terminal-exec`, which WSL usually doesn't have, and resuming failed with "No such file or directory". ([#33](https://github.com/nunoaleixogoncalves/ccm/pull/33))
+- When a terminal can't be started, the message now says why: that the launcher isn't installed, or what it printed before failing. ([#33](https://github.com/nunoaleixogoncalves/ccm/pull/33))
+- **Worktrees made by Git for Windows, seen from WSL.** Git in WSL can't reach a folder recorded as `C:/...`, so it reported such a worktree as missing. `ccm` then suggested it on the clean-up screen and would have cleared Git's record of a worktree that still exists on Windows. It now shows these as "Windows" and never suggests or removes them. ([#34](https://github.com/nunoaleixogoncalves/ccm/pull/34))
 
 ## [1.1.0] - 2026-11-06
 
@@ -49,5 +49,6 @@ The first release.
 - `ccm setup` to install the hooks crash recovery needs, after showing the changes and asking.
 - Ready-made programs for Linux (static, x86-64 and ARM) and macOS (Intel and Apple silicon), and an install script that checks their checksums.
 
+[1.1.1]: https://github.com/nunoaleixogoncalves/ccm/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/nunoaleixogoncalves/ccm/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/nunoaleixogoncalves/ccm/releases/tag/v1.0.0
