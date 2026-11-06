@@ -1,6 +1,6 @@
 //! What the worktree view shows. Git runs on another thread, so this only holds results.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,23 @@ pub struct Worktrees {
     selected_path: Option<PathBuf>,
     /// Worktrees picked for a removal, which otherwise acts on the selected one.
     pub marked: HashSet<PathBuf>,
+    /// Show only worktrees with no conversation and nothing to lose, as the clean-up screen asks.
+    pub only_idle: bool,
+    /// What removing each could-be-cleaned worktree would free, measured for the clean-up screen.
+    pub sizes: HashMap<PathBuf, u64>,
+    /// The next scan should measure them.
+    pub measure_due: bool,
+    /// Worktrees a running session is working in, which may have no transcript yet.
+    pub busy: HashSet<PathBuf>,
+}
+
+/// No conversation worked in it, and removing it loses nothing: its folder is gone, or Git says
+/// it has no changes and no unpushed commits and it's on a branch. A locked one is left alone.
+pub fn is_idle(w: &Worktree, links: &[Link]) -> bool {
+    w.is_linked()
+        && links.is_empty()
+        && !w.locked
+        && (w.prunable || (!w.detached() && w.state.is_some_and(|s| s.changes == 0 && s.unpushed == 0)))
 }
 
 impl Worktrees {
@@ -56,6 +73,7 @@ impl Worktrees {
         self.last_scan = Some(Instant::now());
         let present: HashSet<&Path> = scan.worktrees.iter().filter(|w| w.is_linked()).map(|w| w.path.as_path()).collect();
         self.marked.retain(|p| present.contains(p.as_path()));
+        self.sizes.retain(|p, _| present.contains(p.as_path()));
         self.scan = Some(scan);
         self.relink(sessions);
     }
@@ -75,6 +93,21 @@ impl Worktrees {
             Row::Item(i) => self.worktrees().get(*i),
             Row::Header { .. } => None,
         })
+    }
+
+    /// Every worktree that could be cleaned up, whatever is shown.
+    pub fn idle(&self) -> Vec<&Worktree> {
+        (0..self.worktrees().len()).filter(|&i| self.is_idle_at(i)).map(|i| &self.worktrees()[i]).collect()
+    }
+
+    fn is_idle_at(&self, i: usize) -> bool {
+        let w = &self.worktrees()[i];
+        !self.busy.contains(&w.path) && is_idle(w, self.links.get(i).map_or(&[][..], Vec::as_slice))
+    }
+
+    pub fn show_idle(&mut self, on: bool, sessions: &[Session]) {
+        self.only_idle = on;
+        self.relink(sessions);
     }
 
     pub fn marked_shown(&self) -> Vec<&Worktree> {
@@ -121,7 +154,7 @@ impl Worktrees {
     /// picked for anything.
     fn rebuild(&mut self) {
         let list = self.worktrees();
-        let mut items: Vec<usize> = (0..list.len()).filter(|&i| list[i].is_linked()).collect();
+        let mut items: Vec<usize> = (0..list.len()).filter(|&i| list[i].is_linked() && (!self.only_idle || self.is_idle_at(i))).collect();
         items.sort_by(|&a, &b| (&list[a].repo, &list[a].path).cmp(&(&list[b].repo, &list[b].path)));
         let mut rows = Vec::new();
         for (n, &i) in items.iter().enumerate() {

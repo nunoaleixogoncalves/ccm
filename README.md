@@ -26,7 +26,7 @@ If you run a lot of Claude Code sessions, they pile up:
 - **Delete:** permanently remove one or many conversations and their data, after a confirmation that lists what goes.
 - **Rename:** the new name also shows in Claude Code's own `/resume`.
 - **Group:** by the folder a conversation ran in, or by Git repository, so the work in a repository and all its worktrees shows together.
-- **Clean up:** one screen lists what could be cleaned up and how much space it would free, and deletes it after asking: conversations Claude never replied to, ones whose folder is gone, and large ones you haven't used for a while.
+- **Clean up:** one screen lists what could be cleaned up and how much space it would free, and deletes it after asking: conversations Claude never replied to, ones whose folder is gone, large ones you haven't used for a while, and worktrees nothing needs.
 - **Recover:** after a crash, see what was running and reopen it all at once.
 - **Worktrees:** see the Git worktrees of the repositories your conversations used, with their uncommitted changes, unpushed commits and the conversations that worked in each, and remove the ones you're done with.
 
@@ -150,11 +150,12 @@ Press `Shift+C` to see what could be cleaned up. Each line says how many items i
 - conversations Claude never replied to
 - conversations whose folder is gone
 - conversations over the large size, 100 MB by default, that haven't been active for 30 days
+- worktrees no conversation worked in that have nothing to lose: no uncommitted changes, no unpushed commits and a branch, or a folder that's already gone. Locked ones, and ones a running session is in, aren't suggested
 
 Open conversations are never suggested, and `ccm` never brings this screen up by itself.
 
-- `d` or Del deletes everything on the selected line. To delete several lines at once, mark them with Space (`a` marks every line with something in it) and press `d`. One confirmation lists each line and every conversation, and a conversation found on two lines is deleted once. Each one is checked again just before it goes, as with any delete.
-- Enter or a double-click opens the list showing just that line's conversations, to look through them or delete only some. `c` clears it like any filter.
+- `d` or Del deletes everything on the selected line. To delete several lines at once, mark them with Space (`a` marks every line with something in it) and press `d`. One confirmation lists each line, every conversation and every worktree, and a conversation found on two lines is deleted once. Each one is checked again just before it goes, as with any delete. Worktrees are removed with `git worktree remove` and their branches are kept. One that has gained unpushed commits since is skipped, so remove it from the worktree view.
+- Enter or a double-click opens a line to look through it or delete only some. A conversation line opens the list showing just those conversations, and `c` clears it like any filter. The worktree line opens the worktree view showing just those worktrees, and `c` shows all of them again.
 
 Change what counts as large or old with `large_threshold_mb` and `old_after_days` in the [configuration](#configuration).
 
@@ -231,7 +232,7 @@ On macOS, set `terminal` to a terminal that can run a command, such as `["alacri
 
 `ccm` reads Claude Code's files in `~/.claude`, or in `CLAUDE_CONFIG_DIR` if that's set. It sends nothing over the network.
 
-While the [worktree view](#worktrees) is open, it runs Git in the repositories your conversations worked in. While [grouping by repository](#grouping), it asks Git which repository each folder belongs to. Only `git worktree remove` changes anything, and only after you confirm. It ignores `GIT_*` variables from its own environment, stops a repository's `core.fsmonitor` setting from running a program, takes no optional locks and never fetches.
+While the [worktree view](#worktrees) is open, it runs Git in the repositories your conversations worked in. While [grouping by repository](#grouping), it asks Git which repository each folder belongs to. The [clean-up screen](#cleaning-up) runs the same Git checks as the worktree view, and measures the size of the worktrees it suggests. Only `git worktree remove` changes anything, and only after you confirm. It ignores `GIT_*` variables from its own environment, stops a repository's `core.fsmonitor` setting from running a program, takes no optional locks and never fetches.
 
 It writes these files of its own:
 

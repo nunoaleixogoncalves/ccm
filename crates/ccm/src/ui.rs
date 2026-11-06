@@ -212,14 +212,24 @@ fn delete_dialog(app: &App) -> Dialog {
     let plain = Style::new();
     let bold = plain.add_modifier(Modifier::BOLD);
 
-    let freed = plan.bytes() + if confirm.include_notes { plan.note_bytes() } else { 0 };
+    let removing = confirm.worktrees.as_ref().map_or(&[][..], |r| r.items.as_slice());
+    // A worktree's whole folder goes, as far as it was measured.
+    let worktree_bytes: u64 = removing.iter().filter_map(|i| app.worktrees.sizes.get(&i.target.path)).sum();
+    let freed = plan.bytes() + if confirm.include_notes { plan.note_bytes() } else { 0 } + worktree_bytes;
     let count = plan.items.len();
-    let plural = if count == 1 { "" } else { "s" };
-    let mut top = vec![(format!("{count} conversation{plural}, {} freed. This can't be undone.", bytes(freed)), bold)];
+    let mut what = Vec::new();
+    if count > 0 || removing.is_empty() {
+        what.push(format!("{count} conversation{}", if count == 1 { "" } else { "s" }));
+    }
+    if !removing.is_empty() {
+        what.push(format!("{} worktree{}", removing.len(), if removing.len() == 1 { "" } else { "s" }));
+    }
+    let mut top = vec![(format!("{}, {} freed. This can't be undone.", what.join(" and "), bytes(freed)), bold)];
     if !confirm.from.is_empty() {
         top.push(("From the clean-up suggestions:".into(), plain));
         for (line, tally) in &confirm.from {
-            top.push((format!("  {}: {}, {}", cleanup::label(app, *line), tally.count, bytes(tally.bytes)), plain));
+            let size = tally.bytes.map_or("size unknown".into(), bytes);
+            top.push((format!("  {}: {}, {size}", cleanup::label(app, *line), tally.count), plain));
         }
         top.push((String::new(), plain));
     }
@@ -238,6 +248,30 @@ fn delete_dialog(app: &App) -> Dialog {
         body.push((String::new(), plain));
         body.push((format!("Memory notes nothing else wrote {what}:"), bold));
         body.extend(plan.notes.iter().map(|n| (format!("  {}", sanitize(&n.name())), plain)));
+    }
+    if let Some(remove) = &confirm.worktrees {
+        let warn = Style::new().fg(Color::Yellow);
+        if !body.is_empty() {
+            body.push((String::new(), plain));
+        }
+        if !remove.items.is_empty() {
+            body.push(("Worktrees to remove. Their branches stay, so commits are kept:".into(), bold));
+        }
+        if remove.items.iter().any(|i| !i.ignored.is_empty()) {
+            let at_least = if remove.items.iter().any(|i| i.ignored_more) { "at least " } else { "" };
+            let ignored: u64 = remove.items.iter().map(|i| i.ignored_bytes).sum();
+            body.push((format!("Files Git ignores go too, {at_least}{}.", bytes(ignored)), warn.add_modifier(Modifier::BOLD)));
+        }
+        for item in &remove.items {
+            body.extend(worktrees::item_lines(app, item, bold, warn, plain));
+        }
+        body.extend(remove.refused.iter().map(|r| {
+            let path = sanitize(&short_path(&r.path.to_string_lossy(), &app.home));
+            (format!("Skipping {path}: {}", sanitize(&r.reason)), plain)
+        }));
+        if body.last().is_some_and(|(l, _)| l.is_empty()) {
+            body.pop();
+        }
     }
     let notes = if plan.notes.is_empty() { "" } else { "m toggle notes   " };
     let bottom = format!("y or Del delete   {notes}any other key cancels   or click Delete again");
@@ -602,7 +636,11 @@ fn footer_groups(app: &App) -> [(&'static str, Vec<Button>); 2] {
             ("a", "All", Action::MarkAll, false),
             ("q", "Quit", Action::Quit, false),
         ];
-        let view = vec![("w", "Conversations", Action::Worktrees, false), ("Shift+C", "Clean up", Action::Cleanup, false)];
+        let mut view = vec![("w", "Conversations", Action::Worktrees, false)];
+        if app.worktrees.only_idle {
+            view.push(("c", "Show all", Action::ClearFilters, true));
+        }
+        view.push(("Shift+C", "Clean up", Action::Cleanup, false));
         return [("Actions", actions), ("View", view)];
     }
     if app.view == View::Cleanup {
