@@ -29,7 +29,7 @@ If you run a lot of Claude Code sessions, they pile up:
 - **Clean up:** one screen lists what could be cleaned up and how much space it would free, and deletes it after asking: conversations Claude never replied to, ones whose folder is gone, large ones you haven't used for a while, worktrees nothing needs, and leftover background job folders.
 - **Recover:** after a crash, see what was running and reopen it all at once.
 - **Worktrees:** see the Git worktrees of the repositories your conversations used, with their uncommitted changes, unpushed commits and the conversations that worked in each, and remove the ones you're done with.
-- **Codex:** Codex conversations show in the same list, and can be searched, previewed, resumed, forked and deleted. See [Codex](#codex).
+- **Codex:** Codex conversations show in the same list, and can be searched, previewed, resumed, forked, renamed and deleted. See [Codex](#codex).
 
 ## Install
 
@@ -225,7 +225,7 @@ Codex conversations can be resumed, forked and deleted, through Codex's own comm
 
 **Open and crashed** need no setup for Codex. A running Codex holds a lock on `thread-writer-locks/<id>.lock` in its folder and removes the file when it finishes, so a held lock shows the conversation as open, and a file nobody holds shows it as crashed. `ccm` checks this the way Codex itself does, under Codex's `.coordination.lock`, and never creates or removes these files. Codex clears files left by a crash the next time it starts.
 
-Rename is greyed out for Codex conversations and comes in a later version. Files Codex compressed (`.jsonl.zst`) aren't read yet.
+**Rename** works the way Codex's own `/rename` does: one more line in `session_index.jsonl`, written while holding Codex's `session_index.jsonl.lock`, and Codex shows the newest one. An open conversation is renamed from Codex itself. So is one using Codex's opt-in paginated history, which keeps names in Codex's database. Files Codex compressed (`.jsonl.zst`) aren't read yet.
 
 ## Configuration
 
@@ -259,7 +259,7 @@ On WSL, `ccm` opens a new Windows Terminal tab when `terminal` isn't set. It sta
 
 ## What it touches on your machine
 
-`ccm` reads Claude Code's files in `~/.claude`, or in `CLAUDE_CONFIG_DIR` if that's set, and Codex's conversation files in `~/.codex/sessions` and its `session_index.jsonl`, or in `CODEX_HOME`. It only changes Codex's data through `codex delete`, plus the prompt history edit described in [Codex](#codex), and never opens its databases. It sends nothing over the network.
+`ccm` reads Claude Code's files in `~/.claude`, or in `CLAUDE_CONFIG_DIR` if that's set, and Codex's conversation files in `~/.codex/sessions` and its `session_index.jsonl`, or in `CODEX_HOME`. It only changes Codex's data through `codex delete`, plus the prompt history edit and the name line described in [Codex](#codex), and never opens its databases. It sends nothing over the network.
 
 While the [worktree view](#worktrees) is open, it runs Git in the repositories your conversations worked in. While [grouping by repository](#grouping), it asks Git which repository each folder belongs to. The [clean-up screen](#cleaning-up) runs the same Git checks as the worktree view, and measures the size of the worktrees it suggests. Only `git worktree remove` changes anything, and only after you confirm. It ignores `GIT_*` variables from its own environment, stops a repository's `core.fsmonitor` setting from running a program, takes no optional locks and never fetches.
 

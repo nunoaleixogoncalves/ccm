@@ -154,7 +154,11 @@ fn browse(paths: Paths) -> Result<()> {
     let delete_codex_home = codex_home.clone();
     app.deleter = Some(Box::new(move |plan, notes| delete_conversations(&delete_paths, &delete_codex_home, plan, notes)));
     let rename_paths = paths.clone();
-    app.renamer = Some(Box::new(move |id, transcript, name| rename::rename(&rename_paths, Path::new(PROC), id, transcript, name)));
+    let rename_codex_home = codex_home.clone();
+    app.renamer = Some(Box::new(move |id, source, transcript, name| match source {
+        Source::ClaudeCode => rename::rename(&rename_paths, Path::new(PROC), id, transcript, name),
+        Source::Codex => codex::rename(&rename_codex_home, id, transcript, name),
+    }));
     app.copier = Some(Box::new(clipboard::copy));
     let dismiss_paths = paths.clone();
     app.dismisser = Some(Box::new(move |ids| recovery::dismiss(&dismiss_paths, ids, now_ms()).map_err(|e| e.to_string())));

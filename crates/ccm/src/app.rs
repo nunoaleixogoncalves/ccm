@@ -126,7 +126,7 @@ pub type PlanFn = Box<dyn FnMut(&[Session]) -> Plan>;
 /// Carries out a plan, including the memory notes when asked.
 pub type DeleteFn = Box<dyn FnMut(&Plan, bool) -> Result<Outcome, String>>;
 /// Takes the ID, transcript path and new name, and returns the name as saved.
-pub type RenameFn = Box<dyn FnMut(&str, &Path, &str) -> Result<String, String>>;
+pub type RenameFn = Box<dyn FnMut(&str, Source, &Path, &str) -> Result<String, String>>;
 /// Stops these conversations showing as crashed.
 pub type DismissFn = Box<dyn FnMut(&[String]) -> Result<(), String>>;
 /// Works out what removing these worktrees would do, without changing anything.
@@ -1181,8 +1181,9 @@ impl App {
 
     fn save_rename(&mut self) {
         let Some(Renaming { id, transcript, name }) = self.renaming.take() else { return };
+        let source = self.sessions.iter().find(|s| s.id == id).map_or(Source::ClaudeCode, |s| s.source);
         let Some(renamer) = self.renamer.as_mut() else { return };
-        match renamer(&id, Path::new(&transcript), &name) {
+        match renamer(&id, source, Path::new(&transcript), &name) {
             Ok(saved) => {
                 self.status = Some(format!("Renamed to {saved}."));
                 if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
