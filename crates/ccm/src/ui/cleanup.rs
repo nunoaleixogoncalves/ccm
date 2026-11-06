@@ -2,18 +2,19 @@
 //! removing them would free. Nothing is removed from here. A line opens its items where they
 //! can be marked and removed the usual way.
 
-use ccm_core::format::{bytes, sanitize};
+use ccm_core::format::{ago, bytes, sanitize};
 use ccm_core::query::Suggestion;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, TableState};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
-use super::{draw_dialog, draw_footer, footer_rows, COLUMN_SPACING};
+use super::{draw_dialog, draw_footer, fit_end, footer_rows, Dialog, COLUMN_SPACING, MIN_NAME_WIDTH};
 use crate::app::{App, Cleanup, Tally};
 
-pub(super) fn draw(f: &mut Frame, app: &mut App) {
+pub(super) fn draw(f: &mut Frame, app: &mut App, now_ms: i64) {
     let [summary, _, table, _, detail, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -27,7 +28,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
     app.hit.columns.clear();
     f.render_widget(Paragraph::new(summary_line(app)), summary);
     draw_table(f, app, table);
-    draw_detail(f, app, detail);
+    draw_detail(f, app, detail, now_ms);
     draw_footer(f, app, footer);
     draw_dialog(f, app);
 }
@@ -67,6 +68,7 @@ pub(crate) fn label(app: &App, line: Cleanup) -> String {
             app.config.old_after_days
         ),
         Cleanup::Worktrees => "Worktrees with no conversation and nothing to lose".into(),
+        Cleanup::Jobs => "Background job folders with no conversation".into(),
     }
 }
 
@@ -135,6 +137,20 @@ fn explanation(app: &App, line: Cleanup) -> Vec<String> {
                 what.into(),
             ];
         }
+        Cleanup::Jobs => {
+            let what = if app.leftovers.is_none() {
+                "Job folders can't be checked."
+            } else if is_empty {
+                empty
+            } else {
+                "d deletes the ones ccm can, and Space marks lines to delete several at once. Enter lists them, where c copies the claude rm commands."
+            };
+            return vec![
+                "Folders in ~/.claude/jobs whose conversation is gone, untouched for a day and not running.".into(),
+                "Ones that may have a worktree are only listed, with the claude rm command that removes them safely.".into(),
+                what.into(),
+            ];
+        }
     };
     let what = if is_empty {
         empty
@@ -144,13 +160,20 @@ fn explanation(app: &App, line: Cleanup) -> Vec<String> {
     vec![first, "Open ones aren't suggested.".into(), what.into()]
 }
 
-fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
+fn draw_detail(f: &mut Frame, app: &App, area: Rect, now_ms: i64) {
     let line = Cleanup::ALL[app.cleanup_row.min(Cleanup::ALL.len() - 1)];
     let block = Block::new().borders(Borders::TOP).title(" About this suggestion ");
     let inner = block.inner(area);
     f.render_widget(block, area);
     let width = inner.width.saturating_sub(1) as usize;
     let mut text: Vec<Line> = explanation(app, line).iter().flat_map(|l| super::wrap(l, width)).map(|l| Line::from(format!(" {l}"))).collect();
+    if line == Cleanup::Jobs
+        && let Some(found) = &app.leftovers
+        && !found.is_empty()
+    {
+        text.push(Line::from(""));
+        text.extend(found.iter().map(|l| Line::from(format!(" {}", job_line(l, width.saturating_sub(1), now_ms)))));
+    }
     text.push(Line::from(""));
     let safety = "Nothing is deleted without asking. Each one is checked again just before, and any that opened meanwhile are kept.";
     let grey = Style::new().fg(Color::DarkGray);
@@ -158,18 +181,58 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(text), inner);
 }
 
+/// One job folder: its ID, size and age, then what's known of it.
+pub(super) fn job_line(l: &ccm_core::jobs::Leftover, width: usize, now_ms: i64) -> String {
+    let what = match (&l.name, l.no_state) {
+        (_, true) => "no state file".to_string(),
+        (Some(name), _) => sanitize(name),
+        (None, _) => "unnamed".to_string(),
+    };
+    let note = if l.worktree { "  may have a worktree, kept" } else { "" };
+    let head = format!("{}  {:>7}  {:>4} ago  ", sanitize(&l.short()), bytes(l.bytes), ago(now_ms, l.last_ms));
+    let room = width.saturating_sub(head.width() + note.width()).max(MIN_NAME_WIDTH);
+    format!("{head}{}{note}", fit_end(&what, room))
+}
+
+pub(super) fn jobs_dialog(app: &App) -> Dialog {
+    let confirm = app.confirm_jobs.as_ref().expect("checked by the caller");
+    let plain = Style::new();
+    let bold = plain.add_modifier(Modifier::BOLD);
+    let removable: Vec<_> = confirm.removable().collect();
+    let freed: u64 = removable.iter().map(|l| l.bytes).sum();
+    let kept = confirm.items.len() - removable.len();
+    let mut top = vec![(
+        format!("{} job folder{}, {} freed. This can't be undone.", removable.len(), if removable.len() == 1 { "" } else { "s" }, bytes(freed)),
+        bold,
+    )];
+    if kept > 0 {
+        let what = if kept == 1 { "1 may have a worktree and is kept. Remove it" } else { "These may have a worktree and are kept. Remove them" };
+        let what = if kept == 1 { what.to_string() } else { what.replacen("These", &kept.to_string(), 1) };
+        top.push((format!("{what} with claude rm."), plain));
+    }
+    let width = app.dialog_width.saturating_sub(2) as usize;
+    let now_ms = (app.clock)();
+    let body = confirm.items.iter().map(|l| (job_line(l, width, now_ms), plain)).collect();
+    let copy = if kept > 0 { "c copy claude rm commands   " } else { "" };
+    let delete = if removable.is_empty() { "" } else { "y or Del delete   " };
+    Dialog { title: " Delete job folders? ", top, body, bottom: format!("{delete}{copy}any other key cancels") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::{Action, View};
     use ccm_core::config::Config;
+    use ccm_core::jobs::{self, Leftover};
     use ccm_core::model::{Session, Source};
     use ccm_core::worktree::{Scan, State, Worktree};
     use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::rc::Rc;
 
     const DAY: i64 = 24 * 60 * 60 * 1000;
     const NOW: i64 = 1000 * DAY;
@@ -207,7 +270,20 @@ mod tests {
         }
     }
 
-    fn app() -> App {
+    fn leftover(short: &str, worktree: bool) -> Leftover {
+        Leftover {
+            dir: PathBuf::from(format!("/c/jobs/{short}")),
+            name: Some(format!("job {short}")),
+            worktree,
+            no_state: false,
+            bytes: 2 * MB,
+            last_ms: Some(NOW - 90 * DAY),
+        }
+    }
+
+    type Removed = Rc<RefCell<Vec<Vec<PathBuf>>>>;
+
+    fn app() -> (App, Removed) {
         let mut a = App::new(Config::default(), "/c".into(), "/home/me".into());
         a.clock = Box::new(|| NOW);
         a.loading = false;
@@ -224,7 +300,17 @@ mod tests {
         let big_new = session("big-new", "/home/me/a", 2, 300);
         let used = session("used", "/home/me/shop-login", 1, 1);
         a.set_sessions(vec![junk, open_junk, gone, big_old, big_old_open, big_new, used]);
-        a
+        let found = Rc::new(RefCell::new(vec![leftover("aaaaaaaa", false), leftover("bbbbbbbb", true), leftover("cccccccc", false)]));
+        let source = found.clone();
+        a.leftovers_finder = Some(Box::new(move || source.borrow().clone()));
+        let removed: Removed = Rc::default();
+        let (log, left) = (removed.clone(), found);
+        a.job_remover = Some(Box::new(move |dirs| {
+            log.borrow_mut().push(dirs.to_vec());
+            left.borrow_mut().retain(|l| !dirs.contains(&l.dir));
+            jobs::Outcome { removed: dirs.to_vec(), bytes: dirs.len() as u64 * 2 * MB, kept: Vec::new() }
+        }));
+        (a, removed)
     }
 
     fn worktree(path: &str, changes: u64, unpushed: u64) -> Worktree {
@@ -284,7 +370,7 @@ mod tests {
 
     #[test]
     fn shift_c_opens_a_summary_of_every_suggestion_and_esc_goes_back() {
-        let mut a = app();
+        let (mut a, _) = app();
         a.on_key(KeyCode::Char('C'));
         assert_eq!(a.view, View::Cleanup);
         let screen = render(&mut a, 100, 30);
@@ -292,6 +378,7 @@ mod tests {
         assert!(line(&screen, "folder is gone").contains("3M"));
         assert!(line(&screen, "over 100M not used for 30 days").contains("300M"), "{screen}");
         assert!(line(&screen, "Worktrees with no conversation").contains('…'), "worktrees are still being checked");
+        assert!(line(&screen, "Background job folders").contains(" 3 ") && line(&screen, "Background job folders").contains("4M"), "the one with a worktree frees nothing here");
         assert!(screen.contains("checking…"));
         assert!(screen.contains("Nothing is deleted without asking."), "{screen}");
         a.on_key(KeyCode::Esc);
@@ -303,13 +390,14 @@ mod tests {
 
     #[test]
     fn an_empty_line_stays_with_zero() {
-        let mut a = app();
+        let (mut a, _) = app();
         a.set_sessions(Vec::new());
         a.on_key(KeyCode::Char('C'));
         let screen = render(&mut a, 100, 30);
         assert!(line(&screen, " ccm ").contains("checking…"), "not 'nothing' while worktrees are checked:\n{screen}");
         a.worktree_request();
         a.finish_worktree_scan(Scan { worktrees: Vec::new(), errors: Vec::new() });
+        a.leftovers = Some(Vec::new());
         let screen = render(&mut a, 100, 30);
         assert!(line(&screen, "folder is gone").contains(" 0 "), "{screen}");
         assert!(line(&screen, " ccm ").contains("nothing to clean up right now"), "{screen}");
@@ -318,7 +406,7 @@ mod tests {
 
     #[test]
     fn a_conversation_line_opens_the_list_showing_exactly_those() {
-        let mut a = app();
+        let (mut a, _) = app();
         a.on_key(KeyCode::Char('C'));
         a.on_key(KeyCode::Down);
         a.on_key(KeyCode::Down);
@@ -341,7 +429,7 @@ mod tests {
 
     #[test]
     fn the_worktree_line_counts_idle_worktrees_and_opens_only_them() {
-        let mut a = app();
+        let (mut a, _) = app();
         a.on_key(KeyCode::Char('C'));
         assert!(a.worktree_sizes_wanted(), "the first scan of a visit measures");
         scan(&mut a);
@@ -377,8 +465,65 @@ mod tests {
     }
 
     #[test]
+    fn the_job_line_lists_folders_and_y_deletes_only_those_without_a_worktree() {
+        let (mut a, removed) = app();
+        a.on_key(KeyCode::Char('C'));
+        a.cleanup_row = 4;
+        let screen = render(&mut a, 100, 30);
+        assert!(line(&screen, "bbbbbbbb").contains("may have a worktree"), "{screen}");
+        a.on_key(KeyCode::Enter);
+        let screen = render(&mut a, 100, 30);
+        assert!(screen.contains("2 job folders, 4M freed"), "{screen}");
+        assert!(screen.contains("1 may have a worktree and is kept. Remove it with claude rm."), "{screen}");
+        a.on_key(KeyCode::Char('y'));
+        assert_eq!(*removed.borrow(), [vec![PathBuf::from("/c/jobs/aaaaaaaa"), PathBuf::from("/c/jobs/cccccccc")]]);
+        assert_eq!(a.status.as_deref(), Some("Deleted 2 job folders, freed 4M."));
+        assert_eq!(a.tally(Cleanup::Jobs).unwrap().count, 1, "looked again after deleting");
+    }
+
+    #[test]
+    fn worktree_jobs_can_only_be_copied_as_claude_rm_commands() {
+        let (mut a, removed) = app();
+        let copied = Rc::new(RefCell::new(Vec::new()));
+        let log = copied.clone();
+        a.copier = Some(Box::new(move |t| {
+            log.borrow_mut().push(t.to_string());
+            Ok("Copied".into())
+        }));
+        a.on_key(KeyCode::Char('C'));
+        a.cleanup_row = 4;
+        a.on_key(KeyCode::Enter);
+        a.on_key(KeyCode::Char('c'));
+        assert_eq!(*copied.borrow(), ["claude rm bbbbbbbb"]);
+        assert!(removed.borrow().is_empty());
+
+        a.leftovers = Some(vec![leftover("bbbbbbbb", true)]);
+        a.on_key(KeyCode::Enter);
+        a.on_key(KeyCode::Char('y'));
+        assert!(removed.borrow().is_empty(), "nothing ccm would delete");
+        assert!(a.status.as_deref().unwrap().contains("claude rm"));
+    }
+
+    #[test]
+    fn other_keys_and_clicks_cancel_and_a_quick_second_del_waits() {
+        let (mut a, removed) = app();
+        a.on_key(KeyCode::Char('C'));
+        a.cleanup_row = 4;
+        a.on_key(KeyCode::Enter);
+        a.on_key(KeyCode::Char('x'));
+        assert!(a.confirm_jobs.is_none() && removed.borrow().is_empty());
+        a.on_key(KeyCode::Enter);
+        a.on_key(KeyCode::Delete);
+        assert!(a.confirm_jobs.is_some() && removed.borrow().is_empty());
+        render(&mut a, 100, 30);
+        a.on_mouse(MouseEventKind::Down(MouseButton::Left), 1, 1);
+        assert!(a.confirm_jobs.is_none() && removed.borrow().is_empty());
+        assert_eq!(a.status.as_deref(), Some("Cancelled. Nothing was deleted."));
+    }
+
+    #[test]
     fn a_double_click_on_a_line_opens_it() {
-        let mut a = app();
+        let (mut a, _) = app();
         a.on_key(KeyCode::Char('C'));
         render(&mut a, 100, 30);
         let y = a.hit.body.y + 1;
@@ -419,7 +564,7 @@ mod tests {
 
     #[test]
     fn d_deletes_everything_on_the_selected_line_after_asking() {
-        let mut a = app();
+        let (mut a, _) = app();
         let calls = deletable(&mut a);
         a.on_key(KeyCode::Char('C'));
         a.on_key(KeyCode::Down);
@@ -441,7 +586,7 @@ mod tests {
 
     #[test]
     fn marked_lines_go_in_one_delete_and_a_conversation_on_two_lines_goes_once() {
-        let mut a = app();
+        let (mut a, _) = app();
         let mut both = session("both", "/home/me/old", 3, 2);
         both.replies = 0;
         both.folder_exists = false;
@@ -468,10 +613,10 @@ mod tests {
 
     #[test]
     fn a_marks_every_line_with_something_in_it_and_again_clears_them() {
-        let mut a = app();
+        let (mut a, _) = app();
         a.on_key(KeyCode::Char('C'));
         a.on_key(KeyCode::Char('a'));
-        assert_eq!(a.cleanup_marked.len(), 3);
+        assert_eq!(a.cleanup_marked.len(), 4, "not the worktrees, still being checked");
         a.on_key(KeyCode::Char('a'));
         assert!(a.cleanup_marked.is_empty());
         a.on_key(KeyCode::Char('a'));
@@ -482,8 +627,9 @@ mod tests {
         a.on_key(KeyCode::Char('C'));
         assert!(a.cleanup_marked.is_empty(), "marks last one visit");
 
-        let mut a = app();
+        let (mut a, _) = app();
         a.set_sessions(vec![session("big-new", "/home/me/a", 2, 300)]);
+        a.leftovers_finder = Some(Box::new(Vec::new));
         a.on_key(KeyCode::Char('C'));
         a.on_key(KeyCode::Char('a'));
         assert!(a.cleanup_marked.is_empty(), "empty lines aren't marked");
@@ -491,7 +637,7 @@ mod tests {
 
     #[test]
     fn an_empty_line_has_nothing_to_delete_and_cancelling_deletes_nothing() {
-        let mut a = app();
+        let (mut a, _) = app();
         a.set_sessions(vec![session("big-new", "/home/me/a", 2, 300)]);
         let calls = deletable(&mut a);
         a.on_key(KeyCode::Char('C'));
@@ -499,7 +645,7 @@ mod tests {
         assert!(a.confirm_delete.is_none());
         assert_eq!(a.status.as_deref(), Some("Nothing to delete on this line."));
 
-        let mut a = app();
+        let (mut a, _) = app();
         let calls2 = deletable(&mut a);
         a.on_key(KeyCode::Char('C'));
         a.on_key(KeyCode::Char('d'));
@@ -547,10 +693,10 @@ mod tests {
 
     #[test]
     fn d_on_the_worktree_line_removes_the_idle_worktrees_after_asking() {
-        let mut a = app();
+        let (mut a, _) = app();
         let calls = removable(&mut a, "nothing");
         a.on_key(KeyCode::Char('C'));
-        a.on_key(KeyCode::End);
+        a.cleanup_row = 3;
         a.on_key(KeyCode::Char('d'));
         assert!(a.confirm_delete.is_none(), "not while it's still checking");
         assert_eq!(a.status.as_deref(), Some("Still checking. Try again in a moment."));
@@ -571,13 +717,13 @@ mod tests {
 
     #[test]
     fn conversations_and_worktrees_go_in_one_delete_and_one_that_gained_commits_is_skipped() {
-        let mut a = app();
+        let (mut a, _) = app();
         let deletes = deletable(&mut a);
         let removals = removable(&mut a, "shop-gone");
         a.on_key(KeyCode::Char('C'));
         scan(&mut a);
         a.on_key(KeyCode::Char(' '));
-        a.on_key(KeyCode::End);
+        a.cleanup_row = 3;
         a.on_key(KeyCode::Char(' '));
         a.on_key(KeyCode::Char('d'));
         let screen = render(&mut a, 120, 40);
@@ -594,7 +740,7 @@ mod tests {
 
     #[test]
     fn every_button_fits_and_small_terminals_do_not_panic() {
-        let mut a = app();
+        let (mut a, _) = app();
         a.on_key(KeyCode::Char('C'));
         let screen = render(&mut a, 80, 24);
         for label in ["Enter Open", "d Delete", "Space Mark", "a All", "q Quit", "Esc Conversations", "w Worktrees"] {
@@ -603,5 +749,54 @@ mod tests {
         for (w, h) in [(20, 5), (40, 10), (1, 1)] {
             render(&mut a, w, h);
         }
+        a.cleanup_row = 4;
+        a.on_key(KeyCode::Enter);
+        for (w, h) in [(20, 5), (40, 10), (80, 24)] {
+            render(&mut a, w, h);
+        }
+    }
+
+    #[test]
+    fn d_on_the_job_line_deletes_only_folders_without_a_worktree() {
+        let (mut a, removed) = app();
+        a.on_key(KeyCode::Char('C'));
+        a.on_key(KeyCode::End);
+        a.on_key(KeyCode::Char('d'));
+        let screen = render(&mut a, 120, 40);
+        assert!(line(&screen, "This can't be undone").contains("2 job folders, 4M freed"), "{screen}");
+        assert!(screen.contains("Ones that may have a worktree are kept, so remove them with claude rm"), "{screen}");
+        assert!(screen.contains("job bbbbbbbb  may have a worktree, kept"), "{screen}");
+        a.on_key(KeyCode::Char('y'));
+        a.perform_delete();
+        assert_eq!(*removed.borrow(), [vec![PathBuf::from("/c/jobs/aaaaaaaa"), PathBuf::from("/c/jobs/cccccccc")]]);
+        assert_eq!(a.status.as_deref(), Some("Deleted 2 job folders, freed 4M."));
+        assert_eq!(a.tally(Cleanup::Jobs).unwrap().count, 1, "looked again after deleting");
+
+        a.on_key(KeyCode::Char('d'));
+        assert!(a.confirm_delete.is_none(), "only the worktree job is left");
+        assert!(a.status.as_deref().unwrap().contains("Press Enter on the line, then c"), "{:?}", a.status);
+    }
+
+    #[test]
+    fn every_kind_goes_in_one_delete() {
+        let (mut a, removed) = app();
+        let deletes = deletable(&mut a);
+        let removals = removable(&mut a, "nothing");
+        a.on_key(KeyCode::Char('C'));
+        scan(&mut a);
+        a.on_key(KeyCode::Char('a'));
+        assert_eq!(a.cleanup_marked.len(), 5);
+        a.on_key(KeyCode::Char('d'));
+        let screen = render(&mut a, 120, 50);
+        assert!(line(&screen, "This can't be undone").contains("3 conversations, 2 worktrees and 2 job folders"), "{screen}");
+        a.on_key(KeyCode::Char('y'));
+        a.perform_delete();
+        assert_eq!(deletes.borrow().len(), 1);
+        assert_eq!(removals.borrow().len(), 1);
+        assert_eq!(removed.borrow().len(), 1);
+        assert_eq!(
+            a.status.as_deref(),
+            Some("Deleted 3 conversations, freed 304M. Removed 2 worktrees. Their branches are kept. Deleted 2 job folders, freed 4M.")
+        );
     }
 }

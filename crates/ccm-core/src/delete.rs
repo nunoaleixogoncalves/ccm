@@ -167,7 +167,7 @@ pub(crate) fn written_since(path: &Path, now: SystemTime, window: Duration) -> b
 }
 
 /// Real folders only: following a symlink could reach outside `~/.claude`.
-fn project_dirs(paths: &Paths) -> Vec<PathBuf> {
+pub(crate) fn project_dirs(paths: &Paths) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(paths.projects()) else { return Vec::new() };
     entries
         .flatten()
@@ -483,7 +483,7 @@ fn remove(paths: &Paths, path: &Path, failures: &mut Vec<Failure>) {
 }
 
 /// Refuses anything outside `root`. A symlink is removed itself, and never followed.
-fn remove_path(root: &Path, path: &Path) -> io::Result<()> {
+pub(crate) fn remove_path(root: &Path, path: &Path) -> io::Result<()> {
     if !is_inside(root, path) {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "outside the Claude Code folder"));
     }
