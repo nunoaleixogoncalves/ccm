@@ -26,7 +26,7 @@ If you run a lot of Claude Code sessions, they pile up:
 - **Delete:** permanently remove one or many conversations and their data, after a confirmation that lists what goes.
 - **Rename:** the new name also shows in Claude Code's own `/resume`.
 - **Group:** by the folder a conversation ran in, or by Git repository, so the work in a repository and all its worktrees shows together.
-- **Clean up:** one screen lists what could be cleaned up and how much space it would free, and deletes it after asking: conversations Claude never replied to, ones whose folder is gone, large ones you haven't used for a while, and worktrees nothing needs.
+- **Clean up:** one screen lists what could be cleaned up and how much space it would free, and deletes it after asking: conversations Claude never replied to, ones whose folder is gone, large ones you haven't used for a while, worktrees nothing needs, and leftover background job folders.
 - **Recover:** after a crash, see what was running and reopen it all at once.
 - **Worktrees:** see the Git worktrees of the repositories your conversations used, with their uncommitted changes, unpushed commits and the conversations that worked in each, and remove the ones you're done with.
 
@@ -151,11 +151,13 @@ Press `Shift+C` to see what could be cleaned up. Each line says how many items i
 - conversations whose folder is gone
 - conversations over the large size, 100 MB by default, that haven't been active for 30 days
 - worktrees no conversation worked in that have nothing to lose: no uncommitted changes, no unpushed commits and a branch, or a folder that's already gone. Locked ones, and ones a running session is in, aren't suggested
+- background job folders in `~/.claude/jobs` whose conversation is gone, that haven't changed for a day and aren't running
 
 Open conversations are never suggested, and `ccm` never brings this screen up by itself.
 
-- `d` or Del deletes everything on the selected line. To delete several lines at once, mark them with Space (`a` marks every line with something in it) and press `d`. One confirmation lists each line, every conversation and every worktree, and a conversation found on two lines is deleted once. Each one is checked again just before it goes, as with any delete. Worktrees are removed with `git worktree remove` and their branches are kept. One that has gained unpushed commits since is skipped, so remove it from the worktree view.
-- Enter or a double-click opens a line to look through it or delete only some. A conversation line opens the list showing just those conversations, and `c` clears it like any filter. The worktree line opens the worktree view showing just those worktrees, and `c` shows all of them again.
+- `d` or Del deletes everything on the selected line. To delete several lines at once, mark them with Space (`a` marks every line with something in it) and press `d`. One confirmation lists each line and everything that would go, and a conversation found on two lines is deleted once. Each one is checked again just before it goes, as with any delete. Worktrees are removed with `git worktree remove` and their branches are kept. One that has gained unpushed commits since is skipped, so remove it from the worktree view.
+- Enter or a double-click opens a line to look through it or delete only some. A conversation line opens the list showing just those conversations, and `c` clears it like any filter. The worktree line opens the worktree view showing just those worktrees, and `c` shows all of them again. The job line lists the folders.
+- A job that may have a worktree is never deleted by `ccm`, because `claude rm` is what removes its worktree safely. Open the job line with Enter and press `c` to copy the `claude rm` commands.
 
 Change what counts as large or old with `large_threshold_mb` and `old_after_days` in the [configuration](#configuration).
 

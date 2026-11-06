@@ -62,7 +62,7 @@ pub fn draw(f: &mut Frame, app: &mut App, now_ms: i64) {
         return worktrees::draw(f, app, now_ms);
     }
     if app.view == View::Cleanup {
-        return cleanup::draw(f, app);
+        return cleanup::draw(f, app, now_ms);
     }
     let bar = if app.typing || !app.query.is_empty() { 1 } else { 0 };
     let preview_height = if f.area().height >= MIN_HEIGHT_FOR_PREVIEW { Constraint::Fill(1) } else { Constraint::Length(0) };
@@ -111,6 +111,8 @@ fn draw_dialog(f: &mut Frame, app: &mut App) {
         delete_dialog(app)
     } else if app.confirm_remove.is_some() {
         worktrees::remove_dialog(app)
+    } else if app.confirm_jobs.is_some() {
+        cleanup::jobs_dialog(app)
     } else if app.reopen.is_some() {
         reopen_dialog(app)
     } else {
@@ -217,14 +219,23 @@ fn delete_dialog(app: &App) -> Dialog {
     let worktree_bytes: u64 = removing.iter().filter_map(|i| app.worktrees.sizes.get(&i.target.path)).sum();
     let freed = plan.bytes() + if confirm.include_notes { plan.note_bytes() } else { 0 } + worktree_bytes;
     let count = plan.items.len();
+    let jobs: Vec<_> = confirm.jobs.iter().filter(|j| !j.worktree).collect();
     let mut what = Vec::new();
-    if count > 0 || removing.is_empty() {
+    if count > 0 || (removing.is_empty() && jobs.is_empty()) {
         what.push(format!("{count} conversation{}", if count == 1 { "" } else { "s" }));
     }
     if !removing.is_empty() {
         what.push(format!("{} worktree{}", removing.len(), if removing.len() == 1 { "" } else { "s" }));
     }
-    let mut top = vec![(format!("{}, {} freed. This can't be undone.", what.join(" and "), bytes(freed)), bold)];
+    if !jobs.is_empty() {
+        what.push(format!("{} job folder{}", jobs.len(), if jobs.len() == 1 { "" } else { "s" }));
+    }
+    let freed = freed + jobs.iter().map(|j| j.bytes).sum::<u64>();
+    let what = match what.as_slice() {
+        [.., last] if what.len() > 1 => format!("{} and {last}", what[..what.len() - 1].join(", ")),
+        _ => what.join(""),
+    };
+    let mut top = vec![(format!("{what}, {} freed. This can't be undone.", bytes(freed)), bold)];
     if !confirm.from.is_empty() {
         top.push(("From the clean-up suggestions:".into(), plain));
         for (line, tally) in &confirm.from {
@@ -272,6 +283,21 @@ fn delete_dialog(app: &App) -> Dialog {
         if body.last().is_some_and(|(l, _)| l.is_empty()) {
             body.pop();
         }
+    }
+    if !confirm.jobs.is_empty() {
+        if !body.is_empty() {
+            body.push((String::new(), plain));
+        }
+        let kept = confirm.jobs.len() - jobs.len();
+        let title = if kept == 0 {
+            "Job folders to delete:".to_string()
+        } else {
+            "Job folders. Ones that may have a worktree are kept, so remove them with claude rm:".to_string()
+        };
+        body.push((title, bold));
+        let width = app.dialog_width.saturating_sub(2) as usize;
+        let now_ms = (app.clock)();
+        body.extend(confirm.jobs.iter().map(|l| (cleanup::job_line(l, width, now_ms), plain)));
     }
     let notes = if plan.notes.is_empty() { "" } else { "m toggle notes   " };
     let bottom = format!("y or Del delete   {notes}any other key cancels   or click Delete again");
@@ -588,6 +614,10 @@ fn message_lines(p: &Preview, width: usize) -> Vec<Line<'static>> {
 /// line are split.
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
+    if text.is_empty() {
+        // A blank line asked for on purpose, which `lines` would drop.
+        return vec![String::new()];
+    }
     let mut out = Vec::new();
     for line in text.lines() {
         let mut current = String::new();

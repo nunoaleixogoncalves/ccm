@@ -9,6 +9,7 @@ use ccm_core::model::Session;
 use ccm_core::preview::{self, Preview};
 use ccm_core::rename::MAX_NAME;
 use ccm_core::resume::{decide, decide_fork, is_safe_folder, manual_command, Decision, Fork};
+use ccm_core::jobs::{self, Leftover};
 use ccm_core::query::{group_by_folder, group_by_repo, select, status_rank, Filters, GroupRow, SortKey, Suggestion};
 use ccm_core::repo::Place;
 use ccm_core::window::{context_label, window_size};
@@ -56,14 +57,16 @@ pub enum Action {
 pub enum Cleanup {
     Conversations(Suggestion),
     Worktrees,
+    Jobs,
 }
 
 impl Cleanup {
-    pub const ALL: [Cleanup; 4] = [
+    pub const ALL: [Cleanup; 5] = [
         Cleanup::Conversations(Suggestion::NoReply),
         Cleanup::Conversations(Suggestion::FolderGone),
         Cleanup::Conversations(Suggestion::LargeOld),
         Cleanup::Worktrees,
+        Cleanup::Jobs,
     ];
 }
 
@@ -129,6 +132,10 @@ pub type RemovePlanFn = Box<dyn FnMut(&[Target], &[Session]) -> removal::Plan>;
 pub type RemoveFn = Box<dyn FnMut(&removal::Plan, &[Session]) -> removal::Outcome>;
 /// Copies text and returns what to tell the user.
 pub type CopyFn = Box<dyn FnMut(&str) -> Result<String, String>>;
+/// Finds background job folders left without a conversation.
+pub type LeftoversFn = Box<dyn FnMut() -> Vec<Leftover>>;
+/// Removes these job folders, checking each again first.
+pub type RemoveJobsFn = Box<dyn FnMut(&[PathBuf]) -> jobs::Outcome>;
 /// The time now, in milliseconds. Tests set their own.
 pub type ClockFn = Box<dyn Fn() -> i64>;
 
@@ -148,6 +155,8 @@ pub const UNPUSHED_COUNTDOWN: Duration = Duration::from_secs(5);
 const DELETE_REPORT: &str = " Delete finished ";
 const REOPEN_REPORT: &str = " Reopen finished ";
 const REMOVE_REPORT: &str = " Remove finished ";
+const JOBS_REPORT: &str = " Job folders ";
+const KEPT_JOBS: &str = "These job folders may have worktrees, so ccm leaves them. Press Enter on the line, then c, to copy the claude rm commands.";
 
 pub type SearchFn = Box<dyn FnMut(&str) -> Result<Option<HashSet<String>>, String>>;
 
@@ -177,6 +186,8 @@ pub struct ConfirmDelete {
     pub from: Vec<(Cleanup, Tally)>,
     /// Worktrees removed along with the conversations, from the clean-up screen.
     pub worktrees: Option<removal::Plan>,
+    /// Job folders from the clean-up screen. Ones that may have a worktree are only listed.
+    pub jobs: Vec<Leftover>,
 }
 
 /// A worktree removal waiting for an answer. Nothing has changed yet.
@@ -203,6 +214,19 @@ impl ConfirmRemove {
             self.unlocks = Some(Instant::now() + UNPUSHED_COUNTDOWN);
             self.restarted = true;
         }
+    }
+}
+
+/// Leftover job folders waiting for an answer. Nothing has changed yet.
+pub struct ConfirmJobs {
+    pub items: Vec<Leftover>,
+    opened: Instant,
+}
+
+impl ConfirmJobs {
+    /// The ones `ccm` removes. The rest may have a worktree.
+    pub fn removable(&self) -> impl Iterator<Item = &Leftover> {
+        self.items.iter().filter(|l| !l.worktree)
     }
 }
 
@@ -296,6 +320,11 @@ pub struct App {
     pub cleanup_row: usize,
     /// Clean-up lines picked for a delete, which otherwise acts on the selected line.
     pub cleanup_marked: HashSet<Cleanup>,
+    /// Job folders left without a conversation. `None` until looked for.
+    pub leftovers: Option<Vec<Leftover>>,
+    pub leftovers_finder: Option<LeftoversFn>,
+    pub job_remover: Option<RemoveJobsFn>,
+    pub confirm_jobs: Option<ConfirmJobs>,
     pub clock: ClockFn,
 }
 
@@ -355,6 +384,10 @@ impl App {
             pending_remove: None,
             cleanup_row: 0,
             cleanup_marked: HashSet::new(),
+            leftovers: None,
+            leftovers_finder: None,
+            job_remover: None,
+            confirm_jobs: None,
             clock: Box::new(|| chrono::Utc::now().timestamp_millis()),
         }
     }
@@ -455,6 +488,13 @@ impl App {
         self.view = View::Cleanup;
         self.worktrees.refresh_soon();
         self.worktrees.measure_due = true;
+        self.find_leftovers();
+    }
+
+    fn find_leftovers(&mut self) {
+        if let Some(finder) = self.leftovers_finder.as_mut() {
+            self.leftovers = Some(finder());
+        }
     }
 
     /// What a clean-up line holds. `None` while it's still being checked.
@@ -469,6 +509,11 @@ impl App {
                 let idle = self.worktrees.idle();
                 let bytes = idle.iter().map(|w| if w.prunable { Some(0) } else { self.worktrees.sizes.get(&w.path).copied() }).sum();
                 Some(Tally { count: idle.len(), bytes })
+            }
+            Cleanup::Jobs => {
+                let found = self.leftovers.as_ref()?;
+                // Ones that may have a worktree stay, so they free nothing here.
+                Some(Tally { count: found.len(), bytes: Some(found.iter().filter(|l| !l.worktree).map(|l| l.bytes).sum()) })
             }
         }
     }
@@ -494,6 +539,14 @@ impl App {
                 self.worktrees.show_idle(true, &self.sessions);
                 self.worktrees.select_first();
             }
+            Cleanup::Jobs => match self.leftovers.clone() {
+                Some(items) if !items.is_empty() => {
+                    self.dialog_scroll = 0;
+                    self.confirm_jobs = Some(ConfirmJobs { items, opened: Instant::now() });
+                }
+                Some(_) => self.status = Some("No job folders to clean up.".into()),
+                None => self.status = Some("Job folders can't be checked.".into()),
+            },
         }
     }
 
@@ -501,7 +554,7 @@ impl App {
     fn cleanup_conversations(&self, line: Cleanup) -> Vec<usize> {
         match line {
             Cleanup::Conversations(suggestion) => suggestion.select(&self.sessions, self.config.limits((self.clock)())),
-            Cleanup::Worktrees => Vec::new(),
+            Cleanup::Worktrees | Cleanup::Jobs => Vec::new(),
         }
     }
 
@@ -545,7 +598,13 @@ impl App {
         } else {
             Vec::new()
         };
-        if picked.is_empty() && worktrees.is_empty() {
+        let jobs: Vec<Leftover> =
+            if lines.contains(&Cleanup::Jobs) { self.leftovers.clone().unwrap_or_default() } else { Vec::new() };
+        if picked.is_empty() && worktrees.is_empty() && jobs.iter().all(|j| j.worktree) {
+            if !jobs.is_empty() {
+                self.status = Some(KEPT_JOBS.into());
+                return;
+            }
             let checking = lines.iter().any(|&l| self.tally(l).is_none());
             self.status = Some(if checking { "Still checking. Try again in a moment." } else { "Nothing to delete on this line." }.into());
             return;
@@ -567,7 +626,7 @@ impl App {
             }));
             Some(remove)
         };
-        if plan.items.is_empty() && remove.as_ref().is_none_or(|r| r.items.is_empty()) {
+        if plan.items.is_empty() && remove.as_ref().is_none_or(|r| r.items.is_empty()) && jobs.iter().all(|j| j.worktree) {
             let reason = plan
                 .skipped
                 .first()
@@ -577,7 +636,7 @@ impl App {
             return;
         }
         self.dialog_scroll = 0;
-        self.confirm_delete = Some(ConfirmDelete { plan, include_notes: false, opened: Instant::now(), from, worktrees: remove });
+        self.confirm_delete = Some(ConfirmDelete { plan, include_notes: false, opened: Instant::now(), from, worktrees: remove, jobs });
     }
 
     fn on_cleanup_key(&mut self, key: KeyCode) {
@@ -599,6 +658,55 @@ impl App {
         }
     }
 
+    fn answer_jobs(&mut self, key: KeyCode) {
+        if self.scroll_dialog(key) {
+            return;
+        }
+        let Some(confirm) = self.confirm_jobs.as_mut() else { return };
+        match key {
+            KeyCode::Char('y') => self.remove_jobs(),
+            KeyCode::Delete if confirm.opened.elapsed() < DEL_PAUSE => {
+                confirm.opened = Instant::now();
+                self.status = Some("Too quick. Wait a moment, then press Del again.".into());
+            }
+            KeyCode::Delete => self.remove_jobs(),
+            KeyCode::Char('c') => {
+                let command = rm_commands(confirm);
+                self.confirm_jobs = None;
+                match command {
+                    Some(command) => self.copy(command),
+                    None => self.status = Some("No job here needs claude rm.".into()),
+                }
+            }
+            _ => {
+                self.confirm_jobs = None;
+                self.status = Some("Cancelled. Nothing was deleted.".into());
+            }
+        }
+    }
+
+    fn remove_jobs(&mut self) {
+        let Some(confirm) = self.confirm_jobs.take() else { return };
+        let dirs: Vec<PathBuf> = confirm.removable().map(|l| l.dir.clone()).collect();
+        if dirs.is_empty() {
+            self.status = Some("These may have worktrees, so ccm leaves them. Press c in the list to copy the claude rm commands.".into());
+            return;
+        }
+        let (summary, lines) = self.run_job_removal(&dirs);
+        self.tell(JOBS_REPORT, summary, lines);
+    }
+
+    /// Deletes job folders, checking each again first, and says what happened.
+    fn run_job_removal(&mut self, dirs: &[PathBuf]) -> (String, Vec<String>) {
+        let Some(remover) = self.job_remover.as_mut() else { return (String::new(), Vec::new()) };
+        let outcome = remover(dirs);
+        let count = outcome.removed.len();
+        let summary = format!("Deleted {count} job folder{}, freed {}.", if count == 1 { "" } else { "s" }, bytes(outcome.bytes));
+        let lines: Vec<String> =
+            outcome.kept.iter().map(|(p, why)| format!("Kept {}: {}", sanitize(&p.display().to_string()), sanitize(why))).collect();
+        self.find_leftovers();
+        (summary, lines)
+    }
 
     fn on_worktree_key(&mut self, key: KeyCode) {
         if key == KeyCode::Char('C') {
@@ -852,7 +960,7 @@ impl App {
             return;
         }
         self.dialog_scroll = 0;
-        self.confirm_delete = Some(ConfirmDelete { plan, include_notes: false, opened: Instant::now(), from: Vec::new(), worktrees: None });
+        self.confirm_delete = Some(ConfirmDelete { plan, include_notes: false, opened: Instant::now(), from: Vec::new(), worktrees: None, jobs: Vec::new() });
     }
 
     /// What deleting these would do, leaving out any just resumed.
@@ -926,7 +1034,7 @@ impl App {
         if self.pending_remove.is_some() {
             return self.perform_remove();
         }
-        let Some(ConfirmDelete { plan, include_notes, worktrees, .. }) = self.pending_delete.take() else { return };
+        let Some(ConfirmDelete { plan, include_notes, worktrees, jobs, .. }) = self.pending_delete.take() else { return };
         self.status = None;
         let mut summaries = Vec::new();
         let mut lines = Vec::new();
@@ -948,6 +1056,12 @@ impl App {
             if !remove.items.is_empty() {
                 summaries.push(summary);
             }
+            lines.extend(more);
+        }
+        let dirs: Vec<PathBuf> = jobs.iter().filter(|j| !j.worktree).map(|j| j.dir.clone()).collect();
+        if !dirs.is_empty() {
+            let (summary, more) = self.run_job_removal(&dirs);
+            summaries.push(summary);
             lines.extend(more);
         }
         self.cleanup_marked.clear();
@@ -1424,6 +1538,9 @@ impl App {
         if self.confirm_remove.is_some() {
             return self.answer_remove(key);
         }
+        if self.confirm_jobs.is_some() {
+            return self.answer_jobs(key);
+        }
         if self.reopen.is_some() {
             return self.on_reopen_key(key);
         }
@@ -1484,6 +1601,7 @@ impl App {
     pub fn on_mouse(&mut self, kind: MouseEventKind, x: u16, y: u16) {
         let waiting = self.confirm_delete.is_some()
             || self.confirm_remove.is_some()
+            || self.confirm_jobs.is_some()
             || self.renaming.is_some()
             || self.report.is_some()
             || self.reopen.is_some();
@@ -1567,6 +1685,10 @@ impl App {
             if on_remove { self.confirm_removal() } else { self.cancel_removal() }
             return;
         }
+        if self.confirm_jobs.take().is_some() {
+            self.status = Some("Cancelled. Nothing was deleted.".into());
+            return;
+        }
         if self.renaming.take().is_some() || self.reopen.take().is_some() {
             self.status = Some("Cancelled.".into());
             return;
@@ -1608,6 +1730,15 @@ impl App {
             }
         }
     }
+}
+
+/// One `claude rm` per job that may have a worktree, ready to paste. A name that isn't plainly
+/// safe in a shell is left out.
+fn rm_commands(confirm: &ConfirmJobs) -> Option<String> {
+    let safe = |n: &str| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let commands: Vec<String> =
+        confirm.items.iter().filter(|l| l.worktree).map(Leftover::short).filter(|n| safe(n)).map(|n| format!("claude rm {n}")).collect();
+    (!commands.is_empty()).then(|| commands.join("; "))
 }
 
 /// Keeps a fork's cooldown apart from a resume's, so one doesn't block the other.

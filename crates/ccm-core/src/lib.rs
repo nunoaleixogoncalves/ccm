@@ -6,6 +6,7 @@ pub mod delete;
 pub mod forks;
 pub mod format;
 pub mod index;
+pub mod jobs;
 pub mod model;
 pub mod paths;
 pub mod preview;

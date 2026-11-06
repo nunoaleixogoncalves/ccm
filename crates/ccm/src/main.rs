@@ -8,13 +8,14 @@ use std::io::{stdin, stdout, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use ccm_core::catalog::Catalog;
 use ccm_core::config::Config;
 use ccm_core::delete::{self, Failure, Outcome, Plan};
 use ccm_core::index::{Index, Searcher};
+use ccm_core::jobs;
 use ccm_core::model::Session;
 use ccm_core::paths::Paths;
 use ccm_core::recovery;
@@ -146,6 +147,10 @@ fn browse(paths: Paths) -> Result<()> {
     app.remove_planner = Some(Box::new(move |targets, sessions| removal::plan(&remove_plan_paths, Path::new(PROC), targets, sessions)));
     let remove_paths = paths.clone();
     app.remover = Some(Box::new(move |plan, sessions| removal::execute(&remove_paths, Path::new(PROC), plan, sessions)));
+    let jobs_paths = paths.clone();
+    app.leftovers_finder = Some(Box::new(move || jobs::leftovers(&jobs_paths, Path::new(PROC), SystemTime::now())));
+    let remove_jobs_paths = paths.clone();
+    app.job_remover = Some(Box::new(move |dirs| jobs::remove(&remove_jobs_paths, Path::new(PROC), dirs, SystemTime::now())));
     app.set_sessions(cached);
 
     let updates = spawn_refresher(catalog);
