@@ -1,6 +1,6 @@
 [package]
 name = "ccm"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 description = "A terminal app for finding, resuming and cleaning up your Claude Code conversations"
 repository = "https://github.com/nunoaleixogoncalves/ccm"
@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.104"
-ccm-core = { version = "1.1.0", path = "../ccm-core" }
+ccm-core = { version = "1.1.1", path = "../ccm-core" }
 chrono = "0.4.45"
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
