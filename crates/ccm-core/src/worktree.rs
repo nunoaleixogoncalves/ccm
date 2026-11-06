@@ -544,6 +544,7 @@ mod tests {
             started_at_ms: None,
             last_active_ms: None,
             context_used: None,
+            context_window: None,
             prompts: 0,
             replies: 0,
             cost_usd: None,

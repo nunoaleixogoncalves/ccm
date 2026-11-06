@@ -15,6 +15,9 @@ pub struct Catalog {
     tools: Vec<Box<dyn Tool>>,
     index: Index,
     known: HashMap<String, Session>,
+    /// Files a tool read and left out, such as Codex's non-interactive runs, with the fingerprint
+    /// they had, so they aren't parsed again on every scan.
+    skipped: HashMap<PathBuf, (u64, i64)>,
 }
 
 impl Catalog {
@@ -30,7 +33,7 @@ impl Catalog {
     pub fn with_tools(index: &Path, tools: Vec<Box<dyn Tool>>) -> rusqlite::Result<Self> {
         let index = Index::open(index)?;
         let known = index.load()?.into_iter().map(|s| (s.id.clone(), s)).collect();
-        Ok(Self { tools, index, known })
+        Ok(Self { tools, index, known, skipped: HashMap::new() })
     }
 
     /// What the index held at the last scan, for an instant first screen.
@@ -51,6 +54,7 @@ impl Catalog {
 
         let changed: Vec<&(&dyn Tool, Found)> = found
             .iter()
+            .filter(|(_, f)| self.skipped.get(&f.path) != Some(&(f.size, f.mtime_ns)))
             .filter(|(t, f)| {
                 self.known.get(&f.id).is_none_or(|s| {
                     s.source != t.source()
@@ -60,11 +64,22 @@ impl Catalog {
                 })
             })
             .collect();
-        let mut upsert: Vec<(Session, Option<SearchDoc>)> = changed
-            .par_iter()
-            .filter_map(|(t, f)| t.read(f))
-            .map(|(s, doc)| (s, Some(doc)))
-            .collect();
+        let read: Vec<(&Found, Option<(Session, SearchDoc)>)> = changed.par_iter().map(|(t, f)| (f, t.read(f))).collect();
+        let mut upsert: Vec<(Session, Option<SearchDoc>)> = Vec::new();
+        let mut left_out: Vec<String> = Vec::new();
+        for (f, r) in read {
+            match r {
+                Some((s, doc)) => upsert.push((s, Some(doc))),
+                None => {
+                    self.skipped.insert(f.path.clone(), (f.size, f.mtime_ns));
+                    left_out.push(f.id.clone());
+                }
+            }
+        }
+        // A conversation that changed into one its tool leaves out goes from the list too.
+        let remove: Vec<String> = remove.into_iter().chain(left_out.into_iter().filter(|id| self.known.contains_key(id))).collect();
+        let found_paths: HashSet<&Path> = found.iter().map(|(_, f)| f.path.as_path()).collect();
+        self.skipped.retain(|p, _| found_paths.contains(p.as_path()));
 
         if resize_all {
             let changed_ids: HashSet<&str> = changed.iter().map(|(_, f)| f.id.as_str()).collect();
@@ -399,5 +414,56 @@ mod tests {
         let ids: Vec<String> = alone.refresh(false).unwrap().into_iter().map(|s| s.id).collect();
         assert_eq!(ids, [A]);
         assert!(Searcher::open(&t.paths.index).unwrap().search("hi").unwrap().unwrap().len() == 1);
+    }
+
+    struct Counting {
+        inner: crate::tools::codex::Codex,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Tool for Counting {
+        fn source(&self) -> crate::model::Source {
+            self.inner.source()
+        }
+        fn find(&self) -> Vec<Found> {
+            self.inner.find()
+        }
+        fn read(&self, found: &Found) -> Option<(Session, SearchDoc)> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read(found)
+        }
+        fn measure(&self, found: &Found) -> u64 {
+            self.inner.measure(found)
+        }
+        fn live(&self) -> Live {
+            self.inner.live()
+        }
+    }
+
+    #[test]
+    fn a_file_its_tool_leaves_out_is_not_read_again_until_it_changes() {
+        let t = tree();
+        let home = t.dir.path().join("codex");
+        let day = home.join("sessions/2026/11/05");
+        fs::create_dir_all(&day).unwrap();
+        let meta = |id: &str, source: &str| {
+            format!("{{\"timestamp\":\"2026-11-05T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"/w\",\"source\":\"{source}\"}}}}\n")
+        };
+        let exec = day.join(format!("rollout-2026-11-05T10-00-00-{B}.jsonl"));
+        fs::write(day.join(format!("rollout-2026-11-05T10-00-00-{A}.jsonl")), meta(A, "cli")).unwrap();
+        fs::write(&exec, meta(B, "exec")).unwrap();
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = Counting { inner: crate::tools::codex::Codex::new(home), reads: reads.clone() };
+        let mut c = Catalog::with_tools(&t.paths.index, vec![Box::new(tool)]).unwrap();
+
+        let ids: Vec<String> = c.refresh(false).unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, [A]);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+        c.refresh(true).unwrap();
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2, "nothing changed, so nothing is read");
+
+        fs::write(&exec, meta(B, "exec") + "{}\n").unwrap();
+        c.refresh(false).unwrap();
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 }

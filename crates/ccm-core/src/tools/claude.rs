@@ -71,6 +71,7 @@ fn find_transcripts(projects: &Path) -> Vec<Found> {
                 path,
                 size: meta.len(),
                 mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                name: None,
             };
             match by_id.get(&id) {
                 Some(existing) if existing.mtime_ns >= found.mtime_ns => {}
@@ -108,6 +109,7 @@ fn read_session(f: &Found) -> Option<(Session, SearchDoc)> {
         started_at_ms: p.started_at_ms,
         last_active_ms: p.last_active_ms.or(Some(f.mtime_ns / 1_000_000)),
         context_used: p.context_used,
+        context_window: None,
         prompts: p.prompts,
         replies: p.replies,
         cost_usd: p.cost_usd,

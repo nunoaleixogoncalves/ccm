@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 use ccm_core::config::Config;
 use ccm_core::delete::{Outcome, Plan, Skipped};
 use ccm_core::format::bytes;
-use ccm_core::model::Session;
+use ccm_core::model::{Session, Source};
 use ccm_core::preview::Preview;
-use ccm_core::tools;
+use ccm_core::tools::{self, Features};
 use ccm_core::rename::MAX_NAME;
 use ccm_core::resume::{decide, decide_fork, is_safe_folder, manual_command, Decision, Fork};
 use ccm_core::jobs::{self, Leftover};
@@ -30,6 +30,8 @@ pub enum Action {
     ToggleJunk,
     ToggleMissing,
     ToggleLarge,
+    /// Steps through all tools, then each one.
+    ToggleTool,
     ClearFilters,
     ToggleGroup,
     NextSort,
@@ -252,8 +254,11 @@ pub struct Renaming {
 
 pub struct App {
     pub config: Config,
+    /// Where conversations were looked for, for the empty list.
     pub claude_dir: String,
     pub home: String,
+    /// The tools being read. The Tool column and filter only show when there's more than one.
+    pub tools: Vec<Source>,
     pub sessions: Vec<Session>,
     pub rows: Vec<GroupRow>,
     pub filters: Filters,
@@ -335,6 +340,7 @@ impl App {
             config,
             claude_dir,
             home,
+            tools: vec![Source::ClaudeCode],
             sessions: Vec::new(),
             rows: Vec::new(),
             filters: Filters::default(),
@@ -554,7 +560,12 @@ impl App {
     /// The conversations on a clean-up line, as indexes. Other lines have none.
     fn cleanup_conversations(&self, line: Cleanup) -> Vec<usize> {
         match line {
-            Cleanup::Conversations(suggestion) => suggestion.select(&self.sessions, self.config.limits((self.clock)())),
+            // Only what can be deleted from here is suggested.
+            Cleanup::Conversations(suggestion) => suggestion
+                .select(&self.sessions, self.config.limits((self.clock)()))
+                .into_iter()
+                .filter(|i| self.sessions[*i].source.features().delete)
+                .collect(),
             Cleanup::Worktrees | Cleanup::Jobs => Vec::new(),
         }
     }
@@ -738,7 +749,9 @@ impl App {
     /// Whether the delete or remove button can do anything in the current view.
     pub fn can_press_delete(&self) -> bool {
         match self.view {
-            View::Conversations => self.can_change() || !self.marked_shown().is_empty(),
+            View::Conversations => {
+                (self.can_change() && self.selected().is_some_and(|s| s.source.features().delete)) || !self.marked_shown().is_empty()
+            }
             View::Worktrees if self.confirm_remove.as_ref().is_some_and(|c| c.seconds_left().is_some()) => false,
             View::Worktrees => self.worktrees.selected().is_some() || !self.worktrees.marked_shown().is_empty(),
             View::Cleanup => self.cleanup_targets().into_iter().any(|l| self.tally(l).is_some_and(|t| t.count > 0)),
@@ -885,7 +898,29 @@ impl App {
 
     /// False for an open conversation or one just started, which a resume must not touch.
     pub fn can_resume(&self) -> bool {
-        self.selected().is_some_and(|s| !s.open && !self.recently_resumed(&s.id))
+        self.selected().is_some_and(|s| s.source.features().resume && !s.open && !self.recently_resumed(&s.id))
+    }
+
+    pub fn can_fork(&self) -> bool {
+        self.selected().is_some_and(|s| s.source.features().fork)
+    }
+
+    pub fn can_rename(&self) -> bool {
+        self.can_change() && self.selected().is_some_and(|s| s.source.features().rename)
+    }
+
+    pub fn many_tools(&self) -> bool {
+        self.tools.len() > 1
+    }
+
+    /// Says so when the selected conversation's tool can't do something yet. True if it said so.
+    fn unsupported(&mut self, what: &str, supported: fn(Features) -> bool) -> bool {
+        let Some(s) = self.selected() else { return false };
+        if supported(s.source.features()) {
+            return false;
+        }
+        self.status = Some(format!("ccm can't {what} {} conversations yet.", s.source.label()));
+        true
     }
 
     /// The original of a fork `ccm` started, and whether it still exists.
@@ -908,7 +943,7 @@ impl App {
     }
 
     /// Conversations on screen, in order.
-    fn shown(&self) -> impl Iterator<Item = &Session> {
+    pub(crate) fn shown(&self) -> impl Iterator<Item = &Session> {
         self.rows.iter().filter_map(|r| match r {
             GroupRow::Item(i) => self.sessions.get(*i),
             GroupRow::Header { .. } => None,
@@ -966,6 +1001,11 @@ impl App {
 
     /// What deleting these would do, leaving out any just resumed.
     fn plan_delete(&mut self, targets: Vec<&Session>) -> Plan {
+        let (targets, unsupported): (Vec<&Session>, Vec<&Session>) = targets.into_iter().partition(|s| s.source.features().delete);
+        let unsupported: Vec<Skipped> = unsupported
+            .into_iter()
+            .map(|s| Skipped { id: s.id.clone(), reason: format!("ccm can't delete {} conversations yet", s.source.label()) })
+            .collect();
         let (starting, ids): (Vec<&Session>, Vec<&Session>) = targets.into_iter().partition(|s| self.recently_resumed(&s.id));
         let starting: Vec<Skipped> = starting
             .into_iter()
@@ -973,8 +1013,9 @@ impl App {
             .collect();
         let ids: Vec<String> = ids.into_iter().map(|s| s.id.clone()).collect();
         let Some(planner) = self.planner.as_mut() else { return Plan::default() };
-        let mut plan = planner(&ids);
+        let mut plan = if ids.is_empty() { Plan::default() } else { planner(&ids) };
         plan.skipped.extend(starting);
+        plan.skipped.extend(unsupported);
         plan
     }
 
@@ -1106,6 +1147,9 @@ impl App {
     }
 
     fn start_rename(&mut self) {
+        if self.unsupported("rename", |f| f.rename) {
+            return;
+        }
         let Some(s) = self.selected() else { return };
         if !self.can_change() {
             self.status = Some("This conversation is open, so rename it from there with /rename.".into());
@@ -1156,6 +1200,12 @@ impl App {
     /// This gets pasted into a shell, so a folder that isn't safe is left out rather than quoted.
     /// A control character in it could end the paste early, whatever the quoting.
     fn resume_command(s: &Session) -> String {
+        if s.source == Source::Codex {
+            return match s.folder.as_deref().filter(|f| is_safe_folder(f)) {
+                Some(folder) => format!("cd '{}' && codex resume {}", folder.replace('\'', r"'\''"), s.id),
+                None => format!("codex resume {}", s.id),
+            };
+        }
         match s.folder.as_deref().filter(|f| is_safe_folder(f)) {
             Some(folder) => manual_command(&s.id, None, Path::new(folder)),
             None => format!("claude --resume {}", s.id),
@@ -1167,6 +1217,9 @@ impl App {
     }
 
     fn resume_selected(&mut self) {
+        if self.unsupported("resume", |f| f.resume) {
+            return;
+        }
         let Some(s) = self.selected() else { return };
         let id = s.id.clone();
         if self.recently_resumed(&id) {
@@ -1186,6 +1239,9 @@ impl App {
     /// Starts a new conversation as a copy of the selected one, in the same folder, which is
     /// where Claude Code looks for the original.
     fn fork_selected(&mut self) {
+        if self.unsupported("fork", |f| f.fork) {
+            return;
+        }
         let Some(s) = self.selected() else { return };
         let id = s.id.clone();
         if self.recently_resumed(&fork_key(&id)) {
@@ -1393,7 +1449,7 @@ impl App {
     }
 
     pub fn context_text(&self, s: &Session) -> String {
-        context_label(s.context_used, window_size(s.window_size, s.model.as_deref(), &self.config.windows))
+        context_label(s.context_used, window_size(s.window_size.or(s.context_window), s.model.as_deref(), &self.config.windows))
     }
 
     pub fn status_text(s: &Session) -> &'static str {
@@ -1424,6 +1480,13 @@ impl App {
             Action::ToggleJunk => self.filters.junk = !self.filters.junk,
             Action::ToggleMissing => self.filters.missing = !self.filters.missing,
             Action::ToggleLarge => self.filters.large = !self.filters.large,
+            Action::ToggleTool => {
+                let at = self.filters.tool.and_then(|t| self.tools.iter().position(|x| *x == t));
+                self.filters.tool = match at {
+                    None => self.tools.first().copied(),
+                    Some(i) => self.tools.get(i + 1).copied(),
+                };
+            }
             Action::ClearFilters if self.view == View::Worktrees => self.worktrees.show_idle(false, &self.sessions),
             Action::ClearFilters => self.filters = Filters::default(),
             Action::ToggleGroup => {
@@ -1478,10 +1541,11 @@ impl App {
         }
         let undo = if narrowed { "turn this off" } else { "show all" };
         let shown = self.rows.iter().filter(|r| matches!(r, GroupRow::Item(_))).count();
+        let why = if self.many_tools() { "no reply came" } else { "Claude never replied" };
         match shown {
             0 => format!("No junk conversations to show. Press Shift+J again to {undo}."),
-            1 => format!("Showing 1 junk conversation: Claude never replied. Press Shift+J again to {undo}."),
-            n => format!("Showing {n} junk conversations: Claude never replied. Press Shift+J again to {undo}."),
+            1 => format!("Showing 1 junk conversation: {why}. Press Shift+J again to {undo}."),
+            n => format!("Showing {n} junk conversations: {why}. Press Shift+J again to {undo}."),
         }
     }
 
@@ -1587,6 +1651,7 @@ impl App {
             KeyCode::Char('J') => self.run(Action::ToggleJunk),
             KeyCode::Char('m') => self.run(Action::ToggleMissing),
             KeyCode::Char('l') => self.run(Action::ToggleLarge),
+            KeyCode::Char('t') if self.many_tools() => self.run(Action::ToggleTool),
             KeyCode::Char('c') => self.run(Action::ClearFilters),
             KeyCode::Char('g') => self.run(Action::ToggleGroup),
             KeyCode::Char('s') => self.run(Action::NextSort),

@@ -190,7 +190,7 @@ pub(crate) fn read_capped_line<R: BufRead>(reader: &mut R, line: &mut Vec<u8>) -
     }
 }
 
-fn label(text: &str) -> String {
+pub(crate) fn label(text: &str) -> String {
     let short: String = text.chars().take(MAX_LABEL).collect();
     sanitize(&short)
 }

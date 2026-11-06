@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::model::Session;
+use crate::model::{Session, Source};
 use crate::repo::{infer, Place};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -17,6 +17,8 @@ pub struct Filters {
     pub old: bool,
     /// Not open. Only the clean-up screen sets this, since open conversations are never suggested.
     pub closed: bool,
+    /// Only this tool's conversations.
+    pub tool: Option<Source>,
 }
 
 /// What counts as large and as old.
@@ -38,10 +40,11 @@ impl Filters {
             && (!self.large || s.size_bytes > limits.large_bytes)
             && (!self.old || s.last_active_ms.is_some_and(|t| t < limits.old_before_ms))
             && (!self.closed || !s.open)
+            && self.tool.is_none_or(|t| s.source == t)
     }
 
     pub fn any(&self) -> bool {
-        self.open || self.crashed || self.junk || self.missing || self.large || self.old || self.closed
+        self.open || self.crashed || self.junk || self.missing || self.large || self.old || self.closed || self.tool.is_some()
     }
 }
 
@@ -83,6 +86,8 @@ pub enum SortKey {
     Model,
     Branch,
     Status,
+    /// Only shown, and so only sortable by clicking, when more than one tool is read.
+    Tool,
 }
 
 impl SortKey {
@@ -126,6 +131,7 @@ fn compare(a: &Session, b: &Session, key: SortKey) -> Ordering {
         SortKey::Model => a.model.cmp(&b.model),
         SortKey::Branch => a.branch.cmp(&b.branch),
         SortKey::Status => status_rank(a).cmp(&status_rank(b)),
+        SortKey::Tool => a.source.label().cmp(b.source.label()),
     }
 }
 
@@ -265,6 +271,7 @@ mod tests {
             started_at_ms: None,
             last_active_ms: None,
             context_used: None,
+            context_window: None,
             prompts: 1,
             replies: 1,
             cost_usd: None,

@@ -12,6 +12,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use ccm_core::catalog::Catalog;
+use ccm_core::config::ToolName;
+use ccm_core::model::Source;
+use ccm_core::tools::{self, codex::Codex};
 use ccm_core::config::Config;
 use ccm_core::delete::{self, Failure, Outcome, Plan};
 use ccm_core::index::{Index, Searcher};
@@ -116,12 +119,21 @@ fn run_setup(paths: &Paths) -> Result<()> {
 
 fn browse(paths: Paths) -> Result<()> {
     let (config, config_error) = Config::load(&paths.config);
-    let catalog = Catalog::open(paths.clone()).context("opening the index")?;
+    let codex_home = Codex::home_from(|v| std::env::var(v).ok(), Path::new(&home()));
+    let tools = tools::detect(&paths, Path::new(PROC), &codex_home, config.tools.as_deref());
+    let sources: Vec<Source> = tools.iter().map(|t| t.source()).collect();
+    let catalog = Catalog::with_tools(&paths.index, tools).context("opening the index")?;
     let cached = catalog.cached();
     let searcher = Searcher::open(&paths.index).context("opening the search index")?;
 
     let config_terminal = config.terminal.clone();
-    let mut app = App::new(config, paths.claude.display().to_string(), home());
+    let looked_in = match config.tools.as_deref() {
+        Some(wanted) if !wanted.contains(&ToolName::Codex) => paths.claude.display().to_string(),
+        Some(wanted) if !wanted.contains(&ToolName::Claude) => codex_home.display().to_string(),
+        _ => format!("{} or {}", paths.claude.display(), codex_home.display()),
+    };
+    let mut app = App::new(config, looked_in, home());
+    app.tools = if sources.is_empty() { vec![Source::ClaudeCode] } else { sources };
     app.status = config_error;
     let terminal_command = config_terminal.clone();
     let claude_json = paths.claude_json.clone();

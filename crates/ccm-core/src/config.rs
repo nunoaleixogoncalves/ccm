@@ -3,6 +3,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::model::Source;
 use crate::query::Limits;
 
 /// `~/.config/ccm/config.toml`. Every field is optional.
@@ -17,11 +18,31 @@ pub struct Config {
     /// Command that opens a terminal and runs what follows it, such as `["foot", "-e"]`.
     /// `xdg-terminal-exec` is used when this isn't set.
     pub terminal: Option<Vec<String>>,
+    /// Which tools to read, such as `["claude", "codex"]`. When this isn't set, every tool whose
+    /// folder exists is read.
+    pub tools: Option<Vec<ToolName>>,
+}
+
+/// A tool's name in `config.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolName {
+    Claude,
+    Codex,
+}
+
+impl ToolName {
+    pub fn source(self) -> Source {
+        match self {
+            ToolName::Claude => Source::ClaudeCode,
+            ToolName::Codex => Source::Codex,
+        }
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { large_threshold_mb: 100, old_after_days: 30, windows: default_windows(), terminal: None }
+        Self { large_threshold_mb: 100, old_after_days: 30, windows: default_windows(), terminal: None, tools: None }
     }
 }
 
@@ -76,6 +97,15 @@ mod tests {
         assert_eq!(c.limits(10 * 86_400_000).old_before_ms, 8 * 86_400_000);
         assert_eq!(Config::default().old_after_days, 30);
         assert_eq!(c.windows["claude-opus-5-5"], 1_000_000);
+    }
+
+    #[test]
+    fn tools_are_named_in_lowercase_and_an_unknown_one_is_an_error() {
+        let c = Config::parse("tools = [\"codex\"]\n").unwrap();
+        assert_eq!(c.tools, Some(vec![ToolName::Codex]));
+        assert_eq!(ToolName::Claude.source(), Source::ClaudeCode);
+        assert!(Config::default().tools.is_none());
+        assert!(Config::parse("tools = [\"cursor\"]\n").is_err());
     }
 
     #[test]
