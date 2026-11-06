@@ -109,6 +109,8 @@ fn session<'a>(app: &'a App, id: &str) -> Option<&'a Session> {
 fn status(app: &App, w: &Worktree, links: &[Link]) -> &'static str {
     if w.prunable {
         "missing"
+    } else if w.from_windows() {
+        "Windows"
     } else if open_count(app, links) > 0 {
         "open"
     } else if w.locked {
@@ -208,6 +210,9 @@ fn plural(n: u64, one: &str, many: &str) -> String {
 fn state_lines(w: &Worktree) -> Vec<String> {
     if w.prunable {
         return vec!["Its folder is gone. Git still lists it until it's pruned.".into()];
+    }
+    if w.from_windows() {
+        return vec!["Made by Git for Windows. Git here can't reach its folder, so ccm leaves it alone. Manage it from Windows.".into()];
     }
     let Some(s) = w.state else {
         return vec!["Git couldn't say whether it has changes or unpushed commits.".into()];

@@ -52,6 +52,16 @@ impl Worktree {
     pub fn is_linked(&self) -> bool {
         !self.main && !self.bare
     }
+
+    /// Recorded by Git for Windows, with a path like `C:/Users/...` that Git in WSL can't open.
+    /// Git then calls it prunable, but its folder may well exist on the Windows side. Depending
+    /// on the version, Git shows the path as it is or after the admin folder's own path.
+    pub fn from_windows(&self) -> bool {
+        self.path.to_string_lossy().split('/').any(|part| {
+            let b = part.as_bytes();
+            b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b.len() == 2 || b[2] == b'\\')
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,7 +210,8 @@ pub(crate) fn parse_list(out: &[u8]) -> Vec<Worktree> {
                 w.branch = Some(name.strip_prefix("refs/heads/").unwrap_or(&name).to_owned());
             }
             b"locked" => w.locked = true,
-            b"prunable" => w.prunable = true,
+            // Not gone, only out of reach: see `from_windows`.
+            b"prunable" => w.prunable = !w.from_windows(),
             _ => {}
         }
     }
@@ -281,7 +292,7 @@ pub fn scan(folders: &[String]) -> Scan {
         scan.errors.push(format!("Couldn't list the worktrees of {failed} repositor{plural}. Worktrees need Git 2.36 or later."));
     }
     scan.worktrees = lists.into_iter().flatten().flatten().collect();
-    scan.worktrees.par_iter_mut().filter(|w| w.is_linked() && !w.prunable).for_each(|w| w.state = inspect(w));
+    scan.worktrees.par_iter_mut().filter(|w| w.is_linked() && !w.prunable && !w.from_windows()).for_each(|w| w.state = inspect(w));
     scan
 }
 
@@ -470,6 +481,20 @@ mod tests {
         let scan = scan(&[folder(&repo)]);
         assert!(scan.worktrees.iter().any(|w| w.state.is_some()));
         assert!(!ran.exists(), "core.fsmonitor ran");
+    }
+
+    #[test]
+    fn a_worktree_made_by_git_for_windows_is_not_gone() {
+        for windows in ["/r/.git/worktrees/w/C:/Users/me/w", "C:/Users/me/w", "/r/.git/worktrees/w/d:\\Users\\me\\w\\.git", "/home/me/C:"] {
+            let out = format!("worktree /r\0HEAD 1\0branch refs/heads/main\0\0worktree {windows}\0HEAD 1\0branch refs/heads/w\0prunable gitdir file points to non-existent location\0\0");
+            let list = parse_list(out.as_bytes());
+            assert!(list[1].from_windows() && !list[1].prunable, "{windows}");
+        }
+        for linux in ["/home/me/w", "/home/me/a:b", "/home/me/ab:/w", "/mnt/c/Users/me/w"] {
+            let out = format!("worktree /r\0HEAD 1\0\0worktree {linux}\0HEAD 1\0prunable gone\0\0");
+            let list = parse_list(out.as_bytes());
+            assert!(!list[1].from_windows() && list[1].prunable, "{linux}");
+        }
     }
 
     #[test]

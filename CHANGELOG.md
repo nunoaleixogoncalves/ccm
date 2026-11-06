@@ -8,6 +8,7 @@ Every release of `ccm` and what changed in it. Each section is also used as the 
 
 - **Resuming on WSL.** `ccm` now opens a new Windows Terminal tab there, starting the conversation in its Linux folder through `wsl.exe --cd`. Before, it tried `xdg-terminal-exec`, which WSL usually doesn't have, and resuming failed with "No such file or directory".
 - When a terminal can't be started, the message now says why: that the launcher isn't installed, or what it printed before failing.
+- **Worktrees made by Git for Windows, seen from WSL.** Git in WSL can't reach a folder recorded as `C:/...`, so it reported such a worktree as missing. `ccm` then suggested it on the clean-up screen and would have cleared Git's record of a worktree that still exists on Windows. It now shows these as "Windows" and never suggests or removes them.
 
 ## [1.1.0] - 2026-11-06
 
