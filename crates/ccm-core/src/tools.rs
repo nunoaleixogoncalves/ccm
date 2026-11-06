@@ -56,7 +56,7 @@ pub fn detect(paths: &Paths, proc_root: &Path, codex_home: &Path, wanted: Option
         tools.push(Box::new(claude::ClaudeCode::new(paths.clone(), proc_root.to_path_buf())));
     }
     if wants(ToolName::Codex) && codex::Codex::sessions(codex_home).is_dir() {
-        tools.push(Box::new(codex::Codex::new(codex_home.to_path_buf())));
+        tools.push(Box::new(codex::Codex::new(codex_home.to_path_buf()).with_state(paths.state.clone())));
     }
     tools
 }
@@ -92,7 +92,7 @@ impl Source {
     pub fn features(self) -> Features {
         match self {
             Source::ClaudeCode => Features { resume: true, fork: true, delete: true, rename: true, recovery: true },
-            Source::Codex => Features { resume: true, fork: true, delete: true, rename: false, recovery: false },
+            Source::Codex => Features { resume: true, fork: true, delete: true, rename: false, recovery: true },
         }
     }
 }

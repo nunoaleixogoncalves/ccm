@@ -131,6 +131,19 @@ pub fn crashed(paths: &Paths, open: &HashSet<String>, roster: &str, now_ms: i64)
         .collect()
 }
 
+/// When each conversation was last dismissed, in ms, from the log in `state`. For tools whose
+/// crashes `ccm` sees some other way.
+pub fn dismissals(state: &Path) -> HashMap<String, i64> {
+    let Ok(text) = fs::read_to_string(state.join("sessions.jsonl")) else { return HashMap::new() };
+    let mut out = HashMap::new();
+    for event in text.lines().filter_map(|l| serde_json::from_str::<Event>(l).ok()) {
+        if event.event == Kind::Dismissed {
+            out.insert(event.id, event.ts);
+        }
+    }
+    out
+}
+
 /// Stops these showing as crashed. The next time one of them starts, it's tracked again.
 pub fn dismiss(paths: &Paths, ids: &[String], now_ms: i64) -> io::Result<()> {
     let events: Vec<Event> = ids.iter().map(|id| Event { event: Kind::Dismissed, id: id.clone(), ts: now_ms }).collect();

@@ -3,7 +3,8 @@
 //!
 //! Read only. Codex also keeps databases next to these files, which `ccm` never opens.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
@@ -22,15 +23,24 @@ use crate::index::SearchDoc;
 use crate::model::{FolderVisit, Session, Source};
 use crate::paths::is_uuid;
 use crate::preview::{self, Preview};
+use crate::recovery;
 use crate::transcript::label;
 
 pub struct Codex {
     home: PathBuf,
+    /// `ccm`'s own state folder, which records crashes the user dismissed.
+    state: Option<PathBuf>,
+    /// The last answer, kept for when Codex holds its coordination lock too long to ask again.
+    last_live: Mutex<(HashSet<String>, HashSet<String>)>,
 }
 
 impl Codex {
     pub fn new(home: PathBuf) -> Self {
-        Self { home }
+        Self { home, state: None, last_live: Mutex::default() }
+    }
+
+    pub fn with_state(self, state: PathBuf) -> Self {
+        Self { state: Some(state), ..self }
     }
 
     /// `$CODEX_HOME`, or `~/.codex`.
@@ -123,9 +133,65 @@ impl Tool for Codex {
         found.size
     }
 
+    /// A running Codex holds a lock on `thread-writer-locks/<id>.lock`, and removes the file when
+    /// it finishes. A file nobody holds was left by a Codex that stopped without finishing: a
+    /// crash, unless the user dismissed it since.
     fn live(&self) -> Live {
-        Live::default()
+        let Some((open, stale)) = probe_writer_locks(&self.home.join(WRITER_LOCKS)) else {
+            let (open, crashed) = self.last_live.lock().map(|l| l.clone()).unwrap_or_default();
+            return Live { open, crashed, ..Live::default() };
+        };
+        let dismissed = self.state.as_deref().map(recovery::dismissals).unwrap_or_default();
+        let crashed: HashSet<String> =
+            stale.into_iter().filter(|(id, at)| dismissed.get(id).is_none_or(|d| d < at)).map(|(id, _)| id).collect();
+        if let Ok(mut last) = self.last_live.lock() {
+            *last = (open.clone(), crashed.clone());
+        }
+        Live { open, crashed, ..Live::default() }
     }
+}
+
+const WRITER_LOCKS: &str = "thread-writer-locks";
+/// How long to wait for Codex's coordination lock. Codex itself waits up to 30 seconds.
+const COORDINATION_WAIT: Duration = Duration::from_secs(1);
+
+/// The conversations whose lock is held, and those whose lock file nobody holds, with the
+/// file's time in ms. `None` when Codex's coordination lock couldn't be had in time.
+///
+/// This follows Codex's own check: every Codex takes `.coordination.lock` before it opens or
+/// takes a conversation's lock, so while `ccm` holds it, trying a conversation's lock for an
+/// instant can't get in a Codex's way. Nothing here is created or removed.
+fn probe_writer_locks(dir: &Path) -> Option<(HashSet<String>, HashMap<String, i64>)> {
+    let mut open = HashSet::new();
+    let mut stale = HashMap::new();
+    // No coordination file means no Codex has ever taken a lock here.
+    let Ok(coordination) = fs::File::open(dir.join(".coordination.lock")) else { return Some((open, stale)) };
+    let started = Instant::now();
+    loop {
+        match coordination.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < COORDINATION_WAIT => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => return None,
+        }
+    }
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".lock")).filter(|id| is_uuid(id)) else { continue };
+        let Ok(file) = fs::File::open(entry.path()) else { continue };
+        match file.try_lock() {
+            Ok(()) => {
+                let at = file.metadata().map_or(0, |m| m.mtime() * 1000 + m.mtime_nsec() / 1_000_000);
+                drop(file);
+                stale.insert(id.to_string(), at);
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                open.insert(id.to_string());
+            }
+            Err(_) => {}
+        }
+    }
+    drop(coordination);
+    Some((open, stale))
 }
 
 /// Every `rollout-*.jsonl` under `sessions/`, three folders deep. Compressed `.jsonl.zst` files
@@ -747,5 +813,56 @@ mod tests {
         assert_eq!(plan.items[0].transcripts, [PathBuf::from(&s.transcript_path)]);
         s.open = true;
         assert_eq!(with(&s, Some(Path::new("/usr/bin/codex"))), (0, Some("it's open".into())));
+    }
+
+    fn lock_file(dir: &Path, name: &str) -> fs::File {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(name), "").unwrap();
+        fs::File::open(dir.join(name)).unwrap()
+    }
+
+    #[test]
+    fn a_held_lock_is_open_and_one_left_behind_is_a_crash_until_dismissed() {
+        let h = Home::new();
+        let state = h.dir.path().join("ccm-state");
+        let locks = h.dir.path().join(WRITER_LOCKS);
+        let codex = h.codex().with_state(state.clone());
+        assert_eq!(codex.live().open.len() + codex.live().crashed.len(), 0);
+        assert!(!locks.exists(), "nothing is created in Codex's folder");
+
+        lock_file(&locks, ".coordination.lock");
+        let running = lock_file(&locks, &format!("{ID}.lock"));
+        running.lock().unwrap();
+        let _left = lock_file(&locks, &format!("{BUSY}.lock"));
+        lock_file(&locks, "not-an-id.lock");
+        let live = codex.live();
+        assert_eq!(live.open, HashSet::from([ID.to_string()]));
+        assert_eq!(live.crashed, HashSet::from([BUSY.to_string()]));
+
+        // Dismissed after the crash: no longer shown. A newer crash shows again.
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("sessions.jsonl"), format!("{{\"event\":\"dismissed\",\"id\":\"{BUSY}\",\"ts\":{}}}\n", i64::MAX / 2)).unwrap();
+        assert!(codex.live().crashed.is_empty());
+        fs::write(state.join("sessions.jsonl"), format!("{{\"event\":\"dismissed\",\"id\":\"{BUSY}\",\"ts\":1}}\n")).unwrap();
+        assert_eq!(codex.live().crashed.len(), 1);
+    }
+
+    #[test]
+    fn while_codex_holds_its_coordination_lock_the_last_answer_stands() {
+        let h = Home::new();
+        let locks = h.dir.path().join(WRITER_LOCKS);
+        let coordination = lock_file(&locks, ".coordination.lock");
+        let running = lock_file(&locks, &format!("{ID}.lock"));
+        running.lock().unwrap();
+        let codex = h.codex();
+        assert_eq!(codex.live().open.len(), 1);
+        drop(running);
+        coordination.lock().unwrap();
+        let started = Instant::now();
+        assert_eq!(codex.live().open.len(), 1, "unknown, so the last answer is kept");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        coordination.unlock().unwrap();
+        assert!(codex.live().open.is_empty());
+        assert_eq!(codex.live().crashed.len(), 1);
     }
 }

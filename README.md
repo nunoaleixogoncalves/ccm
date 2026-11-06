@@ -223,7 +223,9 @@ Codex conversations can be resumed, forked and deleted, through Codex's own comm
 - **Fork** runs `codex fork -C <folder> <id>`. Codex gives the fork its own ID and records which conversation it came from, and `ccm` shows that.
 - **Delete** runs `codex delete --force <id>`. That also clears the records Codex keeps of the conversation in its own databases. Codex refuses to delete a conversation that's running, or one a fork still needs, and `ccm` shows its reason. Then `ccm` takes the conversation's prompts out of Codex's `history.jsonl`, which `codex delete` leaves, holding the same lock Codex uses for that file.
 
-Rename and crash recovery are greyed out for Codex conversations and come in later versions. Files Codex compressed (`.jsonl.zst`) aren't read yet.
+**Open and crashed** need no setup for Codex. A running Codex holds a lock on `thread-writer-locks/<id>.lock` in its folder and removes the file when it finishes, so a held lock shows the conversation as open, and a file nobody holds shows it as crashed. `ccm` checks this the way Codex itself does, under Codex's `.coordination.lock`, and never creates or removes these files. Codex clears files left by a crash the next time it starts.
+
+Rename is greyed out for Codex conversations and comes in a later version. Files Codex compressed (`.jsonl.zst`) aren't read yet.
 
 ## Configuration
 
@@ -295,7 +297,7 @@ A Codex conversation is deleted by Codex itself. See [Codex](#codex).
 
 Claude Code records a clean exit, or a closed terminal, but it can't record a power loss or a hard kill. With the hooks installed, `ccm` shows a session that started and never ended as crashed, in red. Press `Shift+O` to choose which ones to reopen. Any you untick stop showing as crashed.
 
-Only sessions started after `ccm setup` are tracked.
+Only sessions started after `ccm setup` are tracked. Codex conversations need no setup; see [Codex](#codex).
 
 ## Platforms
 

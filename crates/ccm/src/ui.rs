@@ -2679,4 +2679,33 @@ mod tests {
         a.on_key(KeyCode::Char('Y'));
         assert_eq!(calls.borrow()[0], format!("cd '/home/me/c' && codex resume {id}"));
     }
+
+    #[test]
+    fn an_open_codex_conversation_is_left_alone_and_a_crashed_one_reopens_with_codex() {
+        let mut a = with_codex();
+        let calls: Rc<RefCell<Vec<Launched>>> = Rc::default();
+        let seen = calls.clone();
+        a.resume = Some(Box::new(move |id, source, fork, folder| {
+            seen.borrow_mut().push((id.to_string(), source, fork.is_some(), folder.to_owned()));
+            Ok("Opened.".to_string())
+        }));
+        let mut sessions = a.sessions.clone();
+        let codex = sessions.iter_mut().find(|s| s.name == "Codex chat").unwrap();
+        codex.open = true;
+        let id = codex.id.clone();
+        a.set_sessions(sessions.clone());
+        select_named(&mut a, "Codex chat");
+        assert!(!a.can_resume() && !a.can_rename());
+        a.on_key(KeyCode::Enter);
+        assert_eq!(a.status.as_deref(), Some("This conversation is already open."));
+
+        let codex = sessions.iter_mut().find(|s| s.id == id).unwrap();
+        codex.open = false;
+        codex.crashed = true;
+        a.set_sessions(sessions);
+        assert!(render(&mut a, 140, 30).lines().any(|l| l.contains("Codex chat") && l.contains("crashed")));
+        a.on_key(KeyCode::Char('O'));
+        a.on_key(KeyCode::Enter);
+        assert_eq!(*calls.borrow(), [(id, Source::Codex, false, PathBuf::from("/home/me/c"))]);
+    }
 }
