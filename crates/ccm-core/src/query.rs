@@ -13,20 +13,62 @@ pub struct Filters {
     pub junk: bool,
     pub missing: bool,
     pub large: bool,
+    /// Not active for a while. Only the clean-up screen sets this.
+    pub old: bool,
+    /// Not open. Only the clean-up screen sets this, since open conversations are never suggested.
+    pub closed: bool,
+}
+
+/// What counts as large and as old.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Limits {
+    /// Larger than this is large.
+    pub large_bytes: u64,
+    /// Last active before this is old. A conversation with no recorded activity never is.
+    pub old_before_ms: i64,
 }
 
 impl Filters {
     /// A row must pass every active filter.
-    pub fn matches(&self, s: &Session, large_bytes: u64) -> bool {
+    pub fn matches(&self, s: &Session, limits: Limits) -> bool {
         (!self.open || s.open)
             && (!self.crashed || s.crashed)
             && (!self.junk || s.is_junk())
             && (!self.missing || s.is_folder_missing())
-            && (!self.large || s.size_bytes > large_bytes)
+            && (!self.large || s.size_bytes > limits.large_bytes)
+            && (!self.old || s.last_active_ms.is_some_and(|t| t < limits.old_before_ms))
+            && (!self.closed || !s.open)
     }
 
     pub fn any(&self) -> bool {
-        self.open || self.crashed || self.junk || self.missing || self.large
+        self.open || self.crashed || self.junk || self.missing || self.large || self.old || self.closed
+    }
+}
+
+/// Conversations worth cleaning up. Each is a set of filters, so the normal list can show them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Suggestion {
+    NoReply,
+    FolderGone,
+    LargeOld,
+}
+
+impl Suggestion {
+    pub const ALL: [Suggestion; 3] = [Suggestion::NoReply, Suggestion::FolderGone, Suggestion::LargeOld];
+
+    pub fn filters(self) -> Filters {
+        let closed = Filters { closed: true, ..Filters::default() };
+        match self {
+            Suggestion::NoReply => Filters { junk: true, ..closed },
+            Suggestion::FolderGone => Filters { missing: true, ..closed },
+            Suggestion::LargeOld => Filters { large: true, old: true, ..closed },
+        }
+    }
+
+    /// The conversations it suggests, as indices into `sessions`.
+    pub fn select(self, sessions: &[Session], limits: Limits) -> Vec<usize> {
+        let filters = self.filters();
+        (0..sessions.len()).filter(|&i| filters.matches(&sessions[i], limits)).collect()
     }
 }
 
@@ -89,9 +131,9 @@ fn compare(a: &Session, b: &Session, key: SortKey) -> Ordering {
 
 /// Indices into `sessions`, filtered and sorted. Ties fall back to newest first and then ID, so
 /// rows don't jump between refreshes.
-pub fn select(sessions: &[Session], filters: Filters, large_bytes: u64, key: SortKey, descending: bool) -> Vec<usize> {
+pub fn select(sessions: &[Session], filters: Filters, limits: Limits, key: SortKey, descending: bool) -> Vec<usize> {
     let mut rows: Vec<usize> =
-        (0..sessions.len()).filter(|&i| filters.matches(&sessions[i], large_bytes)).collect();
+        (0..sessions.len()).filter(|&i| filters.matches(&sessions[i], limits)).collect();
     rows.sort_by(|&x, &y| {
         let (a, b) = (&sessions[x], &sessions[y]);
         let primary = compare(a, b, key);
@@ -239,6 +281,35 @@ mod tests {
         }
     }
 
+    const LIMITS: Limits = Limits { large_bytes: 1000, old_before_ms: 1000 };
+
+    #[test]
+    fn suggestions_never_include_open_conversations() {
+        let mut junk = session("junk");
+        junk.replies = 0;
+        let mut open_junk = session("open-junk");
+        open_junk.replies = 0;
+        open_junk.open = true;
+        let mut gone = session("gone");
+        gone.folder_exists = false;
+        let mut big_old = session("big-old");
+        big_old.size_bytes = 2000;
+        big_old.last_active_ms = Some(999);
+        let mut big_new = session("big-new");
+        big_new.size_bytes = 2000;
+        big_new.last_active_ms = Some(1000);
+        let mut big_unknown = session("big-unknown");
+        big_unknown.size_bytes = 2000;
+        big_unknown.last_active_ms = None;
+        let all = [junk, open_junk, gone, big_old, big_new, big_unknown];
+        let ids = |s: Suggestion| -> Vec<&str> { s.select(&all, LIMITS).into_iter().map(|i| all[i].id.as_str()).collect() };
+        assert_eq!(ids(Suggestion::NoReply), ["junk"]);
+        assert_eq!(ids(Suggestion::FolderGone), ["gone"]);
+        assert_eq!(ids(Suggestion::LargeOld), ["big-old"], "old means last active before the cutoff, and unknown isn't old");
+        let shown = select(&all, Suggestion::LargeOld.filters(), LIMITS, SortKey::Name, false);
+        assert_eq!(shown, Suggestion::LargeOld.select(&all, LIMITS), "the list shows exactly what was counted");
+    }
+
     #[test]
     fn each_filter_selects_its_rows_and_they_combine() {
         let mut open = session("open");
@@ -254,7 +325,7 @@ mod tests {
         both.size_bytes = 2000;
         let all = [open, junk, gone, big, both, session("plain")];
         let ids = |f: Filters| -> Vec<&str> {
-            select(&all, f, 1000, SortKey::Name, false).into_iter().map(|i| all[i].id.as_str()).collect()
+            select(&all, f, LIMITS, SortKey::Name, false).into_iter().map(|i| all[i].id.as_str()).collect()
         };
         assert_eq!(ids(Filters::default()).len(), 6);
         assert_eq!(ids(Filters { open: true, ..Default::default() }), ["open"]);
@@ -277,9 +348,9 @@ mod tests {
         let mut s = session("a");
         s.size_bytes = 1000;
         let f = Filters { large: true, ..Default::default() };
-        assert!(!f.matches(&s, 1000));
+        assert!(!f.matches(&s, LIMITS));
         s.size_bytes = 1001;
-        assert!(f.matches(&s, 1000));
+        assert!(f.matches(&s, LIMITS));
     }
 
     #[test]
@@ -293,7 +364,7 @@ mod tests {
         let mut c = session("c");
         c.size_bytes = 9;
         let all = [a, b, c];
-        let order = |d| select(&all, Filters::default(), 0, SortKey::Size, d);
+        let order = |d| select(&all, Filters::default(), Limits::default(), SortKey::Size, d);
         assert_eq!(order(true), [2, 1, 0]);
         assert_eq!(order(false), [1, 0, 2]);
     }
@@ -304,7 +375,7 @@ mod tests {
         a.name = "banana".into();
         b.name = "Apple".into();
         let all = [a, b];
-        assert_eq!(select(&all, Filters::default(), 0, SortKey::Name, false), [1, 0]);
+        assert_eq!(select(&all, Filters::default(), Limits::default(), SortKey::Name, false), [1, 0]);
     }
 
     #[test]

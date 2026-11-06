@@ -26,7 +26,7 @@ If you run a lot of Claude Code sessions, they pile up:
 - **Delete:** permanently remove one or many conversations and their data, after a confirmation that lists what goes.
 - **Rename:** the new name also shows in Claude Code's own `/resume`.
 - **Group:** by the folder a conversation ran in, or by Git repository, so the work in a repository and all its worktrees shows together.
-- **Clean up:** filter for conversations Claude never replied to, ones whose folder is gone, and large ones.
+- **Clean up:** one screen lists what could be cleaned up and how much space it would free: conversations Claude never replied to, ones whose folder is gone, and large ones you haven't used for a while.
 - **Recover:** after a crash, see what was running and reopen it all at once.
 - **Worktrees:** see the Git worktrees of the repositories your conversations used, with their uncommitted changes, unpushed commits and the conversations that worked in each, and remove the ones you're done with.
 
@@ -139,8 +139,21 @@ View:
 | `s` | Change the sort column |
 | `r` | Reverse the sort |
 | `w` | Show the [worktrees](#worktrees). `w` or Esc goes back |
+| `Shift+C` | Show the [clean-up suggestions](#cleaning-up). `Shift+C` or Esc goes back |
 
 With the mouse, you can click a row to select it, double-click to resume, click a column heading to sort, and use the wheel to scroll.
+
+## Cleaning up
+
+Press `Shift+C` to see what could be cleaned up. Each line says how many items it found and how much space removing them would free:
+
+- conversations Claude never replied to
+- conversations whose folder is gone
+- conversations over the large size, 100 MB by default, that haven't been active for 30 days
+
+Open conversations are never suggested. Nothing is removed from this screen, and `ccm` never brings it up by itself. Choose a line with Enter or a double-click to open the list showing just those conversations, where you mark and delete them as usual. `c` clears it like any filter.
+
+Change what counts as large or old with `large_threshold_mb` and `old_after_days` in the [configuration](#configuration).
 
 ## Forking
 
@@ -193,8 +206,12 @@ The popup lists the conversations that worked in each worktree. It also warns wh
 Everything is optional. The file is `~/.config/ccm/config.toml`:
 
 ```toml
-# What counts as large for the l filter, in MB. The default is 100.
+# What counts as large for the l filter and clean-up, in MB. The default is 100.
 large_threshold_mb = 200
+
+# Days without activity after which a large conversation is suggested for
+# clean-up. The default is 30.
+old_after_days = 60
 
 # The command that opens a terminal. "claude --resume <id>" is added to the end,
 # and it runs in the conversation's folder. The default is xdg-terminal-exec.

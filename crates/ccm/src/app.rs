@@ -9,7 +9,7 @@ use ccm_core::model::Session;
 use ccm_core::preview::{self, Preview};
 use ccm_core::rename::MAX_NAME;
 use ccm_core::resume::{decide, decide_fork, is_safe_folder, manual_command, Decision, Fork};
-use ccm_core::query::{group_by_folder, group_by_repo, select, status_rank, Filters, GroupRow, SortKey};
+use ccm_core::query::{group_by_folder, group_by_repo, select, status_rank, Filters, GroupRow, SortKey, Suggestion};
 use ccm_core::repo::Place;
 use ccm_core::window::{context_label, window_size};
 use ccm_core::format::sanitize;
@@ -44,7 +44,32 @@ pub enum Action {
     Reopen,
     /// Switches between the conversations and the worktrees.
     Worktrees,
+    /// Opens the clean-up suggestions, or goes back from them.
+    Cleanup,
+    /// Opens the selected clean-up suggestion.
+    OpenSuggestion,
     Quit,
+}
+
+/// One line of the clean-up screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cleanup {
+    Conversations(Suggestion),
+}
+
+impl Cleanup {
+    pub const ALL: [Cleanup; 3] = [
+        Cleanup::Conversations(Suggestion::NoReply),
+        Cleanup::Conversations(Suggestion::FolderGone),
+        Cleanup::Conversations(Suggestion::LargeOld),
+    ];
+}
+
+/// How many items a clean-up line has and what removing them would free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tally {
+    pub count: usize,
+    pub bytes: u64,
 }
 
 /// How the conversation list is grouped. `g` steps through them in this order.
@@ -80,6 +105,7 @@ pub struct RepoRequest {
 pub enum View {
     Conversations,
     Worktrees,
+    Cleanup,
 }
 
 /// Runs a query. `None` means the query has nothing to search for.
@@ -100,6 +126,8 @@ pub type RemovePlanFn = Box<dyn FnMut(&[Target], &[Session]) -> removal::Plan>;
 pub type RemoveFn = Box<dyn FnMut(&removal::Plan, &[Session]) -> removal::Outcome>;
 /// Copies text and returns what to tell the user.
 pub type CopyFn = Box<dyn FnMut(&str) -> Result<String, String>>;
+/// The time now, in milliseconds. Tests set their own.
+pub type ClockFn = Box<dyn Fn() -> i64>;
 
 /// Two clicks on a row this close together are a double-click. Terminals report each click
 /// separately, so this has to be timed here.
@@ -257,6 +285,9 @@ pub struct App {
     pub remover: Option<RemoveFn>,
     pub confirm_remove: Option<ConfirmRemove>,
     pending_remove: Option<ConfirmRemove>,
+    /// The selected line of the clean-up screen.
+    pub cleanup_row: usize,
+    pub clock: ClockFn,
 }
 
 impl App {
@@ -313,6 +344,8 @@ impl App {
             remover: None,
             confirm_remove: None,
             pending_remove: None,
+            cleanup_row: 0,
+            clock: Box::new(|| chrono::Utc::now().timestamp_millis()),
         }
     }
 
@@ -376,7 +409,7 @@ impl App {
 
     fn toggle_view(&mut self) {
         self.view = match self.view {
-            View::Conversations => {
+            View::Conversations | View::Cleanup => {
                 // Fresh on every visit, as Git's state changes without anything `ccm` watches.
                 self.worktrees.refresh_soon();
                 View::Worktrees
@@ -385,7 +418,64 @@ impl App {
         };
     }
 
+    fn toggle_cleanup(&mut self) {
+        if self.view == View::Cleanup {
+            self.view = View::Conversations;
+            return;
+        }
+        self.view = View::Cleanup;
+    }
+
+    /// What a clean-up line holds.
+    pub fn tally(&self, line: Cleanup) -> Tally {
+        match line {
+            Cleanup::Conversations(suggestion) => {
+                let rows = suggestion.select(&self.sessions, self.config.limits((self.clock)()));
+                Tally { count: rows.len(), bytes: rows.iter().map(|&i| self.sessions[i].size_bytes).sum() }
+            }
+        }
+    }
+
+    /// The suggestion the list is showing, when its filters are exactly one's.
+    pub fn shown_suggestion(&self) -> Option<Suggestion> {
+        Suggestion::ALL.into_iter().find(|s| self.filters == s.filters())
+    }
+
+    fn open_suggestion(&mut self) {
+        let Some(&line) = Cleanup::ALL.get(self.cleanup_row) else { return };
+        match line {
+            Cleanup::Conversations(suggestion) => {
+                self.view = View::Conversations;
+                self.filters = suggestion.filters();
+                self.query.clear();
+                self.typing = false;
+                self.run_search();
+                self.select_row(self.nearest_item(0));
+            }
+        }
+    }
+
+    fn on_cleanup_key(&mut self, key: KeyCode) {
+        let last = Cleanup::ALL.len() - 1;
+        match key {
+            KeyCode::Up | KeyCode::Char('k') => self.cleanup_row = self.cleanup_row.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.cleanup_row = (self.cleanup_row + 1).min(last),
+            KeyCode::Home | KeyCode::PageUp => self.cleanup_row = 0,
+            KeyCode::End | KeyCode::PageDown => self.cleanup_row = last,
+            KeyCode::Enter => self.run(Action::OpenSuggestion),
+            KeyCode::Char('C') | KeyCode::Esc => self.run(Action::Cleanup),
+            KeyCode::Char('w') => self.run(Action::Worktrees),
+            KeyCode::Char('q') => self.run(Action::Quit),
+            _ => {}
+        }
+    }
+
+
     fn on_worktree_key(&mut self, key: KeyCode) {
+        if key == KeyCode::Char('C') {
+            return self.run(Action::Cleanup);
+        }
+
         let page = self.hit.body.height.max(1) as isize;
         let w = &mut self.worktrees;
         match key {
@@ -411,6 +501,7 @@ impl App {
             View::Conversations => self.can_change() || !self.marked_shown().is_empty(),
             View::Worktrees if self.confirm_remove.as_ref().is_some_and(|c| c.seconds_left().is_some()) => false,
             View::Worktrees => self.worktrees.selected().is_some() || !self.worktrees.marked_shown().is_empty(),
+            View::Cleanup => false,
         }
     }
 
@@ -513,8 +604,8 @@ impl App {
 
     /// Recomputes the rows and keeps the selection on the same conversation where possible.
     fn rebuild(&mut self) {
-        let large = self.config.large_threshold_bytes();
-        let mut order = select(&self.sessions, self.filters, large, self.sort, self.descending);
+        let limits = self.config.limits((self.clock)());
+        let mut order = select(&self.sessions, self.filters, limits, self.sort, self.descending);
         if let Some(matches) = &self.matches {
             order.retain(|&i| matches.contains(&self.sessions[i].id));
         }
@@ -1087,6 +1178,8 @@ impl App {
             Action::Mark => self.toggle_mark(),
             Action::MarkAll => self.mark_all(),
             Action::Worktrees => self.toggle_view(),
+            Action::Cleanup => self.toggle_cleanup(),
+            Action::OpenSuggestion => self.open_suggestion(),
             Action::Quit => self.quit = true,
         }
         self.rebuild();
@@ -1173,6 +1266,9 @@ impl App {
         if self.view == View::Worktrees {
             return self.on_worktree_key(key);
         }
+        if self.view == View::Cleanup {
+            return self.on_cleanup_key(key);
+        }
         if self.typing {
             return self.on_search_key(key);
         }
@@ -1211,6 +1307,7 @@ impl App {
             KeyCode::Char('s') => self.run(Action::NextSort),
             KeyCode::Char('r') => self.run(Action::ReverseSort),
             KeyCode::Char('w') => self.run(Action::Worktrees),
+            KeyCode::Char('C') => self.run(Action::Cleanup),
             KeyCode::Esc => self.status = Some("Press q to quit.".into()),
             KeyCode::Char('q') => self.run(Action::Quit),
             _ => {}
@@ -1218,13 +1315,26 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, kind: MouseEventKind, x: u16, y: u16) {
-        let waiting = self.confirm_delete.is_some() || self.confirm_remove.is_some() || self.renaming.is_some() || self.report.is_some() || self.reopen.is_some();
+        let waiting = self.confirm_delete.is_some()
+            || self.confirm_remove.is_some()
+            || self.renaming.is_some()
+            || self.report.is_some()
+            || self.reopen.is_some();
         if waiting && !matches!(kind, MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
             match kind {
                 MouseEventKind::ScrollUp if self.reopen.is_some() => self.on_reopen_key(KeyCode::Up),
                 MouseEventKind::ScrollDown if self.reopen.is_some() => self.on_reopen_key(KeyCode::Down),
                 MouseEventKind::ScrollUp => self.dialog_scroll = self.dialog_scroll.saturating_sub(3),
                 MouseEventKind::ScrollDown => self.dialog_scroll = self.dialog_scroll.saturating_add(3),
+                _ => {}
+            }
+            return;
+        }
+        if self.view == View::Cleanup {
+            match kind {
+                MouseEventKind::ScrollUp => self.on_cleanup_key(KeyCode::Up),
+                MouseEventKind::ScrollDown => self.on_cleanup_key(KeyCode::Down),
+                MouseEventKind::Down(crossterm::event::MouseButton::Left) => self.click(x, y),
                 _ => {}
             }
             return;
@@ -1297,6 +1407,18 @@ impl App {
         if let Some((_, action)) = self.hit.buttons.iter().find(|(r, _)| inside(r)) {
             let action = *action;
             self.run(action);
+        } else if self.view == View::Cleanup {
+            if inside(&self.hit.body) {
+                let row = (y - self.hit.body.y) as usize;
+                if row < Cleanup::ALL.len() {
+                    let double = self.cleanup_row == row && self.last_click.is_some_and(|(r, t)| r == row && t.elapsed() < DOUBLE_CLICK);
+                    self.cleanup_row = row;
+                    self.last_click = if double { None } else { Some((row, Instant::now())) };
+                    if double {
+                        self.run(Action::OpenSuggestion);
+                    }
+                }
+            }
         } else if self.view == View::Worktrees {
             if inside(&self.hit.body) {
                 let row = self.worktrees.table.offset() + (y - self.hit.body.y) as usize;

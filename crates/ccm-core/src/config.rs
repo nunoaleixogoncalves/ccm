@@ -3,11 +3,15 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::query::Limits;
+
 /// `~/.config/ccm/config.toml`. Every field is optional.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub large_threshold_mb: u64,
+    /// A conversation not active for this many days counts as old.
+    pub old_after_days: u64,
     /// Context window by model ID. Entries here add to or replace the defaults.
     pub windows: HashMap<String, u64>,
     /// Command that opens a terminal and runs what follows it, such as `["foot", "-e"]`.
@@ -17,7 +21,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { large_threshold_mb: 100, windows: default_windows(), terminal: None }
+        Self { large_threshold_mb: 100, old_after_days: 30, windows: default_windows(), terminal: None }
     }
 }
 
@@ -52,6 +56,12 @@ impl Config {
     pub fn large_threshold_bytes(&self) -> u64 {
         self.large_threshold_mb.saturating_mul(1024 * 1024)
     }
+
+    /// What counts as large and old, as of `now_ms`.
+    pub fn limits(&self, now_ms: i64) -> Limits {
+        let days = i64::try_from(self.old_after_days).unwrap_or(i64::MAX);
+        Limits { large_bytes: self.large_threshold_bytes(), old_before_ms: now_ms.saturating_sub(days.saturating_mul(24 * 60 * 60 * 1000)) }
+    }
 }
 
 #[cfg(test)]
@@ -60,9 +70,11 @@ mod tests {
 
     #[test]
     fn file_values_extend_the_defaults() {
-        let c = Config::parse("large_threshold_mb = 5\n[windows]\nclaude-opus-4-8 = 200000\n").unwrap();
+        let c = Config::parse("large_threshold_mb = 5\nold_after_days = 2\n[windows]\nclaude-opus-4-8 = 200000\n").unwrap();
         assert_eq!(c.large_threshold_bytes(), 5 * 1024 * 1024);
         assert_eq!(c.windows["claude-opus-4-8"], 200_000);
+        assert_eq!(c.limits(10 * 86_400_000).old_before_ms, 8 * 86_400_000);
+        assert_eq!(Config::default().old_after_days, 30);
         assert_eq!(c.windows["claude-opus-5-5"], 1_000_000);
     }
 

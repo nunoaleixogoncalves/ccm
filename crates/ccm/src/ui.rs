@@ -17,6 +17,7 @@ use std::path::Path;
 
 use crate::app::{Action, App, Grouping, View};
 
+mod cleanup;
 mod worktrees;
 
 const COLUMN_SPACING: u16 = 1;
@@ -33,7 +34,7 @@ const BAR_DANGER: Color = Color::Indexed(203);
 const BAR_GROUP: Color = Color::Indexed(109);
 /// Where a group's buttons start, so wrapped ones stay under their group.
 const FOOTER_INDENT: u16 = 9;
-const MAX_FOOTER_ROWS: u16 = 4;
+const MAX_FOOTER_ROWS: u16 = 5;
 const MIN_HEIGHT_FOR_PREVIEW: u16 = 18;
 
 struct Column {
@@ -59,6 +60,9 @@ const COLUMNS: [Column; 9] = [
 pub fn draw(f: &mut Frame, app: &mut App, now_ms: i64) {
     if app.view == View::Worktrees {
         return worktrees::draw(f, app, now_ms);
+    }
+    if app.view == View::Cleanup {
+        return cleanup::draw(f, app);
     }
     let bar = if app.typing || !app.query.is_empty() { 1 } else { 0 };
     let preview_height = if f.area().height >= MIN_HEIGHT_FOR_PREVIEW { Constraint::Fill(1) } else { Constraint::Length(0) };
@@ -240,6 +244,11 @@ fn summary_line(app: &App) -> Line<'static> {
     let mut text = format!(" ccm  {} conversations  {} on disk  {} open", app.sessions.len(), bytes(total), open);
     if app.filters.any() || app.is_searching() {
         text.push_str(&format!("  showing {shown}"));
+    }
+    if let Some(suggestion) = app.shown_suggestion() {
+        let label = cleanup::label(app, crate::app::Cleanup::Conversations(suggestion));
+        let label = label.trim_start_matches("Conversations ");
+        text.push_str(&format!("  clean-up: {label}"));
     }
     let marked = app.marked_shown();
     let crashed = app.sessions.iter().filter(|s| s.crashed).count();
@@ -586,7 +595,13 @@ fn footer_groups(app: &App) -> [(&'static str, Vec<Button>); 2] {
             ("a", "All", Action::MarkAll, false),
             ("q", "Quit", Action::Quit, false),
         ];
-        return [("Actions", actions), ("View", vec![("w", "Conversations", Action::Worktrees, false)])];
+        let view = vec![("w", "Conversations", Action::Worktrees, false), ("Shift+C", "Clean up", Action::Cleanup, false)];
+        return [("Actions", actions), ("View", view)];
+    }
+    if app.view == View::Cleanup {
+        let actions = vec![("Enter", "Open", Action::OpenSuggestion, false), ("q", "Quit", Action::Quit, false)];
+        let view = vec![("Esc", "Conversations", Action::Cleanup, false), ("w", "Worktrees", Action::Worktrees, false)];
+        return [("Actions", actions), ("View", view)];
     }
     [
         (
@@ -618,6 +633,7 @@ fn footer_groups(app: &App) -> [(&'static str, Vec<Button>); 2] {
                 ("s", "Sort", Action::NextSort, false),
                 ("r", "Reverse", Action::ReverseSort, false),
                 ("w", "Worktrees", Action::Worktrees, false),
+                ("Shift+C", "Clean up", Action::Cleanup, false),
             ],
         ),
     ]
