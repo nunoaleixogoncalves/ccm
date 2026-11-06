@@ -24,6 +24,7 @@ use crate::model::{FolderVisit, Session, Source};
 use crate::paths::is_uuid;
 use crate::preview::{self, Preview};
 use crate::recovery;
+use crate::rename::MAX_NAME;
 use crate::transcript::label;
 
 pub struct Codex {
@@ -562,6 +563,76 @@ fn remove_history_lines(history: &Path, ids: &[&str]) -> std::io::Result<()> {
     file.unlock()
 }
 
+/// How long to wait for Codex's lock on its name index.
+const INDEX_LOCK_WAIT: Duration = Duration::from_secs(3);
+
+/// Renames a conversation the way Codex's `/rename` does: one more line in
+/// `session_index.jsonl`, written while holding `session_index.jsonl.lock`, where the newest
+/// line wins. Returns the name as saved.
+pub fn rename(home: &Path, id: &str, transcript: &Path, name: &str) -> Result<String, String> {
+    let name: String = sanitize(name).trim().chars().take(MAX_NAME).collect();
+    if name.is_empty() {
+        return Err("The name is empty.".into());
+    }
+    if !is_uuid(id) || rollout_id(transcript) != Some(id) || !transcript.starts_with(Codex::sessions(home)) {
+        return Err("This conversation's path isn't valid.".into());
+    }
+    match probe_writer_locks(&home.join(WRITER_LOCKS)) {
+        Some((open, _)) if open.contains(id) => return Err("This conversation is open, so rename it from there with /rename.".into()),
+        Some(_) => {}
+        None => return Err("Codex is busy, so this conversation may be open. Try again in a moment.".into()),
+    }
+    // Codex's newer, opt-in history keeps names in its database, which `ccm` doesn't write.
+    if history_mode(transcript).as_deref() == Some("paginated") {
+        return Err("Codex keeps this conversation's name in its database, so rename it in Codex with /rename.".into());
+    }
+    append_name(home, id, &name).map_err(|e| format!("Couldn't rename it: {e}"))?;
+    Ok(name)
+}
+
+fn history_mode(transcript: &Path) -> Option<String> {
+    let mut first = String::new();
+    BufReader::new(fs::File::open(transcript).ok()?).take(1 << 20).read_line(&mut first).ok()?;
+    let line: Line = serde_json::from_str(&first).ok()?;
+    (line.kind == "session_meta").then(|| text(&line.payload["history_mode"])).flatten()
+}
+
+fn append_name(home: &Path, id: &str, name: &str) -> std::io::Result<()> {
+    // Codex keeps this file in place and creates it the same way, so a lock is never on a
+    // replaced file.
+    let lock = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(home.join("session_index.jsonl.lock"))?;
+    let started = Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < INDEX_LOCK_WAIT => std::thread::sleep(Duration::from_millis(50)),
+            Err(fs::TryLockError::WouldBlock) => return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "Codex kept its name index locked")),
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    let index = home.join("session_index.jsonl");
+    if fs::symlink_metadata(&index).is_ok_and(|m| !m.is_file()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "session_index.jsonl isn't a regular file"));
+    }
+    let updated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+    let mut line = serde_json::to_string(&serde_json::json!({ "id": id, "thread_name": name, "updated_at": updated_at }))?;
+    line.push('\n');
+    let mut file = fs::OpenOptions::new().create(true).append(true).read(true).open(&index)?;
+    let len = file.metadata()?.len();
+    if len > 0 {
+        let mut last = [0u8; 1];
+        file.seek(SeekFrom::Start(len - 1))?;
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            line.insert(0, '\n');
+        }
+    }
+    // One write on an append-only handle, so a line from Codex can't land inside it.
+    file.write_all(line.as_bytes())?;
+    file.sync_all()?;
+    lock.unlock()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,5 +935,63 @@ mod tests {
         coordination.unlock().unwrap();
         assert!(codex.live().open.is_empty());
         assert_eq!(codex.live().crashed.len(), 1);
+    }
+
+    #[test]
+    fn rename_adds_a_line_codex_reads_as_the_newest_name() {
+        let h = Home::new();
+        let path = h.put("2026/11/05", &file(ID), &rollout(r#""cli""#));
+        let index = h.dir.path().join("session_index.jsonl");
+        fs::write(&index, format!("{{\"id\":\"{ID}\",\"thread_name\":\"old\",\"updated_at\":\"2026-01-01T00:00:00Z\"}}")).unwrap();
+        assert_eq!(rename(h.dir.path(), ID, &path, "  parser \u{1b}[31mfix  ").unwrap(), "parser fix");
+        let text = fs::read_to_string(&index).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "a missing newline is added first: {text}");
+        let last: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(last["id"], ID);
+        assert_eq!(last["thread_name"], "parser fix");
+        assert!(last["updated_at"].as_str().unwrap().ends_with('Z'));
+        assert!(h.dir.path().join("session_index.jsonl.lock").is_file());
+        assert_eq!(h.read_all()[0].name, "parser fix");
+    }
+
+    #[test]
+    fn rename_is_refused_while_open_busy_paginated_or_for_a_wrong_path() {
+        let h = Home::new();
+        let path = h.put("2026/11/05", &file(ID), &rollout(r#""cli""#));
+        let home = h.dir.path();
+        assert_eq!(rename(home, ID, &path, "  ").unwrap_err(), "The name is empty.");
+        assert_eq!(rename(home, BUSY, &path, "x").unwrap_err(), "This conversation's path isn't valid.");
+        assert_eq!(rename(home, ID, Path::new("/elsewhere").join(file(ID)).as_path(), "x").unwrap_err(), "This conversation's path isn't valid.");
+
+        let locks = home.join(WRITER_LOCKS);
+        let coordination = lock_file(&locks, ".coordination.lock");
+        let running = lock_file(&locks, &format!("{ID}.lock"));
+        running.lock().unwrap();
+        assert!(rename(home, ID, &path, "x").unwrap_err().contains("is open"));
+        drop(running);
+        coordination.lock().unwrap();
+        assert!(rename(home, ID, &path, "x").unwrap_err().contains("Codex is busy"));
+        coordination.unlock().unwrap();
+
+        let paged = rollout(r#""cli""#).replacen(r#""model_provider":"openai""#, r#""model_provider":"openai","history_mode":"paginated""#, 1);
+        fs::write(&path, paged).unwrap();
+        assert!(rename(home, ID, &path, "x").unwrap_err().contains("in Codex with /rename"));
+        assert!(!home.join("session_index.jsonl").exists());
+    }
+
+    #[test]
+    fn rename_waits_for_codex_to_let_go_of_the_index_lock() {
+        let h = Home::new();
+        let path = h.put("2026/11/05", &file(ID), &rollout(r#""cli""#));
+        let held = lock_file(h.dir.path(), "session_index.jsonl.lock");
+        held.lock().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            held.unlock().unwrap();
+        });
+        rename(h.dir.path(), ID, &path, "later").unwrap();
+        releaser.join().unwrap();
+        assert_eq!(h.read_all()[0].name, "later");
     }
 }

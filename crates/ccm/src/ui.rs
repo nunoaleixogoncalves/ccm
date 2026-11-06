@@ -2135,7 +2135,7 @@ mod tests {
     fn renameable(a: &mut App) -> Renames {
         let calls: Renames = Rc::default();
         let log = calls.clone();
-        a.renamer = Some(Box::new(move |id, _, name| {
+        a.renamer = Some(Box::new(move |id, _, _, name| {
             log.borrow_mut().push((id.to_string(), name.to_string()));
             Ok(name.trim().to_string())
         }));
@@ -2203,7 +2203,7 @@ mod tests {
     #[test]
     fn a_failed_rename_is_reported() {
         let mut a = app();
-        a.renamer = Some(Box::new(|_, _, _| Err("The name is empty.".into())));
+        a.renamer = Some(Box::new(|_, _, _, _| Err("The name is empty.".into())));
         select_named(&mut a, "Old model");
         a.on_key(KeyCode::Char('R'));
         a.on_key(KeyCode::Enter);
@@ -2608,7 +2608,7 @@ mod tests {
     type Launched = (String, Source, bool, PathBuf);
 
     #[test]
-    fn codex_conversations_resume_fork_and_delete_through_codex_and_rename_says_it_cant_yet() {
+    fn codex_conversations_resume_fork_rename_and_delete_through_their_tool() {
         let mut a = with_codex();
         let calls: Rc<RefCell<Vec<Launched>>> = Rc::default();
         let seen = calls.clone();
@@ -2618,12 +2618,20 @@ mod tests {
         }));
         select_named(&mut a, "Codex chat");
         let id = a.selected().unwrap().id.clone();
-        assert!(a.can_resume() && a.can_fork() && a.can_press_delete());
-        assert!(!a.can_rename());
+        assert!(a.can_resume() && a.can_fork() && a.can_press_delete() && a.can_rename());
 
+        let renames: Rc<RefCell<Vec<(String, Source, String)>>> = Rc::default();
+        let log = renames.clone();
+        a.renamer = Some(Box::new(move |id, source, _, name| {
+            log.borrow_mut().push((id.to_string(), source, name.to_string()));
+            Ok(name.to_string())
+        }));
         a.on_key(KeyCode::Char('R'));
-        assert_eq!(a.status.as_deref(), Some("ccm can't rename Codex conversations yet."));
-        assert!(a.renaming.is_none());
+        a.on_key(KeyCode::Char('!'));
+        a.on_key(KeyCode::Enter);
+        assert_eq!(*renames.borrow(), [(id.clone(), Source::Codex, "Codex chat!".to_string())]);
+        assert_eq!(a.status.as_deref(), Some("Renamed to Codex chat!."));
+        select_named(&mut a, "Codex chat!");
 
         a.on_key(KeyCode::Enter);
         a.on_key(KeyCode::Char('f'));
