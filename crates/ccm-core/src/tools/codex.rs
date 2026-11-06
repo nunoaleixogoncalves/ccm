@@ -5,15 +5,19 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use chrono::DateTime;
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::{Found, Live, Tool};
+use crate::delete::{Failure, Item, Outcome, Plan, Skipped};
+use crate::format::sanitize;
 use crate::index::SearchDoc;
 use crate::model::{FolderVisit, Session, Source};
 use crate::paths::is_uuid;
@@ -104,6 +108,7 @@ impl Tool for Codex {
             lines_removed: None,
             pr_url: None,
             continued_in: None,
+            forked_from: p.forked_from,
             recaps: Vec::new(),
             bad_lines: p.bad_lines,
             open: false,
@@ -181,6 +186,7 @@ fn read_names(path: &Path) -> HashMap<String, (String, i64)> {
 #[derive(Debug, Default)]
 struct Parsed {
     interactive: bool,
+    forked_from: Option<String>,
     folder: Option<String>,
     folders: Vec<FolderVisit>,
     branch: Option<String>,
@@ -236,6 +242,7 @@ fn parse<R: BufRead>(mut reader: R) -> std::io::Result<Parsed> {
                 p.interactive = is_interactive(&payload["source"]);
                 p.started_at_ms = payload["timestamp"].as_str().and_then(parse_ns).map(|ns| ns / 1_000_000).or(at);
                 p.branch = text(&payload["git"]["branch"]);
+                p.forked_from = text(&payload["forked_from_id"]).filter(|id| is_uuid(id));
                 if let Some(cwd) = text(&payload["cwd"]) {
                     visit(&mut p, &cwd, &mut records, at);
                 }
@@ -345,6 +352,150 @@ pub fn preview(path: &Path) -> std::io::Result<Preview> {
     })
 }
 
+/// How long `codex delete` gets before `ccm` gives up on it.
+const DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long to wait for Codex's lock on its prompt history.
+const HISTORY_LOCK_WAIT: Duration = Duration::from_secs(3);
+
+/// What deleting these Codex conversations would remove. Codex's own `codex delete` does the
+/// work, because it also clears the records Codex keeps in its databases. Without it, nothing
+/// can be deleted.
+pub fn plan_delete(sessions: &[&Session], program: Option<&Path>) -> Plan {
+    let mut plan = Plan::default();
+    for s in sessions {
+        let reason = if program.is_none() {
+            Some("the codex command isn't installed, and ccm deletes Codex conversations only through it")
+        } else if s.open {
+            Some("it's open")
+        } else if !is_uuid(&s.id) {
+            Some("its ID isn't valid")
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => plan.skipped.push(Skipped { id: s.id.clone(), reason: reason.into() }),
+            None => plan.items.push(Item {
+                id: s.id.clone(),
+                source: Source::Codex,
+                side: Vec::new(),
+                transcripts: vec![PathBuf::from(&s.transcript_path)],
+                bytes: s.size_bytes,
+            }),
+        }
+    }
+    if !plan.items.is_empty() {
+        plan.warnings.push("Codex conversations are deleted with codex delete, which also clears Codex's own records of them, and their prompts are taken out of Codex's history.".into());
+    }
+    plan
+}
+
+/// Deletes each conversation with `codex delete --force`, then removes its prompts from Codex's
+/// prompt history, which that command leaves. Codex refuses a conversation that's running or
+/// that a fork still uses, and its reason is reported.
+pub fn delete(program: &Path, home: &Path, items: &[&Item]) -> Outcome {
+    let mut outcome = Outcome::default();
+    for item in items {
+        if !is_uuid(&item.id) {
+            outcome.skipped.push(Skipped { id: item.id.clone(), reason: "its ID isn't valid".into() });
+            continue;
+        }
+        match run_delete(program, home, &item.id) {
+            Ok(()) => outcome.deleted.push(item.id.clone()),
+            Err(reason) => outcome.skipped.push(Skipped { id: item.id.clone(), reason }),
+        }
+    }
+    if !outcome.deleted.is_empty() {
+        let history = home.join("history.jsonl");
+        let ids: Vec<&str> = outcome.deleted.iter().map(String::as_str).collect();
+        if let Err(e) = remove_history_lines(&history, &ids) {
+            outcome.failures.push(Failure { path: history, error: format!("its prompts stay in Codex's history: {e}") });
+        }
+    }
+    outcome
+}
+
+fn run_delete(program: &Path, home: &Path, id: &str) -> Result<(), String> {
+    let mut child = Command::new(program)
+        .args(["delete", "--force", id])
+        .env("CODEX_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("codex couldn't be started: {e}"))?;
+    // Read as it comes, so a chatty codex can't fill the pipe and stall.
+    let mut stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut said = String::new();
+        if let Some(err) = stderr.as_mut() {
+            let _ = err.take(64 * 1024).read_to_string(&mut said);
+        }
+        said
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() > DELETE_TIMEOUT => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("codex delete didn't finish in time".into());
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => return Err(format!("codex delete failed: {e}")),
+        }
+    };
+    let said = reader.join().unwrap_or_default();
+    if status.success() {
+        return Ok(());
+    }
+    let said = said.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or("").to_string();
+    Err(if said.is_empty() { format!("codex delete failed ({status})") } else { format!("codex said: {}", sanitize(&said)) })
+}
+
+/// Rewrites Codex's `history.jsonl` without these conversations' prompts. Codex appends to it
+/// and trims it in place under an exclusive lock on the file, so this holds the same lock and
+/// keeps the same file. Lines that can't be read stay as they are.
+fn remove_history_lines(history: &Path, ids: &[&str]) -> std::io::Result<()> {
+    #[derive(Deserialize)]
+    struct Entry {
+        session_id: Option<String>,
+    }
+    let mut file = match fs::OpenOptions::new().read(true).write(true).open(history) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < HISTORY_LOCK_WAIT => std::thread::sleep(Duration::from_millis(50)),
+            Err(fs::TryLockError::WouldBlock) => return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "Codex kept it locked")),
+            Err(fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let mut kept = Vec::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|b| *b == b'\n') {
+        let drop = serde_json::from_slice::<Entry>(line).ok().and_then(|e| e.session_id).is_some_and(|s| ids.contains(&s.as_str()));
+        if !drop {
+            kept.extend_from_slice(line);
+        }
+    }
+    if kept.len() != bytes.len() {
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&kept)?;
+        file.set_len(kept.len() as u64)?;
+        file.sync_all()?;
+    }
+    file.unlock()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,11 +590,12 @@ mod tests {
         let fork = "66666666-6666-4666-8666-666666666666";
         let own = rollout(r#""cli""#).replace(ID, fork).replace("/home/dev/proj", "/home/dev/fork");
         let parent = rollout(r#""exec""#);
-        let first = own.lines().next().unwrap();
+        let first = own.lines().next().unwrap().replace(r#""id":"66666666"#, &format!(r#""forked_from_id":"{ID}","id":"66666666"#));
         h.put("2026/11/06", &file(fork), &format!("{first}\n{parent}"));
         let s = &h.read_all()[0];
         assert_eq!(s.id, fork);
         assert_eq!(s.folder.as_deref(), Some("/home/dev/fork"));
+        assert_eq!(s.forked_from.as_deref(), Some(ID));
     }
 
     #[test]
@@ -515,5 +667,85 @@ mod tests {
                 Turn { role: Role::Agent, text: "Fixed the off-by-one in parse_header.".into(), tool_calls: 1 },
             ]
         );
+    }
+
+    /// A stand-in for `codex` that logs how it was called, and refuses one ID the way Codex
+    /// refuses a running conversation.
+    fn fake_codex(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("codex");
+        let script = format!(
+            "#!/bin/sh\necho \"$CODEX_HOME $*\" >> '{}/calls'\nif [ \"$3\" = '{BUSY}' ]; then echo 'warning: noise' >&2; echo 'Error: thread {BUSY} is in use by another process' >&2; exit 1; fi\n",
+            dir.display()
+        );
+        fs::write(&p, script).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    const BUSY: &str = "88888888-8888-4888-8888-888888888888";
+
+    fn item(id: &str) -> Item {
+        Item { id: id.into(), source: Source::Codex, side: vec![], transcripts: vec![], bytes: 10 }
+    }
+
+    #[test]
+    fn delete_runs_codex_delete_and_removes_only_those_prompts_from_its_history() {
+        let h = Home::new();
+        let bin = tempfile::tempdir().unwrap();
+        let codex = fake_codex(bin.path());
+        let history = h.dir.path().join("history.jsonl");
+        let line = |id: &str, text: &str| format!("{{\"session_id\":\"{id}\",\"ts\":1,\"text\":\"{text}\"}}\n");
+        let other = "99999999-9999-4999-8999-999999999999";
+        fs::write(&history, [line(ID, "gone"), line(other, "kept"), "{broken\n".into(), line(BUSY, "busy stays"), line(ID, "gone too")].concat()).unwrap();
+
+        let (ok, busy, bad) = (item(ID), item(BUSY), item("../../etc"));
+        let outcome = delete(&codex, h.dir.path(), &[&ok, &busy, &bad]);
+        assert_eq!(outcome.deleted, [ID]);
+        assert_eq!(outcome.skipped.len(), 2);
+        assert_eq!(outcome.skipped[0].reason, format!("codex said: Error: thread {BUSY} is in use by another process"));
+        assert_eq!(outcome.skipped[1].reason, "its ID isn't valid");
+        assert!(outcome.failures.is_empty());
+
+        let calls = fs::read_to_string(bin.path().join("calls")).unwrap();
+        let home = h.dir.path().display();
+        assert_eq!(calls, format!("{home} delete --force {ID}\n{home} delete --force {BUSY}\n"));
+        assert_eq!(fs::read_to_string(&history).unwrap(), [line(other, "kept"), "{broken\n".into(), line(BUSY, "busy stays")].concat());
+    }
+
+    #[test]
+    fn the_history_waits_for_codex_to_let_go_of_its_lock() {
+        let h = Home::new();
+        let history = h.dir.path().join("history.jsonl");
+        fs::write(&history, format!("{{\"session_id\":\"{ID}\",\"text\":\"x\"}}\n")).unwrap();
+        let held = fs::File::open(&history).unwrap();
+        held.lock().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            held.unlock().unwrap();
+        });
+        remove_history_lines(&history, &[ID]).unwrap();
+        releaser.join().unwrap();
+        assert_eq!(fs::read_to_string(&history).unwrap(), "");
+        assert!(remove_history_lines(&h.dir.path().join("none.jsonl"), &[ID]).is_ok());
+    }
+
+    #[test]
+    fn nothing_is_planned_without_the_codex_command_or_while_open() {
+        let h = Home::new();
+        h.put("2026/11/05", &file(ID), &rollout(r#""cli""#));
+        let mut s = h.read_all().remove(0);
+        let with = |s: &Session, program: Option<&Path>| {
+            let plan = plan_delete(&[s], program);
+            (plan.items.len(), plan.skipped.first().map(|k| k.reason.clone()))
+        };
+        assert_eq!(with(&s, None), (0, Some("the codex command isn't installed, and ccm deletes Codex conversations only through it".into())));
+        let (count, _) = with(&s, Some(Path::new("/usr/bin/codex")));
+        assert_eq!(count, 1);
+        let plan = plan_delete(&[&s], Some(Path::new("/usr/bin/codex")));
+        assert_eq!(plan.items[0].source, Source::Codex);
+        assert_eq!(plan.items[0].transcripts, [PathBuf::from(&s.transcript_path)]);
+        s.open = true;
+        assert_eq!(with(&s, Some(Path::new("/usr/bin/codex"))), (0, Some("it's open".into())));
     }
 }

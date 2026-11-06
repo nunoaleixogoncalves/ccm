@@ -117,6 +117,7 @@ fn read_session(f: &Found) -> Option<(Session, SearchDoc)> {
         lines_removed: p.lines_removed,
         pr_url: p.pr_url,
         continued_in: p.continued_in,
+        forked_from: None,
         recaps: p.recaps,
         bad_lines: p.bad_lines,
         open: false,

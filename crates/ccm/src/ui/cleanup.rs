@@ -262,6 +262,7 @@ mod tests {
             lines_removed: None,
             pr_url: None,
             continued_in: None,
+            forked_from: None,
             recaps: Vec::new(),
             bad_lines: 0,
             open: false,
@@ -541,14 +542,14 @@ mod tests {
     fn deletable(a: &mut App) -> Deletes {
         use ccm_core::delete::{Item, Outcome, Plan, Skipped};
         let sessions = a.sessions.clone();
-        a.planner = Some(Box::new(move |ids| {
+        a.planner = Some(Box::new(move |targets: &[Session]| {
             let mut plan = Plan::default();
-            for id in ids {
+            for id in targets.iter().map(|s| &s.id) {
                 let s = sessions.iter().find(|s| s.id == *id).unwrap();
                 if s.open {
                     plan.skipped.push(Skipped { id: id.clone(), reason: "it's open".into() });
                 } else {
-                    plan.items.push(Item { id: id.clone(), side: vec![], transcripts: vec![], bytes: s.size_bytes });
+                    plan.items.push(Item { id: id.clone(), source: Source::ClaudeCode, side: vec![], transcripts: vec![], bytes: s.size_bytes });
                 }
             }
             plan

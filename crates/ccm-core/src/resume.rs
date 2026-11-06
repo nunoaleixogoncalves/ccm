@@ -13,7 +13,7 @@ use serde::Deserialize;
 
 use crate::format::{hides_text, sanitize};
 use crate::rename::MAX_NAME;
-use crate::model::Session;
+use crate::model::{Session, Source};
 use crate::paths::is_uuid;
 
 /// Claude Code's own session variables. A resumed session must not think it's a child of the
@@ -125,6 +125,31 @@ pub fn claude_args(id: &str, fork: Option<&Fork>) -> Vec<String> {
         args.extend(["--fork-session".into(), "--session-id".into(), f.id.clone(), format!("--name={}", f.name)]);
     }
     args
+}
+
+/// The command that resumes or forks a conversation of any tool. Codex picks a fork's ID
+/// itself, so only Claude Code uses the one in `fork`. `-C` makes Codex use the folder without
+/// asking, even when the conversation last worked elsewhere.
+pub fn tool_args(source: Source, id: &str, fork: Option<&Fork>, folder: &Path) -> Vec<String> {
+    match source {
+        Source::ClaudeCode => claude_args(id, fork),
+        Source::Codex => {
+            let verb = if fork.is_some() { "fork" } else { "resume" };
+            vec!["codex".into(), verb.into(), "-C".into(), folder.display().to_string(), id.into()]
+        }
+    }
+}
+
+/// Like `manual_command`, for any tool.
+pub fn manual_command_for(source: Source, id: &str, fork: Option<&Fork>, folder: &Path) -> String {
+    match source {
+        Source::ClaudeCode => manual_command(id, fork, folder),
+        Source::Codex => {
+            let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+            let verb = if fork.is_some() { "fork" } else { "resume" };
+            format!("cd {} && codex {verb} {id}", quote(&folder.display().to_string()))
+        }
+    }
 }
 
 /// Opens a new terminal window, using `command` from the config if it's set. `claude` comes from
@@ -386,6 +411,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn codex_resumes_and_forks_in_the_folder_given_without_asking() {
+        let folder = Path::new("/w/my proj");
+        let id = "019a5a1e-7c3b-7d21-9f4e-2b6c1d8e0a11";
+        assert_eq!(tool_args(Source::Codex, id, None, folder), ["codex", "resume", "-C", "/w/my proj", id]);
+        let fork = Fork { id: "ignored".into(), name: "x".into() };
+        assert_eq!(tool_args(Source::Codex, id, Some(&fork), folder), ["codex", "fork", "-C", "/w/my proj", id]);
+        assert_eq!(tool_args(Source::ClaudeCode, id, None, folder), claude_args(id, None));
+        assert_eq!(manual_command_for(Source::Codex, id, None, Path::new("/w/it's")), format!("cd '/w/it'\\''s' && codex resume {id}"));
+        assert_eq!(manual_command_for(Source::Codex, id, Some(&fork), folder), format!("cd '/w/my proj' && codex fork {id}"));
+    }
+
+    #[test]
     fn folders_that_hide_what_they_are_are_not_safe() {
         assert!(is_safe_folder("/work/two  spaces/olá 日本"));
         for bad in ["relative", "/a/../b", "/x\u{1b}]/tmp/evil", "/tmp/evil\nx", "/x\u{3}y", "/a\u{202e}b", "/a\u{200b}b"] {
@@ -420,6 +457,7 @@ mod tests {
             lines_removed: None,
             pr_url: None,
             continued_in: None,
+            forked_from: None,
             recaps: Vec::new(),
             bad_lines: 0,
             open: false,

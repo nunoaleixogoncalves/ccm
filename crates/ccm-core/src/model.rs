@@ -42,6 +42,9 @@ pub struct Session {
     pub lines_removed: Option<u64>,
     pub pr_url: Option<String>,
     pub continued_in: Option<String>,
+    /// The conversation this one is a fork of, for tools that record it.
+    #[serde(default)]
+    pub forked_from: Option<String>,
     /// Recaps saved by Claude Code, newest first.
     #[serde(default)]
     pub recaps: Vec<String>,

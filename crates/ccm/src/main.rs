@@ -14,9 +14,9 @@ use anyhow::{anyhow, Context, Result};
 use ccm_core::catalog::Catalog;
 use ccm_core::config::ToolName;
 use ccm_core::model::Source;
-use ccm_core::tools::{self, codex::Codex};
+use ccm_core::tools::{self, codex::{self, Codex}};
 use ccm_core::config::Config;
-use ccm_core::delete::{self, Failure, Outcome, Plan};
+use ccm_core::delete::{self, Failure, Outcome, Plan, Skipped};
 use ccm_core::index::{Index, Searcher};
 use ccm_core::jobs;
 use ccm_core::model::Session;
@@ -139,18 +139,20 @@ fn browse(paths: Paths) -> Result<()> {
     let claude_json = paths.claude_json.clone();
     let launch_log = paths.state.join("launch.log");
     let fork_paths = paths.clone();
-    app.resume = Some(Box::new(move |id, fork, folder| {
-        if let Some(fork) = fork {
+    app.resume = Some(Box::new(move |id, source, fork, folder| {
+        // Codex records the original in the fork itself.
+        if let (Some(fork), Source::ClaudeCode) = (fork, source) {
             forks::record(&fork_paths, &fork.id, id, now_ms()).map_err(|e| format!("Couldn't note the fork, so it wasn't started: {e}"))?;
         }
-        resume_conversation(id, fork, folder, terminal_command.as_deref(), &claude_json, &launch_log)
+        resume_conversation(id, source, fork, folder, terminal_command.as_deref(), &claude_json, &launch_log)
     }));
     app.forks = forks::load(&paths);
     app.search = Some(Box::new(move |q| searcher.search(q).map_err(|e| e.to_string())));
     let plan_paths = paths.clone();
-    app.planner = Some(Box::new(move |ids| delete::plan(&plan_paths, Path::new(PROC), ids)));
+    app.planner = Some(Box::new(move |sessions| plan_delete(&plan_paths, sessions)));
     let delete_paths = paths.clone();
-    app.deleter = Some(Box::new(move |plan, notes| delete_conversations(&delete_paths, plan, notes)));
+    let delete_codex_home = codex_home.clone();
+    app.deleter = Some(Box::new(move |plan, notes| delete_conversations(&delete_paths, &delete_codex_home, plan, notes)));
     let rename_paths = paths.clone();
     app.renamer = Some(Box::new(move |id, transcript, name| rename::rename(&rename_paths, Path::new(PROC), id, transcript, name)));
     app.copier = Some(Box::new(clipboard::copy));
@@ -176,9 +178,41 @@ fn browse(paths: Paths) -> Result<()> {
     result
 }
 
+/// Each tool's conversations are planned by that tool's code.
+fn plan_delete(paths: &Paths, sessions: &[Session]) -> Plan {
+    let (codex, claude): (Vec<&Session>, Vec<&Session>) = sessions.iter().partition(|s| s.source == Source::Codex);
+    let ids: Vec<String> = claude.iter().map(|s| s.id.clone()).collect();
+    let mut plan = if ids.is_empty() { Plan::default() } else { delete::plan(paths, Path::new(PROC), &ids) };
+    if !codex.is_empty() {
+        let program = codex_program();
+        let more = codex::plan_delete(&codex, program.as_deref());
+        plan.items.extend(more.items);
+        plan.skipped.extend(more.skipped);
+        plan.warnings.extend(more.warnings);
+    }
+    plan
+}
+
+fn codex_program() -> Option<PathBuf> {
+    resume::find_program("codex", &std::env::var("PATH").unwrap_or_default())
+}
+
 /// Also removes them from the search index, whose copy of their words would otherwise linger.
-fn delete_conversations(paths: &Paths, plan: &Plan, notes: bool) -> Result<Outcome, String> {
-    let mut outcome = delete::execute(paths, Path::new(PROC), plan, notes)?;
+fn delete_conversations(paths: &Paths, codex_home: &Path, plan: &Plan, notes: bool) -> Result<Outcome, String> {
+    let codex: Vec<&delete::Item> = plan.items.iter().filter(|i| i.source == Source::Codex).collect();
+    let mut outcome = if codex.len() == plan.items.len() { Outcome::default() } else { delete::execute(paths, Path::new(PROC), plan, notes)? };
+    if !codex.is_empty() {
+        let done = match codex_program() {
+            Some(program) => codex::delete(&program, codex_home, &codex),
+            None => Outcome {
+                skipped: codex.iter().map(|i| Skipped { id: i.id.clone(), reason: "the codex command isn't installed".into() }).collect(),
+                ..Outcome::default()
+            },
+        };
+        outcome.deleted.extend(done.deleted);
+        outcome.skipped.extend(done.skipped);
+        outcome.failures.extend(done.failures);
+    }
     if !outcome.deleted.is_empty() {
         let forgotten = Index::open(&paths.index).and_then(|mut index| index.forget(&outcome.deleted));
         if let Err(e) = forgotten {
@@ -191,6 +225,7 @@ fn delete_conversations(paths: &Paths, plan: &Plan, notes: bool) -> Result<Outco
 /// Opens the conversation in `herdr-app` when running inside it, otherwise in a new terminal.
 fn resume_conversation(
     id: &str,
+    source: Source,
     fork: Option<&Fork>,
     folder: &Path,
     terminal: Option<&[String]>,
@@ -198,7 +233,7 @@ fn resume_conversation(
     log: &Path,
 ) -> Result<String, String> {
     let var = |v: &str| std::env::var(v).ok();
-    let claude = resume::claude_args(id, fork);
+    let claude = resume::tool_args(source, id, fork, folder);
     let (launch, place) = if resume::in_herdr(var) {
         herdr_plan(&claude, folder)?
     } else if let Some(launch) = terminal.is_none().then(|| wsl_plan(&claude, folder)).flatten() {
@@ -212,11 +247,11 @@ fn resume_conversation(
         } else {
             e.to_string()
         };
-        return Err(format!("Couldn't start it ({why}). Run: {}", resume::manual_command(id, fork, folder)));
+        return Err(format!("Couldn't start it ({why}). Run: {}", resume::manual_command_for(source, id, fork, folder)));
     }
     // Claude Code asks this itself, in the new terminal. Only the user may answer it.
-    let warning = match resume::is_trusted(claude_json, folder) {
-        Some(false) => " Claude Code will ask you to trust this folder there first.",
+    let warning = match (source, resume::is_trusted(claude_json, folder)) {
+        (Source::ClaudeCode, Some(false)) => " Claude Code will ask you to trust this folder there first.",
         _ => "",
     };
     Ok(format!("Opened in {place}.{warning}"))
@@ -227,10 +262,11 @@ fn wsl_plan(claude: &[String], folder: &Path) -> Option<Launch> {
     let distro = resume::wsl_distro(|v| std::env::var(v).ok())?;
     let path = std::env::var("PATH").unwrap_or_default();
     resume::find_program("wt.exe", &path)?;
-    let claude_path = resume::find_program("claude", &path).map_or_else(|| "claude".to_string(), |p| p.display().to_string());
+    let name = claude.first().map_or("claude", String::as_str);
+    let claude_path = resume::find_program(name, &path).map_or_else(|| name.to_string(), |p| p.display().to_string());
     // The one setting that decides which conversations exist, so the resumed one is found.
-    let env: Vec<(String, String)> =
-        std::env::var("CLAUDE_CONFIG_DIR").ok().filter(|v| !v.is_empty()).map(|v| ("CLAUDE_CONFIG_DIR".to_string(), v)).into_iter().collect();
+    let var = if name == "codex" { "CODEX_HOME" } else { "CLAUDE_CONFIG_DIR" };
+    let env: Vec<(String, String)> = std::env::var(var).ok().filter(|v| !v.is_empty()).map(|v| (var.to_string(), v)).into_iter().collect();
     Some(resume::wsl_launch(claude, folder, &distro, &claude_path, &env))
 }
 

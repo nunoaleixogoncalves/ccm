@@ -898,6 +898,7 @@ mod tests {
             lines_removed: Some(2),
             pr_url: None,
             continued_in: None,
+            forked_from: None,
             recaps: Vec::new(),
             bad_lines: 0,
             open: false,
@@ -1601,7 +1602,7 @@ mod tests {
     fn resumable(a: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<(String, std::path::PathBuf)>>> {
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let seen = calls.clone();
-        a.resume = Some(Box::new(move |id, _, folder| {
+        a.resume = Some(Box::new(move |id, _, _, folder| {
             seen.borrow_mut().push((id.to_string(), folder.to_owned()));
             Ok("Opened in a new terminal.".to_string())
         }));
@@ -1626,7 +1627,7 @@ mod tests {
     fn forkable(a: &mut App) -> ForkCalls {
         let calls: ForkCalls = Rc::new(RefCell::new(Vec::new()));
         let seen = calls.clone();
-        a.resume = Some(Box::new(move |id, fork, folder| {
+        a.resume = Some(Box::new(move |id, _, fork, folder| {
             seen.borrow_mut().push((id.to_string(), fork.cloned(), folder.to_owned()));
             Ok("Opened in a new terminal.".to_string())
         }));
@@ -1718,7 +1719,7 @@ mod tests {
     #[test]
     fn a_failed_start_can_be_retried() {
         let mut a = resume_app("/work/a", true, false);
-        a.resume = Some(Box::new(|_, _, _| Err("no terminal".to_string())));
+        a.resume = Some(Box::new(|_, _, _, _| Err("no terminal".to_string())));
         a.on_key(KeyCode::Enter);
         assert_eq!(a.status.as_deref(), Some("no terminal"));
         assert!(a.can_resume());
@@ -1830,14 +1831,15 @@ mod tests {
     fn deletable(a: &mut App, notes: &[&str]) -> Deletes {
         let sessions = a.sessions.clone();
         let notes: Vec<Note> = notes.iter().map(|n| Note { path: format!("/m/{n}").into(), bytes: 1024 }).collect();
-        a.planner = Some(Box::new(move |ids| {
+        a.planner = Some(Box::new(move |targets: &[Session]| {
+            let ids: Vec<String> = targets.iter().map(|s| s.id.clone()).collect();
             let mut plan = Plan { notes: notes.clone(), ..Plan::default() };
-            for id in ids {
+            for id in &ids {
                 let s = sessions.iter().find(|s| s.id == *id).unwrap();
                 if s.open {
                     plan.skipped.push(Skipped { id: id.clone(), reason: "it's open".into() });
                 } else {
-                    plan.items.push(Item { id: id.clone(), side: vec![], transcripts: vec![], bytes: s.size_bytes });
+                    plan.items.push(Item { id: id.clone(), source: Source::ClaudeCode, side: vec![], transcripts: vec![], bytes: s.size_bytes });
                 }
             }
             if plan.items.is_empty() {
@@ -2513,7 +2515,7 @@ mod tests {
     #[test]
     fn one_failure_does_not_stop_the_others_and_is_reported() {
         let mut a = crashed_app();
-        a.resume = Some(Box::new(|id, _, _| if id == JUNK_ID { Err("no terminal".into()) } else { Ok("Opened.".into()) }));
+        a.resume = Some(Box::new(|id, _, _, _| if id == JUNK_ID { Err("no terminal".into()) } else { Ok("Opened.".into()) }));
         a.on_key(KeyCode::Char('O'));
         a.on_key(KeyCode::Enter);
         let screen = render(&mut a, 120, 30);
@@ -2602,45 +2604,60 @@ mod tests {
         assert_eq!(a.hit.buttons.len(), footer_groups(&a).iter().map(|(_, b)| b.len()).sum::<usize>(), "every button still fits at 80 columns");
     }
 
+    /// ID, tool, whether it's a fork, and folder.
+    type Launched = (String, Source, bool, PathBuf);
+
     #[test]
-    fn what_ccm_cant_do_with_codex_yet_is_greyed_out_and_says_so() {
+    fn codex_conversations_resume_fork_and_delete_through_codex_and_rename_says_it_cant_yet() {
         let mut a = with_codex();
-        let resumes = resumable(&mut a);
+        let calls: Rc<RefCell<Vec<Launched>>> = Rc::default();
+        let seen = calls.clone();
+        a.resume = Some(Box::new(move |id, source, fork, folder| {
+            seen.borrow_mut().push((id.to_string(), source, fork.is_some(), folder.to_owned()));
+            Ok("Opened in a new terminal.".to_string())
+        }));
+        select_named(&mut a, "Codex chat");
+        let id = a.selected().unwrap().id.clone();
+        assert!(a.can_resume() && a.can_fork() && a.can_press_delete());
+        assert!(!a.can_rename());
+
+        a.on_key(KeyCode::Char('R'));
+        assert_eq!(a.status.as_deref(), Some("ccm can't rename Codex conversations yet."));
+        assert!(a.renaming.is_none());
+
+        a.on_key(KeyCode::Enter);
+        a.on_key(KeyCode::Char('f'));
+        assert_eq!(
+            *calls.borrow(),
+            [(id.clone(), Source::Codex, false, PathBuf::from("/home/me/c")), (id.clone(), Source::Codex, true, PathBuf::from("/home/me/c"))]
+        );
+        assert_eq!(a.status.as_deref(), Some("Started a fork. Opened in a new terminal. It shows here once Codex saves it."));
+        assert!(a.forks.is_empty(), "Codex records the original in the fork, so ccm doesn't");
+
+        // A just-resumed conversation isn't deleted, so the delete starts afresh.
+        let mut a = with_codex();
         let deletes = deletable(&mut a, &[]);
         select_named(&mut a, "Codex chat");
-        assert!(!a.can_resume() && !a.can_fork() && !a.can_rename() && !a.can_press_delete());
-        for (key, message) in [
-            (KeyCode::Enter, "ccm can't resume Codex conversations yet."),
-            (KeyCode::Char('f'), "ccm can't fork Codex conversations yet."),
-            (KeyCode::Char('R'), "ccm can't rename Codex conversations yet."),
-            (KeyCode::Char('d'), "Can't delete: ccm can't delete Codex conversations yet."),
-        ] {
-            a.status = None;
-            a.on_key(key);
-            assert_eq!(a.status.as_deref(), Some(message));
-        }
-        assert!(a.renaming.is_none() && a.confirm_delete.is_none());
-        assert!(resumes.borrow().is_empty());
-
-        // Marked along with others, it's left out of the delete.
-        a.status = None;
-        a.on_key(KeyCode::Char('a'));
         a.on_key(KeyCode::Char('d'));
         a.on_key(KeyCode::Char('y'));
         a.perform_delete();
-        let deleted = &deletes.borrow()[0].0;
-        assert!(!deleted.is_empty());
-        assert!(!deleted.iter().any(|id| id.starts_with("019a")), "{deleted:?}");
+        assert_eq!(deletes.borrow()[0].0, [id]);
     }
 
     #[test]
-    fn codex_conversations_are_not_suggested_for_clean_up_since_they_cant_be_deleted_yet() {
+    fn a_codex_fork_names_its_original() {
         let mut a = with_codex();
         let mut sessions = a.sessions.clone();
-        sessions.iter_mut().find(|s| s.name == "Codex chat").unwrap().replies = 0;
+        let mut fork = sessions.iter().find(|s| s.name == "Codex chat").unwrap().clone();
+        fork.id = "019a5a1e-0000-7000-8000-000000000001".into();
+        fork.name = "Codex fork".into();
+        fork.forked_from = Some("019a5a1e-7c3b-7d21-9f4e-2b6c1d8e0a11".into());
+        sessions.push(fork);
         a.set_sessions(sessions);
-        let junk = a.tally(crate::app::Cleanup::Conversations(ccm_core::query::Suggestion::NoReply)).unwrap();
-        assert_eq!(junk.count, 1, "only the Claude Code one");
+        select_named(&mut a, "Codex fork");
+        assert!(render(&mut a, 140, 40).contains("Forked from Codex chat"));
+        select_named(&mut a, "Codex chat");
+        assert!(render(&mut a, 140, 40).contains("Forks: Codex fork"));
     }
 
     #[test]

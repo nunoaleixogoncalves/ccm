@@ -92,7 +92,7 @@ impl Source {
     pub fn features(self) -> Features {
         match self {
             Source::ClaudeCode => Features { resume: true, fork: true, delete: true, rename: true, recovery: true },
-            Source::Codex => Features { resume: false, fork: false, delete: false, rename: false, recovery: false },
+            Source::Codex => Features { resume: true, fork: true, delete: true, rename: false, recovery: false },
         }
     }
 }
