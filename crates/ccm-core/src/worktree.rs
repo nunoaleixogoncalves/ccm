@@ -276,16 +276,7 @@ pub fn scan(folders: &[String]) -> Scan {
         scan.errors.push("Git wasn't found, so worktrees can't be listed.".into());
         return scan;
     }
-    let mut folders: Vec<&str> = folders.iter().map(String::as_str).collect();
-    folders.sort_unstable();
-    folders.dedup();
-    let mut repos: Vec<PathBuf> =
-        folders.par_iter().filter(|f| Path::new(f).is_dir()).filter_map(|f| common_dir(Path::new(f))).collect();
-    repos.sort();
-    repos.dedup();
-
-    let lists: Vec<Option<Vec<Worktree>>> =
-        repos.par_iter().map(|r| git(r, &["worktree", "list", "--porcelain", "-z"]).ok().map(|out| parse_list(&out))).collect();
+    let lists = lists_of(folders);
     let failed = lists.iter().filter(|l| l.is_none()).count();
     if failed > 0 {
         let plural = if failed == 1 { "y" } else { "ies" };
@@ -294,6 +285,23 @@ pub fn scan(folders: &[String]) -> Scan {
     scan.worktrees = lists.into_iter().flatten().flatten().collect();
     scan.worktrees.par_iter_mut().filter(|w| w.is_linked() && !w.prunable && !w.from_windows()).for_each(|w| w.state = inspect(w));
     scan
+}
+
+/// Git's list of worktrees for each repository these folders are in. `None` when Git failed.
+fn lists_of(folders: &[String]) -> Vec<Option<Vec<Worktree>>> {
+    let mut folders: Vec<&str> = folders.iter().map(String::as_str).collect();
+    folders.sort_unstable();
+    folders.dedup();
+    let mut repos: Vec<PathBuf> =
+        folders.par_iter().filter(|f| Path::new(f).is_dir()).filter_map(|f| common_dir(Path::new(f))).collect();
+    repos.sort();
+    repos.dedup();
+    repos.par_iter().map(|r| git(r, &["worktree", "list", "--porcelain", "-z"]).ok().map(|out| parse_list(&out))).collect()
+}
+
+/// The worktrees of the repositories these folders are in, without looking inside each one.
+pub(crate) fn listed(folders: &[String]) -> Vec<Worktree> {
+    lists_of(folders).into_iter().flatten().flatten().collect()
 }
 
 /// The worktree a folder is in. With one worktree inside another, the deepest wins.

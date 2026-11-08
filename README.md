@@ -117,6 +117,7 @@ Actions:
 | `f` | Fork it. See [Forking](#forking) |
 | `d` or Del, then `y` or Del | Delete the selected or marked conversations. You can also click Delete twice. A second Del needs a moment's pause, so holding the key can't delete anything |
 | `m`, while confirming a delete | Choose whether to delete memory notes too. It only appears when there are notes to delete |
+| `w`, while confirming a delete | Choose whether to remove the worktrees only those conversations used. It only appears when there's one to remove. See [Removing a worktree with its conversation](#removing-a-worktree-with-its-conversation) |
 | `Shift+R` | Rename |
 | Space | Mark or unmark, then move to the next row |
 | `a` | Mark everything shown, or clear those marks |
@@ -211,6 +212,14 @@ Unpushed commits don't stop a removal, because the branch keeps them. They are o
 
 The popup lists the conversations that worked in each worktree. It also warns when a conversation started there, because resuming that conversation later recreates the folder empty. **Files Git ignores, such as `.env` or build output, are deleted with the worktree.** The popup lists them with their size, and if new ones appear after you confirm, that worktree is skipped.
 
+### Removing a worktree with its conversation
+
+When you delete a conversation from the list, the popup also shows the worktrees nothing else used, and `w` adds them to the delete. They're kept unless you press it.
+
+- A worktree is offered when a deleted conversation started there or was last working there, and no other conversation was ever there, even briefly. One the conversation only passed through stays, and shows on the [clean-up screen](#cleaning-up) once nothing is connected to it.
+- The rules above apply: the same refusals, the same check just before it goes, and the same warning and 5-second countdown for unpushed commits. A worktree that can't go is listed with the reason, and doesn't stop the delete.
+- The conversations go first. A worktree stays if one of its conversations couldn't be deleted.
+
 ## Codex
 
 `ccm` also lists [Codex](https://github.com/openai/codex) conversations, from `~/.codex/sessions`, or from `CODEX_HOME` if that's set. When both tools have conversations, a Tool column says which one each belongs to, and `t` shows one tool at a time.
@@ -289,6 +298,7 @@ It writes these files of its own:
 | **Removed** | The transcript and its folder of subagents and tool results, its file history, session environment, tasks, debug log and telemetry, its search index entry, and its finished background job's files |
 | **Edited** | `history.jsonl` loses that conversation's lines, using Claude Code's own lock. A pasted-content file goes only if nothing else uses it |
 | **Kept unless you press `m`** | Memory notes that only this conversation wrote |
+| **Kept unless you press `w`** | The [worktree](#removing-a-worktree-with-its-conversation) only this conversation used |
 | **Always kept** | Other conversations, including forks and continuations, plus memory notes edited by hand, `plans/`, the folder's trust setting, and a background job that may have a worktree, which `ccm` tells you to remove with `claude rm` |
 
 A Codex conversation is deleted by Codex itself. See [Codex](#codex).

@@ -287,9 +287,9 @@ pub(super) fn remove_dialog(app: &App) -> Dialog {
     if body.last().is_some_and(|(l, _): &(String, Style)| l.is_empty()) {
         body.pop();
     }
-    let bottom = match confirm.seconds_left() {
+    let bottom = match confirm.countdown.seconds_left() {
         Some(left) => {
-            let again = if confirm.restarted { "Too early, so it started over. " } else { "" };
+            let again = if confirm.countdown.restarted { "Too early, so it started over. " } else { "" };
             format!("{again}Remove unlocks in {left}s. Pressing y, Del or Remove before then starts it over.   Any other key cancels.")
         }
         None => "y or Del remove   any other key cancels   or click Remove again".into(),
@@ -642,6 +642,7 @@ mod tests {
                     unpushed: worktrees[at].state.map_or(0, |s| s.unpushed),
                     has_remote: true,
                     upstream_gone: t.path.ends_with("shop-merged"),
+                    bytes: 0,
                 });
             }
             plan
@@ -852,7 +853,7 @@ mod tests {
         render(&mut a, 140, 30);
         a.age_removal();
         a.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
-        assert!(a.confirm_remove.as_ref().is_some_and(|c| c.restarted) && !a.has_pending_delete());
+        assert!(a.confirm_remove.as_ref().is_some_and(|c| c.countdown.restarted) && !a.has_pending_delete());
         a.end_countdown();
         render(&mut a, 140, 30);
         a.on_mouse(MouseEventKind::Down(MouseButton::Left), x, y);
@@ -882,7 +883,7 @@ mod tests {
         a.on_key(KeyCode::Esc);
         select(&mut a, "shop-login");
         a.on_key(KeyCode::Char('d'));
-        assert!(a.confirm_remove.as_ref().unwrap().seconds_left().is_none());
+        assert!(a.confirm_remove.as_ref().unwrap().countdown.seconds_left().is_none());
         assert!(!render(&mut a, 140, 40).contains("Warning:"));
     }
 

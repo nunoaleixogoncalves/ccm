@@ -164,6 +164,8 @@ fn browse(paths: Paths) -> Result<()> {
     app.dismisser = Some(Box::new(move |ids| recovery::dismiss(&dismiss_paths, ids, now_ms()).map_err(|e| e.to_string())));
     let remove_plan_paths = paths.clone();
     app.remove_planner = Some(Box::new(move |targets, sessions| removal::plan(&remove_plan_paths, Path::new(PROC), targets, sessions)));
+    let offer_paths = paths.clone();
+    app.worktree_offer = Some(Box::new(move |ids, sessions| removal::offer(&offer_paths, Path::new(PROC), ids, sessions)));
     let remove_paths = paths.clone();
     app.remover = Some(Box::new(move |plan, sessions| removal::execute(&remove_paths, Path::new(PROC), plan, sessions)));
     let jobs_paths = paths.clone();
