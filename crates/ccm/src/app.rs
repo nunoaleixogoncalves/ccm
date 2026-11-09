@@ -21,6 +21,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 
 use crate::repos::{RepoRequest, Repos};
+use crate::wording::{delete_report, removal_report};
 use crate::worktrees::{folders_of, Worktrees};
 
 /// An action reachable from both a key and a footer button.
@@ -217,8 +218,14 @@ pub struct Countdown {
 }
 
 impl Countdown {
-    fn new(locked: bool) -> Self {
+    pub(crate) fn new(locked: bool) -> Self {
         Self { unlocks: locked.then(|| Instant::now() + UNPUSHED_COUNTDOWN), restarted: false }
+    }
+
+    /// Lets a test act as if it has run out.
+    #[cfg(test)]
+    pub(crate) fn run_out(&mut self) {
+        self.unlocks = self.unlocks.map(|_| Instant::now());
     }
 
     /// Whole seconds left before confirming works, or `None` once it does.
@@ -227,7 +234,7 @@ impl Countdown {
         (!left.is_zero()).then(|| left.as_millis().div_ceil(1000) as u64)
     }
 
-    fn restart(&mut self) {
+    pub(crate) fn restart(&mut self) {
         if self.unlocks.is_some() {
             self.unlocks = Some(Instant::now() + UNPUSHED_COUNTDOWN);
             self.restarted = true;
@@ -824,26 +831,13 @@ impl App {
 
     /// Removes the worktrees of a plan and says what happened.
     fn run_removal(&mut self, plan: &removal::Plan) -> (String, Vec<String>) {
-        let path = |p: &std::path::Path| sanitize(&p.display().to_string());
-        let refused = plan.refused.iter().map(|s| format!("Skipped {}: {}", path(&s.path), sanitize(&s.reason)));
         if plan.items.is_empty() {
-            return (String::new(), refused.collect());
+            return removal_report(plan, &removal::Outcome::default());
         }
         let Some(remover) = self.remover.as_mut() else { return (String::new(), Vec::new()) };
         let outcome = remover(plan, &self.sessions);
-        let count = outcome.removed.len();
-        let summary = match count {
-            1 => "Removed 1 worktree. Its branch is kept.".to_string(),
-            n => format!("Removed {n} worktrees. Their branches are kept."),
-        };
-        let mut lines = Vec::new();
-        for f in &outcome.failures {
-            lines.push(format!("Not removed {}: {}", path(&f.path), sanitize(&f.reason)));
-        }
-        lines.extend(refused);
-        lines.extend(outcome.skipped.iter().map(|s| format!("Skipped {}: {}", path(&s.path), sanitize(&s.reason))));
         self.worktrees.forget(&outcome.removed, &self.sessions);
-        (summary, lines)
+        removal_report(plan, &outcome)
     }
 
     /// Lets a test act as if the pause before a second Del has passed.
@@ -1158,20 +1152,7 @@ impl App {
 
     /// Updates the list after a delete, and says what happened.
     fn finish_delete(&mut self, plan: &Plan, include_notes: bool, outcome: &Outcome) -> (String, Vec<String>) {
-        let freed: u64 = plan.items.iter().filter(|i| outcome.deleted.contains(&i.id)).map(|i| i.bytes).sum();
-        let freed = freed + if include_notes { plan.note_bytes() } else { 0 };
-        let count = outcome.deleted.len();
-        let summary = format!("Deleted {count} conversation{}, freed {}.", if count == 1 { "" } else { "s" }, bytes(freed));
-
-        let mut lines = Vec::new();
-        for f in &outcome.failures {
-            lines.push(format!("Not removed: {} ({})", sanitize(&f.path.display().to_string()), sanitize(&f.error)));
-        }
-        for s in plan.skipped.iter().chain(&outcome.skipped) {
-            lines.push(format!("Skipped {}: {}", self.name_of(&s.id), s.reason));
-        }
-        lines.extend(plan.warnings.iter().map(|w| sanitize(w)));
-
+        let (summary, lines) = delete_report(plan, include_notes, outcome, |id| self.name_of(id));
         self.sessions.retain(|s| !outcome.deleted.contains(&s.id));
         self.marked.retain(|id| !outcome.deleted.contains(id));
         self.run_search();

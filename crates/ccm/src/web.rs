@@ -2,11 +2,12 @@
 //! the server is kept private. The page is built into the program, so nothing else is installed.
 
 mod actions;
+mod deletion;
 mod guard;
 mod list;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
@@ -17,6 +18,7 @@ use ccm_core::forks;
 use ccm_core::index::Searcher;
 use ccm_core::model::{Session, Source};
 use ccm_core::paths::Paths;
+use ccm_core::removal;
 use ccm_core::resume;
 use serde_json::{json, Value};
 use std::io::Read;
@@ -31,8 +33,8 @@ const SCRIPT: &str = include_str!("web/page/app.js");
 const STYLE: &str = include_str!("web/page/style.css");
 const ICON: &str = include_str!("web/page/icon.svg");
 
-/// Far more than any request needs. A name is the longest thing sent.
-const MAX_BODY: u64 = 64 * 1024;
+/// Room for marking every conversation there could be, which is the longest thing sent.
+const MAX_BODY: u64 = 4 * 1024 * 1024;
 
 /// Previews and Git run while other requests wait, so one slow answer doesn't hold up the page.
 const WORKERS: usize = 4;
@@ -89,6 +91,8 @@ pub(crate) struct State {
     effects: actions::Effects,
     /// What was just started, shared by every tab.
     starting: Mutex<actions::Starting>,
+    /// The delete waiting for an answer. Only one, so a tab's stale popup can't act.
+    pending_delete: Mutex<Option<deletion::Pending>>,
 }
 
 // A panic in one request must not take the page down for the others.
@@ -188,8 +192,25 @@ pub fn serve(paths: Paths, options: Options) -> Result<()> {
             resume: Box::new(crate::resumer(&paths, terminal)),
             rename: Box::new(crate::renamer(&paths, &start.codex_home)),
             dismiss: Box::new(crate::dismisser(&paths)),
+            plan_delete: Box::new({
+                let paths = paths.clone();
+                move |sessions| crate::plan_delete(&paths, sessions)
+            }),
+            delete: Box::new({
+                let (paths, codex_home) = (paths.clone(), start.codex_home.clone());
+                move |plan, notes| crate::delete_conversations(&paths, &codex_home, plan, notes)
+            }),
+            offer: Box::new({
+                let paths = paths.clone();
+                move |ids, sessions| removal::offer(&paths, Path::new(crate::PROC), ids, sessions)
+            }),
+            remove: Box::new({
+                let paths = paths.clone();
+                move |plan, sessions| removal::execute(&paths, Path::new(crate::PROC), plan, sessions)
+            }),
         },
         starting: Mutex::default(),
+        pending_delete: Mutex::default(),
     });
 
     let updates = crate::spawn_refresher(start.catalog);
@@ -329,6 +350,10 @@ fn handle(state: &Arc<State>, guard: &Guard, method: &str, url: &str, headers: &
                 "/api/resume" => Reply::json(&actions::resume(state, &body)),
                 "/api/rename" => Reply::json(&actions::rename(state, &body)),
                 "/api/reopen" => Reply::json(&actions::reopen(state, &body)),
+                "/api/delete/plan" => Reply::json(&deletion::plan(state, &body)),
+                "/api/delete/worktrees" => Reply::json(&deletion::toggle_worktrees(state, &body)),
+                "/api/delete/confirm" => Reply::json(&deletion::confirm(state, &body)),
+                "/api/delete/cancel" => Reply::json(&deletion::cancel(state, &body)),
                 _ => Reply::text(404, "Not found"),
             };
         }
@@ -399,7 +424,7 @@ fn details_reply(state: &State, id: &str) -> Option<Value> {
 
 #[cfg(test)]
 impl State {
-    fn for_tests(root: &std::path::Path, sessions: Vec<Session>) -> Arc<Self> {
+    fn for_tests(root: &Path, sessions: Vec<Session>) -> Arc<Self> {
         let index = root.join("index.db");
         drop(ccm_core::index::Index::open(&index).unwrap());
         Arc::new(State {
@@ -416,8 +441,13 @@ impl State {
                 resume: Box::new(|_, _, _, _| Ok("Opened in a new terminal.".into())),
                 rename: Box::new(|_, _, _, name| Ok(name.to_string())),
                 dismiss: Box::new(|_| Ok(())),
+                plan_delete: Box::new(|_| ccm_core::delete::Plan::default()),
+                delete: Box::new(|_, _| Ok(ccm_core::delete::Outcome::default())),
+                offer: Box::new(|_, _| ccm_core::removal::Plan::default()),
+                remove: Box::new(|_, _| ccm_core::removal::Outcome::default()),
             },
             starting: Mutex::default(),
+            pending_delete: Mutex::default(),
         })
     }
 }

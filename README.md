@@ -242,7 +242,7 @@ Codex conversations can be resumed, forked and deleted, through Codex's own comm
 
 `ccm web` shows the same list in a browser: search, filters, sorting, grouping and the preview, with the same keys. It updates by itself, and can run alongside the terminal app.
 
-Resume and fork open a terminal on this computer, the same way the terminal app does. If that fails, the page gives you the command to copy. Rename, copying the ID or command, and reopening after a crash work as they do in the terminal, under the same rules. Deleting and the worktree and clean-up screens are still only in the terminal app.
+Resume and fork open a terminal on this computer, the same way the terminal app does. If that fails, the page gives you the command to copy. Rename, copying the ID or command, reopening after a crash and deleting work as they do in the terminal, under the same rules. The delete popup lists what goes and offers the same worktrees, and the wait for unpushed commits is enforced by `ccm` itself, not the page. The worktree and clean-up screens are still only in the terminal app.
 
 It opens your browser and prints a link, then runs until you press `Ctrl+C`.
 
