@@ -7,6 +7,8 @@ const AGES_MS = 30000;
 const SEARCH_WAIT_MS = 120;
 const DETAILS_WAIT_MS = 60;
 const PAGE_ROWS = 10;
+const FORK_WAIT_MS = 15 * 60 * 1000;
+const MAX_NAME = 200;
 const GROUPS = ["off", "folder", "repo"];
 const GROUP_LABELS = { off: "Group", folder: "Group: folder", repo: "Group: repo" };
 
@@ -35,6 +37,10 @@ let detailsRequest = 0;
 let detailsTimer = 0;
 let searchTimer = 0;
 let shownDetails = null;
+// What the detail pane shows, for the actions on it.
+let current = null;
+// A fork just started, to select once its tool saves it.
+let awaitingFork = null;
 
 function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
@@ -65,6 +71,34 @@ async function api(path) {
   }
   banner("");
   return response.json();
+}
+
+async function post(path, body) {
+  let response;
+  try {
+    response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  } catch {
+    banner("ccm web has stopped. Start it again to carry on.");
+    return null;
+  }
+  if (response.status === 401 || response.status === 403) {
+    banner(await response.text());
+    return null;
+  }
+  if (!response.ok) {
+    say(await response.text(), true);
+    return null;
+  }
+  return response.json();
+}
+
+// The latest outcome. It stays until the next one, as the terminal app's status line does.
+function say(text, bad = false, command = null) {
+  $("status").hidden = !text;
+  $("status").classList.toggle("bad", bad);
+  $("status-text").textContent = text || "";
+  $("status-copy").hidden = !command;
+  $("status-copy").dataset.command = command || "";
 }
 
 function address() {
@@ -193,6 +227,14 @@ function items() {
 
 function keepSelection() {
   const all = items();
+  if (awaitingFork) {
+    if (all.some((row) => row.id === awaitingFork.id)) {
+      selected = awaitingFork.id;
+      awaitingFork = null;
+    } else if (Date.now() > awaitingFork.until) {
+      awaitingFork = null;
+    }
+  }
   if (!all.some((row) => row.id === selected)) {
     const previous = selectedIndex;
     selected = all.length ? all[Math.min(previous, all.length - 1)].id : null;
@@ -248,7 +290,14 @@ function fact(list, label, value, className = "") {
   list.append(el("dt", { textContent: label }), el("dd", { textContent: value, className }));
 }
 
+function actionButton(label, key, action, enabled = true, main = false) {
+  const button = el("button", { type: "button", className: main ? "chip main" : "chip", disabled: !enabled }, label + " ", el("kbd", { textContent: key }));
+  button.addEventListener("click", action);
+  return button;
+}
+
 function drawDetails(data) {
+  current = data;
   const details = $("details");
   const preview = $("preview");
   if (!data) {
@@ -272,7 +321,13 @@ function drawDetails(data) {
   fact(facts, "Cost", data.cost);
   fact(facts, "Lines", data.lines);
   fact(facts, "PR", data.pr);
-  details.replaceChildren(el("h2", { textContent: data.name }), facts);
+  const actions = el("div", { className: "actions" },
+    actionButton("Resume", "Enter", () => resume(), data.can.resume, true),
+    actionButton("Fork", "f", () => resume(true), data.can.fork),
+    actionButton("Rename", "R", startRename, data.can.rename),
+    actionButton("Copy ID", "y", () => copy(data.id)),
+    actionButton("Copy command", "Y", () => copy(data.command)));
+  details.replaceChildren(el("h2", { textContent: data.name }), actions, facts);
   if (data.notes.length) {
     details.append(el("ul", { className: "notes" }, ...data.notes.map((note) => el("li", { textContent: note }))));
   }
@@ -295,6 +350,111 @@ function drawDetails(data) {
   preview.replaceChildren(...parts);
   // Starts at the newest message, and a refresh leaves the reader where they were.
   preview.scrollTop = preview.scrollHeight - (sameConversation ? fromBottom : 0);
+}
+
+async function copy(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    say(`Copied: ${text}`);
+  } catch {
+    say(`The browser wouldn't copy it, so here it is: ${text}`, true);
+  }
+}
+
+function openDialog(title, body, buttons, onSubmit) {
+  $("dialog-title").textContent = title;
+  $("dialog-body").replaceChildren(...body);
+  $("dialog-buttons").replaceChildren(...buttons);
+  dialogSubmit = onSubmit;
+  $("dialog").showModal();
+}
+
+function closeDialog() {
+  $("dialog").close();
+}
+
+function dialogButton(label, action, primary = false) {
+  const button = el("button", { type: primary ? "submit" : "button", className: primary ? "chip main" : "chip", textContent: label });
+  if (!primary) button.addEventListener("click", action);
+  return button;
+}
+
+function cancelButton() {
+  return dialogButton("Cancel", () => { closeDialog(); say("Cancelled."); });
+}
+
+let dialogSubmit = null;
+
+// Every check is made again on the server. Being told a folder is gone is the one question back.
+async function resume(fork = false, recreate = false, id = selected) {
+  if (id === null) return;
+  const result = await post("/api/resume", { id, fork, recreate });
+  if (!result) return;
+  if (result.ask_folder) {
+    askFolder(id, fork, result.ask_folder);
+    return;
+  }
+  say(result.message, !result.ok, result.command);
+  if (result.fork_id) awaitingFork = { id: result.fork_id, until: Date.now() + FORK_WAIT_MS };
+  loadList();
+}
+
+function askFolder(id, fork, folder) {
+  const doing = fork ? "fork" : "resume";
+  const cancel = cancelButton();
+  openDialog(
+    "This folder no longer exists",
+    [el("p", { className: "mono", textContent: folder }), el("p", { textContent: `Recreate it and ${doing}?` })],
+    [cancel, dialogButton(`Recreate and ${doing}`, null, true)],
+    () => { closeDialog(); resume(fork, true, id); },
+  );
+  cancel.focus();
+}
+
+function startRename() {
+  if (!current) return;
+  if (!current.can.rename) {
+    say("This conversation is open, so rename it from there with /rename.", true);
+    return;
+  }
+  const id = current.id;
+  const input = el("input", { type: "text", maxLength: MAX_NAME, value: current.name === "(untitled)" ? "" : current.name, spellcheck: false, ariaLabel: "New name" });
+  openDialog("Rename this conversation", [input], [cancelButton(), dialogButton("Save", null, true)], async () => {
+    closeDialog();
+    const result = await post("/api/rename", { id, name: input.value });
+    if (!result) return;
+    say(result.message, !result.ok);
+    loadList();
+  });
+  input.select();
+}
+
+async function startReopen() {
+  const data = await api("/api/reopen");
+  if (!data) return;
+  if (!data.rows.length) {
+    say(data.message);
+    return;
+  }
+  const lead = el("p");
+  const boxes = data.rows.map((row) => ({ id: row.id, box: el("input", { type: "checkbox", checked: !row.missing }) }));
+  const count = () => { lead.textContent = `${boxes.filter((b) => b.box.checked).length} of ${boxes.length} will be resumed. Unticked ones stop showing as crashed.`; };
+  boxes.forEach((b) => b.box.addEventListener("change", count));
+  count();
+  const list = el("ul", {}, ...data.rows.map((row, i) => {
+    const parts = [boxes[i].box, el("span", { textContent: row.name }), el("span", { className: "where", textContent: row.folder })];
+    if (row.missing) parts.push(el("span", { className: "warn", textContent: "folder missing, recreated if ticked" }));
+    return el("li", {}, el("label", {}, ...parts));
+  }));
+  openDialog("Reopen crashed conversations", [lead, list], [cancelButton(), dialogButton("Reopen", null, true)], async () => {
+    closeDialog();
+    const ticked = boxes.filter((b) => b.box.checked).map((b) => b.id);
+    const unticked = boxes.filter((b) => !b.box.checked).map((b) => b.id);
+    const result = await post("/api/reopen", { ticked, unticked });
+    if (!result) return;
+    openDialog("Reopen finished", result.lines.map((line) => el("p", { textContent: line })), [dialogButton("OK", null, true)], closeDialog);
+    loadList();
+  });
 }
 
 function sortBy(column) {
@@ -387,6 +547,12 @@ const KEYS = {
   l: () => toggleFilter("large"),
   t: nextTool,
   c: clearFilters,
+  Enter: () => resume(),
+  f: () => resume(true),
+  R: startRename,
+  y: () => { if (current) copy(current.id); },
+  Y: () => { if (current) copy(current.command); },
+  O: startReopen,
   g: nextGroup,
   s: nextSort,
   r: reverse,
@@ -394,6 +560,8 @@ const KEYS = {
 
 document.addEventListener("keydown", (event) => {
   if (event.ctrlKey || event.metaKey || event.altKey) return;
+  if ($("dialog").open) return;
+  if (event.key === "Enter" && event.target.closest("button")) return;
   if (event.target === $("search")) {
     onSearchKey(event);
     return;
@@ -410,6 +578,15 @@ $("rows").addEventListener("click", (event) => {
   const tr = event.target.closest("tr[data-id]");
   if (tr) select(tr.dataset.id);
 });
+$("rows").addEventListener("dblclick", (event) => {
+  const tr = event.target.closest("tr[data-id]");
+  if (tr) resume(false, false, tr.dataset.id);
+});
+$("dialog-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (dialogSubmit) dialogSubmit();
+});
+$("status-copy").addEventListener("click", () => copy($("status-copy").dataset.command));
 for (const chip of document.querySelectorAll("[data-filter]")) {
   chip.addEventListener("click", () => toggleFilter(chip.dataset.filter));
 }
@@ -417,6 +594,7 @@ $("tool").addEventListener("click", nextTool);
 $("group").addEventListener("click", nextGroup);
 $("reverse").addEventListener("click", reverse);
 $("clear").addEventListener("click", clearFilters);
+$("reopen").addEventListener("click", startReopen);
 
 async function poll() {
   if (document.hidden) return;

@@ -164,17 +164,7 @@ fn browse(paths: Paths) -> Result<()> {
     let mut app = App::new(config, looked_in, home());
     app.tools = tools;
     app.status = config_error;
-    let terminal_command = config_terminal.clone();
-    let claude_json = paths.claude_json.clone();
-    let launch_log = paths.state.join("launch.log");
-    let fork_paths = paths.clone();
-    app.resume = Some(Box::new(move |id, source, fork, folder| {
-        // Codex records the original in the fork itself.
-        if let (Some(fork), Source::ClaudeCode) = (fork, source) {
-            forks::record(&fork_paths, &fork.id, id, now_ms()).map_err(|e| format!("Couldn't note the fork, so it wasn't started: {e}"))?;
-        }
-        resume_conversation(id, source, fork, folder, terminal_command.as_deref(), &claude_json, &launch_log)
-    }));
+    app.resume = Some(Box::new(resumer(&paths, config_terminal)));
     app.forks = forks::load(&paths);
     app.search = Some(Box::new(move |q| searcher.search(q).map_err(|e| e.to_string())));
     let plan_paths = paths.clone();
@@ -182,15 +172,9 @@ fn browse(paths: Paths) -> Result<()> {
     let delete_paths = paths.clone();
     let delete_codex_home = codex_home.clone();
     app.deleter = Some(Box::new(move |plan, notes| delete_conversations(&delete_paths, &delete_codex_home, plan, notes)));
-    let rename_paths = paths.clone();
-    let rename_codex_home = codex_home.clone();
-    app.renamer = Some(Box::new(move |id, source, transcript, name| match source {
-        Source::ClaudeCode => rename::rename(&rename_paths, Path::new(PROC), id, transcript, name),
-        Source::Codex => codex::rename(&rename_codex_home, id, transcript, name),
-    }));
+    app.renamer = Some(Box::new(renamer(&paths, &codex_home)));
     app.copier = Some(Box::new(clipboard::copy));
-    let dismiss_paths = paths.clone();
-    app.dismisser = Some(Box::new(move |ids| recovery::dismiss(&dismiss_paths, ids, now_ms()).map_err(|e| e.to_string())));
+    app.dismisser = Some(Box::new(dismisser(&paths)));
     let remove_plan_paths = paths.clone();
     app.remove_planner = Some(Box::new(move |targets, sessions| removal::plan(&remove_plan_paths, Path::new(PROC), targets, sessions)));
     let offer_paths = paths.clone();
@@ -211,6 +195,32 @@ fn browse(paths: Paths) -> Result<()> {
     let _ = execute!(stdout(), DisableMouseCapture);
     ratatui::restore();
     result
+}
+
+/// Opens a conversation, or a fork of it, the way the configuration and the surroundings ask.
+fn resumer(paths: &Paths, terminal: Option<Vec<String>>) -> impl Fn(&str, Source, Option<&Fork>, &Path) -> Result<String, String> + Send + Sync + 'static {
+    let paths = paths.clone();
+    let log = paths.state.join("launch.log");
+    move |id, source, fork, folder| {
+        // Codex records the original in the fork itself.
+        if let (Some(fork), Source::ClaudeCode) = (fork, source) {
+            forks::record(&paths, &fork.id, id, now_ms()).map_err(|e| format!("Couldn't note the fork, so it wasn't started: {e}"))?;
+        }
+        resume_conversation(id, source, fork, folder, terminal.as_deref(), &paths.claude_json, &log)
+    }
+}
+
+fn renamer(paths: &Paths, codex_home: &Path) -> impl Fn(&str, Source, &Path, &str) -> Result<String, String> + Send + Sync + 'static {
+    let (paths, codex_home) = (paths.clone(), codex_home.to_path_buf());
+    move |id, source, transcript, name| match source {
+        Source::ClaudeCode => rename::rename(&paths, Path::new(PROC), id, transcript, name),
+        Source::Codex => codex::rename(&codex_home, id, transcript, name),
+    }
+}
+
+fn dismisser(paths: &Paths) -> impl Fn(&[String]) -> Result<(), String> + Send + Sync + 'static {
+    let paths = paths.clone();
+    move |ids| recovery::dismiss(&paths, ids, now_ms()).map_err(|e| e.to_string())
 }
 
 /// Each tool's conversations are planned by that tool's code.
