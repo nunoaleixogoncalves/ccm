@@ -8,6 +8,7 @@ use ccm_core::model::{Session, Source};
 use ccm_core::preview::{Preview, Role};
 use ccm_core::query::{group_by_folder, group_by_repo, repo_tag, select, status_text, Filters, Group, GroupRow, SortKey};
 use ccm_core::repo::Place;
+use ccm_core::resume::copy_command;
 use ccm_core::window::{context_label, window_size};
 use chrono::{Local, TimeZone};
 use serde_json::{json, Value};
@@ -237,6 +238,7 @@ pub fn details(s: &Session, sessions: &[Session], forks: &HashMap<String, String
     };
     json!({
         "id": s.id,
+        "command": copy_command(s),
         "name": name(s),
         "tool": s.source.label(),
         "folder": s.folder.as_deref().map_or("-".to_string(), sanitize),

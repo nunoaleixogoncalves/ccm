@@ -3,7 +3,8 @@
 //!
 //! - The `Host` must be this server's own address, which stops a website pointing its own name
 //!   at this computer to get around the browser's rules.
-//! - A request a website started is refused, going by `Origin` and `Sec-Fetch-Site`.
+//! - A request a website started is refused, going by `Origin` and `Sec-Fetch-Site`. One that
+//!   changes something must state its `Origin`, and be JSON, which no plain form can send.
 //! - It must carry the secret cookie, which comes from opening the link printed at the start.
 //!   The link works once, as it passes through other programs' command lines on the way to the
 //!   browser. The cookie doesn't, and page scripts can't read it.
@@ -19,6 +20,7 @@ pub struct Headers {
     pub origin: Option<String>,
     pub fetch_site: Option<String>,
     pub cookie: Option<String>,
+    pub content_type: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -77,7 +79,7 @@ impl Guard {
     }
 
     /// `token` is the one from the address, if any.
-    pub fn check(&self, headers: &Headers, path: &str, token: Option<&str>) -> Verdict {
+    pub fn check(&self, headers: &Headers, method: &str, path: &str, token: Option<&str>) -> Verdict {
         if headers.host.as_deref() != Some(self.host.as_str()) {
             return Verdict::Refuse(403, "Open ccm web using the link it printed.");
         }
@@ -86,6 +88,12 @@ impl Guard {
         }
         if headers.fetch_site.as_deref().is_some_and(|s| s != "same-origin" && s != "none") {
             return Verdict::Refuse(403, "Requests from other websites aren't accepted.");
+        }
+        if method != "GET" {
+            let json = headers.content_type.as_deref().is_some_and(|t| t.split(';').next().is_some_and(|m| m.trim().eq_ignore_ascii_case("application/json")));
+            if headers.origin.is_none() || !json {
+                return Verdict::Refuse(403, "Requests from other websites aren't accepted.");
+            }
         }
         let signed_in = self.has_session(headers);
         if path == "/"
@@ -125,7 +133,7 @@ mod tests {
     #[test]
     fn a_cookie_lets_a_request_through() {
         let (g, _) = guard();
-        assert_eq!(g.check(&signed_in(&g), "/api/list", None), Verdict::Pass);
+        assert_eq!(g.check(&signed_in(&g), "GET", "/api/list", None), Verdict::Pass);
     }
 
     #[test]
@@ -133,11 +141,11 @@ mod tests {
         let (g, _) = guard();
         let mut h = signed_in(&g);
         h.cookie = None;
-        assert!(matches!(g.check(&h, "/api/list", None), Verdict::Refuse(401, _)));
+        assert!(matches!(g.check(&h, "GET", "/api/list", None), Verdict::Refuse(401, _)));
         h.cookie = Some("ccm_4000=wrong".into());
-        assert!(matches!(g.check(&h, "/api/list", None), Verdict::Refuse(401, _)));
+        assert!(matches!(g.check(&h, "GET", "/api/list", None), Verdict::Refuse(401, _)));
         h.cookie = Some(cookie_pair(&g).replace("ccm_4000", "ccm_4001"));
-        assert!(matches!(g.check(&h, "/api/list", None), Verdict::Refuse(401, _)), "another server's cookie");
+        assert!(matches!(g.check(&h, "GET", "/api/list", None), Verdict::Refuse(401, _)), "another server's cookie");
     }
 
     #[test]
@@ -145,7 +153,7 @@ mod tests {
         let (g, _) = guard();
         let mut h = signed_in(&g);
         h.cookie = Some(format!("a=b; {}; c=d", cookie_pair(&g)));
-        assert_eq!(g.check(&h, "/", None), Verdict::Pass);
+        assert_eq!(g.check(&h, "GET", "/", None), Verdict::Pass);
     }
 
     #[test]
@@ -154,7 +162,7 @@ mod tests {
         for host in [Some("evil.example:4000"), Some("localhost:4000"), Some("127.0.0.1"), Some("127.0.0.1:4001"), None] {
             let mut h = signed_in(&g);
             h.host = host.map(str::to_string);
-            assert!(matches!(g.check(&h, "/api/list", None), Verdict::Refuse(403, _)), "{host:?}");
+            assert!(matches!(g.check(&h, "GET", "/api/list", None), Verdict::Refuse(403, _)), "{host:?}");
         }
     }
 
@@ -163,13 +171,13 @@ mod tests {
         let (g, _) = guard();
         let mut h = signed_in(&g);
         h.origin = Some("https://evil.example".into());
-        assert!(matches!(g.check(&h, "/api/list", None), Verdict::Refuse(403, _)));
+        assert!(matches!(g.check(&h, "GET", "/api/list", None), Verdict::Refuse(403, _)));
         h.origin = Some("null".into());
-        assert!(matches!(g.check(&h, "/api/list", None), Verdict::Refuse(403, _)), "a sandboxed frame");
+        assert!(matches!(g.check(&h, "GET", "/api/list", None), Verdict::Refuse(403, _)), "a sandboxed frame");
         let mut h = signed_in(&g);
         for site in ["cross-site", "same-site"] {
             h.fetch_site = Some(site.into());
-            assert!(matches!(g.check(&h, "/api/list", None), Verdict::Refuse(403, _)), "{site}");
+            assert!(matches!(g.check(&h, "GET", "/api/list", None), Verdict::Refuse(403, _)), "{site}");
         }
     }
 
@@ -179,40 +187,72 @@ mod tests {
         let mut h = signed_in(&g);
         h.origin = Some("http://127.0.0.1:4000".into());
         h.fetch_site = Some("same-origin".into());
-        assert_eq!(g.check(&h, "/api/list", None), Verdict::Pass);
+        assert_eq!(g.check(&h, "GET", "/api/list", None), Verdict::Pass);
         h.fetch_site = Some("none".into());
-        assert_eq!(g.check(&h, "/", None), Verdict::Pass);
+        assert_eq!(g.check(&h, "GET", "/", None), Verdict::Pass);
+    }
+
+    #[test]
+    fn a_change_needs_its_origin_stated_and_json() {
+        let (g, _) = guard();
+        let origin = || Some("http://127.0.0.1:4000".to_string());
+        let json = || Some("application/json".to_string());
+        let check = |origin: Option<String>, content_type: Option<String>| {
+            let h = Headers { origin, content_type, ..signed_in(&g) };
+            g.check(&h, "POST", "/api/rename", None)
+        };
+        assert_eq!(check(origin(), json()), Verdict::Pass);
+        assert_eq!(check(origin(), Some("Application/JSON; charset=utf-8".into())), Verdict::Pass);
+        assert!(matches!(check(None, json()), Verdict::Refuse(403, _)), "no origin");
+        assert!(matches!(check(origin(), None), Verdict::Refuse(403, _)), "no type");
+        for form in ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data"] {
+            assert!(matches!(check(origin(), Some(form.into())), Verdict::Refuse(403, _)), "{form}");
+        }
+    }
+
+    #[test]
+    fn a_change_from_another_website_is_refused() {
+        let (g, _) = guard();
+        let h = Headers { origin: Some("http://127.0.0.1:9999".into()), content_type: Some("application/json".into()), ..signed_in(&g) };
+        assert!(matches!(g.check(&h, "POST", "/api/rename", None), Verdict::Refuse(403, _)));
+    }
+
+    #[test]
+    fn a_change_without_the_cookie_is_refused() {
+        let (g, _) = guard();
+        let h = Headers { host: Some("127.0.0.1:4000".into()), origin: Some("http://127.0.0.1:4000".into()), content_type: Some("application/json".into()), ..Headers::default() };
+        assert!(matches!(g.check(&h, "POST", "/api/rename", None), Verdict::Refuse(401, _)));
     }
 
     #[test]
     fn the_link_works_once() {
         let (g, login) = guard();
         let h = Headers { host: Some("127.0.0.1:4000".into()), fetch_site: Some("none".into()), ..Headers::default() };
-        let Verdict::LoggedIn(cookie) = g.check(&h, "/", Some(&login)) else { panic!("should sign in") };
+        let Verdict::LoggedIn(cookie) = g.check(&h, "GET", "/", Some(&login)) else { panic!("should sign in") };
         assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict") && cookie.contains(&cookie_pair(&g)));
-        assert!(matches!(g.check(&h, "/", Some(&login)), Verdict::Refuse(401, _)));
+        assert!(matches!(g.check(&h, "GET", "/", Some(&login)), Verdict::Refuse(401, _)));
     }
 
     #[test]
     fn a_wrong_token_does_not_use_up_the_link() {
         let (g, login) = guard();
         let h = Headers { host: Some("127.0.0.1:4000".into()), ..Headers::default() };
-        assert!(matches!(g.check(&h, "/", Some("wrong")), Verdict::Refuse(401, _)));
-        assert!(matches!(g.check(&h, "/", Some(&login)), Verdict::LoggedIn(_)));
+        assert!(matches!(g.check(&h, "GET", "/", Some("wrong")), Verdict::Refuse(401, _)));
+        assert!(matches!(g.check(&h, "GET", "/", Some(&login)), Verdict::LoggedIn(_)));
     }
 
     #[test]
     fn the_link_only_works_on_the_home_page() {
         let (g, login) = guard();
         let h = Headers { host: Some("127.0.0.1:4000".into()), ..Headers::default() };
-        assert!(matches!(g.check(&h, "/api/list", Some(&login)), Verdict::Refuse(401, _)));
-        assert!(matches!(g.check(&h, "/", Some(&login)), Verdict::LoggedIn(_)));
+        assert!(matches!(g.check(&h, "GET", "/api/list", Some(&login)), Verdict::Refuse(401, _)));
+        assert!(matches!(g.check(&h, "GET", "/", Some(&login)), Verdict::LoggedIn(_)));
     }
 
     #[test]
     fn opening_the_link_again_in_the_same_browser_just_goes_home() {
         let (g, login) = guard();
-        assert_eq!(g.check(&signed_in(&g), "/", Some(&login)), Verdict::DropToken);
+        assert_eq!(g.check(&signed_in(&g), "GET", "/", Some(&login)), Verdict::DropToken);
     }
 
     #[test]

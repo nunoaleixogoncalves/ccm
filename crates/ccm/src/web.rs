@@ -1,6 +1,7 @@
 //! `ccm web`: the conversation list in a browser, for this computer only. See `guard` for how
 //! the server is kept private. The page is built into the program, so nothing else is installed.
 
+mod actions;
 mod guard;
 mod list;
 
@@ -18,6 +19,8 @@ use ccm_core::model::{Session, Source};
 use ccm_core::paths::Paths;
 use ccm_core::resume;
 use serde_json::{json, Value};
+use std::io::Read;
+
 use tiny_http::{Header, Response, Server};
 
 use crate::repos::{self, Repos};
@@ -27,6 +30,9 @@ const INDEX: &str = include_str!("web/page/index.html");
 const SCRIPT: &str = include_str!("web/page/app.js");
 const STYLE: &str = include_str!("web/page/style.css");
 const ICON: &str = include_str!("web/page/icon.svg");
+
+/// Far more than any request needs. A name is the longest thing sent.
+const MAX_BODY: u64 = 64 * 1024;
 
 /// Previews and Git run while other requests wait, so one slow answer doesn't hold up the page.
 const WORKERS: usize = 4;
@@ -80,6 +86,9 @@ pub(crate) struct State {
     looked_in: String,
     tools: Vec<Source>,
     index: PathBuf,
+    effects: actions::Effects,
+    /// What was just started, shared by every tab.
+    starting: Mutex<actions::Starting>,
 }
 
 // A panic in one request must not take the page down for the others.
@@ -157,6 +166,7 @@ pub fn serve(paths: Paths, options: Options) -> Result<()> {
     let port = server.server_addr().to_ip().map(|a| a.port()).ok_or_else(|| anyhow!("Couldn't tell which port it's on"))?;
     let (guard, login) = Guard::new(port)?;
 
+    let terminal = start.config.terminal.clone();
     let sessions = by_id(start.cached);
     let state = Arc::new(State {
         live: RwLock::new(Live {
@@ -174,6 +184,12 @@ pub fn serve(paths: Paths, options: Options) -> Result<()> {
         looked_in: start.looked_in,
         tools: start.tools,
         index: paths.index.clone(),
+        effects: actions::Effects {
+            resume: Box::new(crate::resumer(&paths, terminal)),
+            rename: Box::new(crate::renamer(&paths, &start.codex_home)),
+            dismiss: Box::new(crate::dismisser(&paths)),
+        },
+        starting: Mutex::default(),
     });
 
     let updates = crate::spawn_refresher(start.catalog);
@@ -262,11 +278,17 @@ impl Reply {
     }
 }
 
-fn answer(request: tiny_http::Request, state: &Arc<State>, guard: &Guard) {
+fn answer(mut request: tiny_http::Request, state: &Arc<State>, guard: &Guard) {
     let find = |name: &'static str| request.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string());
-    let headers = Headers { host: find("Host"), origin: find("Origin"), fetch_site: find("Sec-Fetch-Site"), cookie: find("Cookie") };
+    let headers = Headers { host: find("Host"), origin: find("Origin"), fetch_site: find("Sec-Fetch-Site"), cookie: find("Cookie"), content_type: find("Content-Type") };
     let method = request.method().as_str().to_string();
-    let reply = handle(state, guard, &method, request.url(), &headers);
+    let url = request.url().to_string();
+    let reader = request.as_reader();
+    let mut read_body = || {
+        let mut body = Vec::new();
+        reader.take(MAX_BODY + 1).read_to_end(&mut body).ok().filter(|_| body.len() as u64 <= MAX_BODY).map(|_| body)
+    };
+    let reply = handle(state, guard, &method, &url, &headers, &mut read_body);
     let mut response = Response::from_data(reply.body).with_status_code(reply.status);
     let mut add = |name: &str, value: &str| {
         if let Ok(header) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
@@ -288,17 +310,29 @@ fn answer(request: tiny_http::Request, state: &Arc<State>, guard: &Guard) {
     let _ = request.respond(response);
 }
 
-fn handle(state: &Arc<State>, guard: &Guard, method: &str, url: &str, headers: &Headers) -> Reply {
+/// `read_body` is only called once the request has passed the guard.
+fn handle(state: &Arc<State>, guard: &Guard, method: &str, url: &str, headers: &Headers, read_body: &mut dyn FnMut() -> Option<Vec<u8>>) -> Reply {
     let (path, query) = url.split_once('?').unwrap_or((url, ""));
     let params = list::params(query);
-    match guard.check(headers, path, params.get("token").map(String::as_str)) {
+    match guard.check(headers, method, path, params.get("token").map(String::as_str)) {
         Verdict::Refuse(status, message) => return Reply::text(status, message),
         Verdict::LoggedIn(cookie) => return Reply::home(Some(cookie)),
         Verdict::DropToken => return Reply::home(None),
         Verdict::Pass => {}
     }
-    if method != "GET" {
-        return Reply::text(405, "Method not allowed");
+    match method {
+        "GET" => {}
+        "POST" => {
+            let Some(body) = read_body() else { return Reply::text(413, "That request is too long.") };
+            let Ok(body) = serde_json::from_slice::<Value>(&body) else { return Reply::text(400, "That request isn't valid.") };
+            return match path {
+                "/api/resume" => Reply::json(&actions::resume(state, &body)),
+                "/api/rename" => Reply::json(&actions::rename(state, &body)),
+                "/api/reopen" => Reply::json(&actions::reopen(state, &body)),
+                _ => Reply::text(404, "Not found"),
+            };
+        }
+        _ => return Reply::text(405, "Method not allowed"),
     }
     match path {
         "/" => Reply::file("text/html; charset=utf-8", INDEX),
@@ -310,6 +344,7 @@ fn handle(state: &Arc<State>, guard: &Guard, method: &str, url: &str, headers: &
             Reply::json(&json!({ "version": live.version, "loading": live.loading }))
         }
         "/api/list" => Reply::json(&list_reply(state, &params)),
+        "/api/reopen" => Reply::json(&actions::reopen_list(state)),
         "/api/details" => match details_reply(state, params.get("id").map_or("", String::as_str)) {
             Some(value) => Reply::json(&value),
             None => Reply::text(404, "That conversation is gone."),
@@ -357,7 +392,9 @@ fn details_reply(state: &State, id: &str) -> Option<Value> {
         (Arc::clone(&live.sessions), Arc::clone(&live.forks))
     };
     let session = sessions.iter().find(|s| s.id == id)?;
-    Some(list::details(session, &sessions, &forks, ccm_core::tools::preview(session).map_err(|e| e.to_string())))
+    let mut details = list::details(session, &sessions, &forks, ccm_core::tools::preview(session).map_err(|e| e.to_string()));
+    details["can"] = actions::abilities(state, session);
+    Some(details)
 }
 
 #[cfg(test)]
@@ -375,25 +412,35 @@ impl State {
             looked_in: "/home/me/.claude".into(),
             tools: vec![Source::ClaudeCode],
             index,
+            effects: actions::Effects {
+                resume: Box::new(|_, _, _, _| Ok("Opened in a new terminal.".into())),
+                rename: Box::new(|_, _, _, name| Ok(name.to_string())),
+                dismiss: Box::new(|_| Ok(())),
+            },
+            starting: Mutex::default(),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpStream;
 
     use super::*;
     use guard::cookie_pair;
 
     #[test]
-    fn options() {
+    fn options_are_read() {
         assert_eq!(Options::parse(&[]), Some(Options { port: 0, open_browser: true }));
         assert_eq!(Options::parse(&["--port", "9000", "--no-browser"]), Some(Options { port: 9000, open_browser: false }));
         assert_eq!(Options::parse(&["--port"]), None);
         assert_eq!(Options::parse(&["--port", "many"]), None);
         assert_eq!(Options::parse(&["--bind", "0.0.0.0"]), None);
+    }
+
+    fn no_body() -> Option<Vec<u8>> {
+        None
     }
 
     fn exchange(port: u16, request: String) -> String {
@@ -442,13 +489,33 @@ mod tests {
     }
 
     #[test]
-    fn only_get_is_answered_for_now() {
+    fn only_get_and_post_are_answered() {
         let dir = tempfile::tempdir().unwrap();
         let state = State::for_tests(dir.path(), Vec::new());
         let (guard, _) = Guard::new(4000).unwrap();
-        let headers = Headers { host: Some("127.0.0.1:4000".into()), origin: None, fetch_site: None, cookie: Some(cookie_pair(&guard)) };
-        assert_eq!(handle(&state, &guard, "POST", "/api/list", &headers).status, 405);
-        assert_eq!(handle(&state, &guard, "DELETE", "/api/list", &headers).status, 405);
+        let headers = Headers { host: Some("127.0.0.1:4000".into()), origin: Some("http://127.0.0.1:4000".into()), fetch_site: None, cookie: Some(cookie_pair(&guard)), content_type: Some("application/json".into()) };
+        assert_eq!(handle(&state, &guard, "DELETE", "/api/list", &headers, &mut no_body).status, 405);
+        assert_eq!(handle(&state, &guard, "POST", "/api/list", &headers, &mut || Some(b"{}".to_vec())).status, 404);
+    }
+
+    #[test]
+    fn a_refused_change_never_reads_its_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::for_tests(dir.path(), Vec::new());
+        let (guard, _) = Guard::new(4000).unwrap();
+        let headers = Headers { host: Some("127.0.0.1:4000".into()), origin: Some("http://evil.example".into()), content_type: Some("application/json".into()), ..Headers::default() };
+        let mut read = || panic!("read before the guard");
+        assert_eq!(handle(&state, &guard, "POST", "/api/rename", &headers, &mut read).status, 403);
+    }
+
+    #[test]
+    fn a_body_that_is_too_long_or_not_json_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::for_tests(dir.path(), Vec::new());
+        let (guard, _) = Guard::new(4000).unwrap();
+        let headers = Headers { host: Some("127.0.0.1:4000".into()), origin: Some("http://127.0.0.1:4000".into()), fetch_site: None, cookie: Some(cookie_pair(&guard)), content_type: Some("application/json".into()) };
+        assert_eq!(handle(&state, &guard, "POST", "/api/rename", &headers, &mut || None).status, 413);
+        assert_eq!(handle(&state, &guard, "POST", "/api/rename", &headers, &mut || Some(b"not json".to_vec())).status, 400);
     }
 
     #[test]
@@ -456,9 +523,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = State::for_tests(dir.path(), Vec::new());
         let (guard, _) = Guard::new(4000).unwrap();
-        let headers = Headers { host: Some("127.0.0.1:4000".into()), origin: None, fetch_site: None, cookie: Some(cookie_pair(&guard)) };
-        assert_eq!(handle(&state, &guard, "GET", "/api/details?id=nope", &headers).status, 404);
-        assert_eq!(handle(&state, &guard, "GET", "/etc/passwd", &headers).status, 404);
+        let headers = Headers { host: Some("127.0.0.1:4000".into()), origin: None, fetch_site: None, cookie: Some(cookie_pair(&guard)), content_type: None };
+        assert_eq!(handle(&state, &guard, "GET", "/api/details?id=nope", &headers, &mut no_body).status, 404);
+        assert_eq!(handle(&state, &guard, "GET", "/etc/passwd", &headers, &mut no_body).status, 404);
     }
 
     #[test]

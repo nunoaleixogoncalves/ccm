@@ -29,9 +29,11 @@
       <button class="chip" id="tool" aria-pressed="false" hidden><span>Tool</span> <kbd>t</kbd></button>
       <button class="chip" id="group" aria-pressed="false"><span>Group</span> <kbd>g</kbd></button>
       <button class="chip" id="reverse">Reverse <kbd>r</kbd></button>
+      <button class="chip" id="reopen">Reopen <kbd>O</kbd></button>
       <button class="chip quiet" id="clear">Clear <kbd>c</kbd></button>
     </div>
   </nav>
+  <p id="status" class="status" role="status" hidden><span id="status-text"></span> <button id="status-copy" class="chip" hidden>Copy the command</button></p>
   <main class="panes">
     <section class="list" id="list" tabindex="0" aria-label="Conversations">
       <table>
@@ -45,5 +47,10 @@
       <div id="preview" class="preview" tabindex="0" aria-label="Latest messages"></div>
     </section>
   </main>
+  <dialog id="dialog" aria-labelledby="dialog-title"><form id="dialog-form" novalidate>
+    <h2 id="dialog-title"></h2>
+    <div id="dialog-body"></div>
+    <div id="dialog-buttons" class="buttons"></div>
+  </form></dialog>
 </body>
 </html>

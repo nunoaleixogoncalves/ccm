@@ -11,7 +11,7 @@ Every release of `ccm` and what changed in it. Each section is also used as the 
 - **Open and crashed Codex conversations,** from the locks Codex holds while it runs, with no setup. `Shift+O` reopens crashed ones with `codex resume`. ([#39](https://github.com/nunoaleixogoncalves/ccm/issues/39))
 - **Rename Codex conversations,** the way Codex's `/rename` does, so the new name also shows in Codex. ([#40](https://github.com/nunoaleixogoncalves/ccm/issues/40))
 - **Remove a conversation's worktree with it.** When a delete leaves a worktree with no conversation, the popup lists it and `w` adds it to the delete, under the same rules as the worktree view. ([#26](https://github.com/nunoaleixogoncalves/ccm/issues/26))
-- **`ccm web`,** the conversation list in a browser, with the same search, filters, sorting, grouping and preview. It's for this computer only, needs the link it prints, and only reads for now. ([#48](https://github.com/nunoaleixogoncalves/ccm/issues/48))
+- **`ccm web`,** the conversation list in a browser, with the same search, filters, sorting, grouping and preview. It's for this computer only, needs the link it prints. Resume, fork, rename and reopen after a crash work from it, under the same rules as the terminal. ([#48](https://github.com/nunoaleixogoncalves/ccm/issues/48), [#49](https://github.com/nunoaleixogoncalves/ccm/issues/49))
 - New setting `tools` in `config.toml` to choose which tools to read. By default, every tool whose folder exists is read.
 
 ### Fixed

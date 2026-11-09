@@ -46,6 +46,19 @@ pub enum Decision {
     InvalidId,
 }
 
+impl Decision {
+    /// Why it can't start, for the decisions that end there.
+    pub fn refusal(&self) -> Option<&'static str> {
+        match self {
+            Decision::AlreadyOpen => Some("This conversation is already open."),
+            Decision::NoFolder => Some("No folder is recorded for this conversation."),
+            Decision::UnsafeFolder => Some("The recorded folder isn't a safe path, so it won't be used."),
+            Decision::InvalidId => Some("This conversation's ID isn't valid."),
+            Decision::Go(_) | Decision::FolderMissing(_) => None,
+        }
+    }
+}
+
 /// Transcript content is untrusted, so the folder is checked before it's used for anything.
 pub fn decide(s: &Session) -> Decision {
     if s.open && is_uuid(&s.id) {
@@ -149,6 +162,17 @@ pub fn manual_command_for(source: Source, id: &str, fork: Option<&Fork>, folder:
             let verb = if fork.is_some() { "fork" } else { "resume" };
             format!("cd {} && codex {verb} {id}", quote(&folder.display().to_string()))
         }
+    }
+}
+
+/// The command to copy for resuming a conversation. This gets pasted into a shell, so a folder
+/// that isn't safe is left out rather than quoted. A control character in it could end the paste
+/// early, whatever the quoting.
+pub fn copy_command(s: &Session) -> String {
+    match (s.folder.as_deref().filter(|f| is_safe_folder(f)), s.source) {
+        (Some(folder), source) => manual_command_for(source, &s.id, None, Path::new(folder)),
+        (None, Source::Codex) => format!("codex resume {}", s.id),
+        (None, Source::ClaudeCode) => format!("claude --resume {}", s.id),
     }
 }
 

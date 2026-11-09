@@ -9,7 +9,7 @@ use ccm_core::model::{Session, Source};
 use ccm_core::preview::Preview;
 use ccm_core::tools::{self, Features};
 use ccm_core::rename::MAX_NAME;
-use ccm_core::resume::{decide, decide_fork, is_safe_folder, manual_command_for, Decision, Fork};
+use ccm_core::resume::{copy_command, decide, decide_fork, Decision, Fork};
 use ccm_core::jobs::{self, Leftover};
 use ccm_core::query::{group_by_folder, group_by_repo, select, status_text, Filters, GroupRow, SortKey, Suggestion};
 use ccm_core::repo::Place;
@@ -1230,16 +1230,8 @@ impl App {
         });
     }
 
-    /// This gets pasted into a shell, so a folder that isn't safe is left out rather than quoted.
-    /// A control character in it could end the paste early, whatever the quoting.
     fn resume_command(s: &Session) -> String {
-        if s.source == Source::Codex && !s.folder.as_deref().is_some_and(is_safe_folder) {
-            return format!("codex resume {}", s.id);
-        }
-        match s.folder.as_deref().filter(|f| is_safe_folder(f)) {
-            Some(folder) => manual_command_for(s.source, &s.id, None, Path::new(folder)),
-            None => format!("claude --resume {}", s.id),
-        }
+        copy_command(s)
     }
 
     fn recently_resumed(&self, id: &str) -> bool {
@@ -1258,11 +1250,8 @@ impl App {
         }
         match decide(s) {
             Decision::Go(folder) => self.launch(id, &folder),
-            Decision::AlreadyOpen => self.status = Some("This conversation is already open.".into()),
-            Decision::NoFolder => self.status = Some("No folder is recorded for this conversation.".into()),
-            Decision::UnsafeFolder => self.status = Some("The recorded folder isn't a safe path, so it won't be used.".into()),
-            Decision::InvalidId => self.status = Some("This conversation's ID isn't valid.".into()),
             Decision::FolderMissing(folder) => self.confirm_folder = Some((id, folder, false)),
+            refused => self.status = refused.refusal().map(String::from),
         }
     }
 
@@ -1281,9 +1270,7 @@ impl App {
         match decide_fork(s) {
             Decision::Go(folder) => self.launch_fork(id, &folder),
             Decision::FolderMissing(folder) => self.confirm_folder = Some((id, folder, true)),
-            Decision::NoFolder => self.status = Some("No folder is recorded for this conversation.".into()),
-            Decision::UnsafeFolder => self.status = Some("The recorded folder isn't a safe path, so it won't be used.".into()),
-            Decision::InvalidId | Decision::AlreadyOpen => self.status = Some("This conversation's ID isn't valid.".into()),
+            refused => self.status = refused.refusal().map(String::from),
         }
     }
 

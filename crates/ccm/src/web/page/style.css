@@ -146,6 +146,21 @@ kbd {
 .chip[aria-pressed="true"] kbd { color: inherit; }
 .chip.quiet { border-color: transparent; color: var(--muted); }
 
+.status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin: 0;
+  padding: 7px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  overflow-wrap: anywhere;
+}
+
+.status[hidden] { display: none; }
+.status.bad { color: var(--crashed); font-weight: 600; }
+
 .panes {
   display: grid;
   grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr);
@@ -275,7 +290,48 @@ th.col-folder { direction: ltr; font-family: var(--sans); }
 .details dd { margin: 0; }
 .details .mono { font-family: var(--mono); font-size: 12px; }
 .details .warn { color: var(--crashed); }
+.actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+.chip.main { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
+.chip.main kbd { color: inherit; }
+.chip.main:hover { background: var(--accent); }
+.chip:disabled { opacity: 0.45; cursor: not-allowed; }
+.chip:disabled:hover { background: transparent; }
+
 .details .notes { margin: 8px 0 0; padding: 0; list-style: none; color: var(--muted); font-size: 13px; }
+
+dialog {
+  width: min(640px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  padding: 18px 20px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+dialog::backdrop { background: rgb(0 0 0 / 45%); }
+dialog h2 { margin: 0 0 12px; font-size: 16px; }
+dialog p { margin: 0 0 10px; }
+dialog .mono { font-family: var(--mono); font-size: 13px; }
+
+dialog input[type="text"] {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+}
+
+dialog input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+dialog ul { margin: 0 0 12px; padding: 0; list-style: none; max-height: 50vh; overflow-y: auto; }
+dialog li { padding: 3px 0; }
+dialog label { display: flex; gap: 8px; align-items: baseline; }
+dialog .where { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+dialog .warn { color: var(--crashed); font-size: 13px; }
+.buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 
 .preview {
   padding: 4px 16px 16px;
