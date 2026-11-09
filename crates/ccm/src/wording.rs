@@ -1,10 +1,11 @@
 //! What's said about a delete or a worktree removal, the same in the terminal and on the page.
 
 use ccm_core::delete;
-use ccm_core::format::{bytes, sanitize, short_path};
+use ccm_core::format::{ago, bytes, sanitize, short_path};
+use ccm_core::jobs;
 use ccm_core::model::Session;
 use ccm_core::removal::{self, Planned, NAMED_IGNORED};
-use ccm_core::worktree::Link;
+use ccm_core::worktree::{Link, State, Worktree};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tone {
@@ -22,6 +23,117 @@ pub fn plural(n: u64, one: &str, many: &str) -> String {
 pub fn share(l: &Link) -> String {
     let percent = (l.records * 100).checked_div(l.total).unwrap_or(0);
     if percent == 0 { "under 1%".into() } else { format!("{percent}%") }
+}
+
+/// What a worktree's status column says.
+pub fn worktree_status(w: &Worktree, open: usize) -> &'static str {
+    if w.prunable {
+        "missing"
+    } else if w.from_windows() {
+        "Windows"
+    } else if open > 0 {
+        "open"
+    } else if w.locked {
+        "locked"
+    } else {
+        ""
+    }
+}
+
+fn unknown(w: &Worktree) -> String {
+    if w.prunable { "-" } else { "?" }.into()
+}
+
+pub fn changes_text(w: &Worktree) -> String {
+    match w.state {
+        None => unknown(w),
+        Some(State { changes: 0, .. }) => "-".into(),
+        Some(State { changes: 1, .. }) => "1 file".into(),
+        Some(s) => format!("{} files", s.changes),
+    }
+}
+
+pub fn unpushed_text(w: &Worktree) -> String {
+    match w.state {
+        None => unknown(w),
+        Some(State { unpushed: 0, .. }) => "-".into(),
+        Some(s) => s.unpushed.to_string(),
+    }
+}
+
+pub fn conversations_text(total: usize, open: usize) -> String {
+    match (total, open) {
+        (0, _) => "-".into(),
+        (n, 0) => n.to_string(),
+        (n, open) => format!("{n} ({open} open)"),
+    }
+}
+
+/// What the state means, in words. Remote branches are as Git last saw them, as `ccm` never
+/// fetches.
+pub fn state_lines(w: &Worktree) -> Vec<String> {
+    if w.prunable {
+        return vec!["Its folder is gone. Git still lists it until it's pruned.".into()];
+    }
+    if w.from_windows() {
+        return vec!["Made by Git for Windows. Git here can't reach its folder, so ccm leaves it alone. Manage it from Windows.".into()];
+    }
+    let Some(s) = w.state else {
+        return vec!["Git couldn't say whether it has changes or unpushed commits.".into()];
+    };
+    let changes = match s.changes {
+        0 => "No uncommitted changes.".to_string(),
+        n => format!("{} not committed.", plural(n, "file", "files")),
+    };
+    let unpushed = match (s.unpushed, s.has_remote) {
+        (0, true) => "Every commit is on a remote branch, as of the last fetch.".to_string(),
+        (0, false) => "No remote, and every commit is on another branch too.".to_string(),
+        (n, true) => format!("{} on no remote branch, as of the last fetch.", plural(n, "commit", "commits")),
+        (n, false) => format!("No remote, and {} on no other branch.", plural(n, "commit is", "commits are")),
+    };
+    let mut lines = vec![format!("{changes} {unpushed}")];
+    if s.upstream_gone {
+        lines.push("Its remote branch was deleted, which usually means it was merged. ccm can't check.".into());
+    }
+    lines
+}
+
+/// How a conversation relates to a worktree it worked in.
+pub fn link_notes(l: &Link, now_ms: i64) -> Vec<String> {
+    let mut notes = vec![format!("last here {}", ago(now_ms, l.last_ms)), format!("{} of its activity", share(l))];
+    if l.last_here {
+        notes.push("still here when it stopped".into());
+    }
+    if l.started_here {
+        notes.push("started here".into());
+    }
+    notes
+}
+
+/// The top of the removal popup: how many go, and what could be lost.
+pub fn removal_head(plan: &removal::Plan) -> Vec<(String, Tone)> {
+    let count = plan.items.len();
+    let mut top = vec![(format!("{count} worktree{} will be removed. Branches stay, so commits are kept.", if count == 1 { "" } else { "s" }), Tone::Bold)];
+    let ahead: Vec<&Planned> = plan.items.iter().filter(|i| i.unpushed > 0).collect();
+    if !ahead.is_empty() {
+        let commits: u64 = ahead.iter().map(|i| i.unpushed).sum();
+        let (of, have) = if count == 1 { ("It".to_string(), "has") } else { (format!("{} of these", ahead.len()), "have") };
+        let commits = plural(commits, "unpushed commit", "unpushed commits");
+        top.push((format!("Warning: {of} {have} {commits}. Branches keep them, but only on this machine."), Tone::Danger));
+    }
+    if let Some(line) = ignored_line(plan, " This can't be undone.") {
+        top.push(line);
+    }
+    top
+}
+
+/// Says how much Git-ignored data goes, when any does.
+pub fn ignored_line(plan: &removal::Plan, tail: &str) -> Option<(String, Tone)> {
+    plan.items.iter().any(|i| !i.ignored.is_empty()).then(|| {
+        let at_least = if plan.items.iter().any(|i| i.ignored_more) { "at least " } else { "" };
+        let ignored: u64 = plan.items.iter().map(|i| i.ignored_bytes).sum();
+        (format!("Files Git ignores go too, {at_least}{}.{tail}", bytes(ignored)), Tone::Warn)
+    })
 }
 
 /// What removing one worktree would do, ending with an empty line to separate it from the next.
@@ -81,6 +193,13 @@ pub fn delete_report(plan: &delete::Plan, include_notes: bool, outcome: &delete:
     }
     lines.extend(plan.warnings.iter().map(|w| sanitize(w)));
     (summary, lines)
+}
+
+/// The same for deleting job folders.
+pub fn jobs_report(outcome: &jobs::Outcome) -> (String, Vec<String>) {
+    let count = outcome.removed.len();
+    let summary = format!("Deleted {count} job folder{}, freed {}.", if count == 1 { "" } else { "s" }, bytes(outcome.bytes));
+    (summary, outcome.kept.iter().map(|(p, why)| format!("Kept {}: {}", sanitize(&p.display().to_string()), sanitize(why))).collect())
 }
 
 /// The same for removing worktrees. A plan with nothing to remove only has its refusals to report.

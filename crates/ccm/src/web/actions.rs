@@ -2,14 +2,15 @@
 //! path comes from what `ccm` read itself, and every check is made again here.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ccm_core::delete;
+use ccm_core::jobs::{self, Leftover};
 use ccm_core::format::{sanitize, short_path};
 use ccm_core::model::{Session, Source};
-use ccm_core::removal;
+use ccm_core::removal::{self, Target};
 use ccm_core::resume::{decide, decide_fork, Decision, Fork};
 use ccm_core::tools::Features;
 use serde_json::{json, Value};
@@ -27,6 +28,10 @@ type PlanDeleteFn = Box<dyn Fn(&[Session]) -> delete::Plan + Send + Sync>;
 type DeleteFn = Box<dyn Fn(&delete::Plan, bool) -> Result<delete::Outcome, String> + Send + Sync>;
 type OfferFn = Box<dyn Fn(&[String], &[Session]) -> removal::Plan + Send + Sync>;
 type RemoveFn = Box<dyn Fn(&removal::Plan, &[Session]) -> removal::Outcome + Send + Sync>;
+type ScanFn = Box<dyn Fn(&[String], bool) -> crate::ScanResult + Send + Sync>;
+type PlanRemoveFn = Box<dyn Fn(&[Target], &[Session]) -> removal::Plan + Send + Sync>;
+type LeftoversFn = Box<dyn Fn() -> Vec<Leftover> + Send + Sync>;
+type RemoveJobsFn = Box<dyn Fn(&[PathBuf]) -> jobs::Outcome + Send + Sync>;
 
 /// What actually touches the system. Tests swap these.
 pub struct Effects {
@@ -37,6 +42,10 @@ pub struct Effects {
     pub delete: DeleteFn,
     pub offer: OfferFn,
     pub remove: RemoveFn,
+    pub scan: ScanFn,
+    pub plan_remove: PlanRemoveFn,
+    pub leftovers: LeftoversFn,
+    pub remove_jobs: RemoveJobsFn,
 }
 
 /// Conversations just started, as they don't show as open at once.

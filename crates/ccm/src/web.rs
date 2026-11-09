@@ -2,20 +2,24 @@
 //! the server is kept private. The page is built into the program, so nothing else is installed.
 
 mod actions;
+mod cleanup;
 mod deletion;
 mod guard;
 mod list;
+mod worktrees;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
+use std::time::SystemTime;
 
 use anyhow::{anyhow, Result};
 use ccm_core::config::Config;
 use ccm_core::forks;
 use ccm_core::index::Searcher;
+use ccm_core::jobs::{self, Leftover};
 use ccm_core::model::{Session, Source};
 use ccm_core::paths::Paths;
 use ccm_core::removal;
@@ -26,6 +30,7 @@ use std::io::Read;
 use tiny_http::{Header, Response, Server};
 
 use crate::repos::{self, Repos};
+use crate::worktrees::Worktrees;
 use guard::{Guard, Headers, Verdict};
 
 const INDEX: &str = include_str!("web/page/index.html");
@@ -93,6 +98,10 @@ pub(crate) struct State {
     starting: Mutex<actions::Starting>,
     /// The delete waiting for an answer. Only one, so a tab's stale popup can't act.
     pending_delete: Mutex<Option<deletion::Pending>>,
+    /// The latest answers from Git. Marks and the selection are the page's own.
+    worktrees: Mutex<Worktrees>,
+    /// Job folders found on the last visit to the clean-up screen.
+    leftovers: Mutex<Option<Vec<Leftover>>>,
 }
 
 // A panic in one request must not take the page down for the others.
@@ -208,9 +217,27 @@ pub fn serve(paths: Paths, options: Options) -> Result<()> {
                 let paths = paths.clone();
                 move |plan, sessions| removal::execute(&paths, Path::new(crate::PROC), plan, sessions)
             }),
+            scan: Box::new({
+                let sessions_dir = paths.sessions();
+                move |folders, measure| crate::scan_worktrees(folders, measure, &sessions_dir)
+            }),
+            plan_remove: Box::new({
+                let paths = paths.clone();
+                move |targets, sessions| removal::plan(&paths, Path::new(crate::PROC), targets, sessions)
+            }),
+            leftovers: Box::new({
+                let paths = paths.clone();
+                move || jobs::leftovers(&paths, Path::new(crate::PROC), SystemTime::now())
+            }),
+            remove_jobs: Box::new({
+                let paths = paths.clone();
+                move |dirs| jobs::remove(&paths, Path::new(crate::PROC), dirs, SystemTime::now())
+            }),
         },
         starting: Mutex::default(),
         pending_delete: Mutex::default(),
+        worktrees: Mutex::default(),
+        leftovers: Mutex::default(),
     });
 
     let updates = crate::spawn_refresher(start.catalog);
@@ -354,6 +381,8 @@ fn handle(state: &Arc<State>, guard: &Guard, method: &str, url: &str, headers: &
                 "/api/delete/worktrees" => Reply::json(&deletion::toggle_worktrees(state, &body)),
                 "/api/delete/confirm" => Reply::json(&deletion::confirm(state, &body)),
                 "/api/delete/cancel" => Reply::json(&deletion::cancel(state, &body)),
+                "/api/worktrees/plan" => Reply::json(&worktrees::plan(state, &body)),
+                "/api/cleanup/plan" => Reply::json(&cleanup::plan(state, &body)),
                 _ => Reply::text(404, "Not found"),
             };
         }
@@ -370,6 +399,8 @@ fn handle(state: &Arc<State>, guard: &Guard, method: &str, url: &str, headers: &
         }
         "/api/list" => Reply::json(&list_reply(state, &params)),
         "/api/reopen" => Reply::json(&actions::reopen_list(state)),
+        "/api/worktrees" => Reply::json(&worktrees::list(state, &params)),
+        "/api/cleanup" => Reply::json(&cleanup::overview(state, &params)),
         "/api/details" => match details_reply(state, params.get("id").map_or("", String::as_str)) {
             Some(value) => Reply::json(&value),
             None => Reply::text(404, "That conversation is gone."),
@@ -445,9 +476,15 @@ impl State {
                 delete: Box::new(|_, _| Ok(ccm_core::delete::Outcome::default())),
                 offer: Box::new(|_, _| ccm_core::removal::Plan::default()),
                 remove: Box::new(|_, _| ccm_core::removal::Outcome::default()),
+                scan: Box::new(|_, _| (ccm_core::worktree::Scan::default(), None, Default::default())),
+                plan_remove: Box::new(|_, _| ccm_core::removal::Plan::default()),
+                leftovers: Box::new(Vec::new),
+                remove_jobs: Box::new(|_| ccm_core::jobs::Outcome::default()),
             },
             starting: Mutex::default(),
             pending_delete: Mutex::default(),
+            worktrees: Mutex::default(),
+            leftovers: Mutex::default(),
         })
     }
 }

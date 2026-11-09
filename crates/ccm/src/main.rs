@@ -1,4 +1,5 @@
 mod app;
+mod cleanup;
 mod clipboard;
 mod repos;
 mod ui;
@@ -349,6 +350,14 @@ fn spawn_refresher(mut catalog: Catalog) -> Receiver<Update> {
     rx
 }
 
+/// Asks Git about the worktrees of these folders, which takes a while, so it runs elsewhere.
+fn scan_worktrees(folders: &[String], measure: bool, sessions_dir: &Path) -> ScanResult {
+    let scan = worktree::scan(folders);
+    let sizes = measure.then(|| measure_worktrees(&scan));
+    let busy = busy_worktrees(&scan, sessions_dir);
+    (scan, sizes, busy)
+}
+
 /// Sizes of the worktrees removing could lose nothing from, for the clean-up screen. Which of
 /// them no conversation used is only known later, so this measures a few more than needed.
 fn measure_worktrees(scan: &Scan) -> HashMap<PathBuf, u64> {
@@ -401,10 +410,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, updates: Receiver<Update>,
             let sessions_dir = paths.sessions();
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
-                let scan = worktree::scan(&folders);
-                let sizes = measure.then(|| measure_worktrees(&scan));
-                let busy = busy_worktrees(&scan, &sessions_dir);
-                let _ = tx.send((scan, sizes, busy));
+                let _ = tx.send(scan_worktrees(&folders, measure, &sessions_dir));
             });
             worktree_scan = Some(rx);
             dirty = true;

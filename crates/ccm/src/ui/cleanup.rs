@@ -3,7 +3,6 @@
 //! can be marked and removed the usual way.
 
 use ccm_core::format::{ago, bytes, sanitize};
-use ccm_core::query::Suggestion;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -13,6 +12,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{draw_dialog, draw_footer, fit_end, footer_rows, Dialog, COLUMN_SPACING, MIN_NAME_WIDTH};
 use crate::app::{App, Cleanup, Tally};
+use crate::cleanup::{explanation, job_what, label, JOB_KEPT_NOTE, SAFETY};
 
 pub(super) fn draw(f: &mut Frame, app: &mut App, now_ms: i64) {
     let [summary, _, table, _, detail, footer] = Layout::vertical([
@@ -58,20 +58,6 @@ fn summary_line(app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
-pub(crate) fn label(app: &App, line: Cleanup) -> String {
-    match line {
-        Cleanup::Conversations(Suggestion::NoReply) => "Conversations Claude never replied to".into(),
-        Cleanup::Conversations(Suggestion::FolderGone) => "Conversations whose folder is gone".into(),
-        Cleanup::Conversations(Suggestion::LargeOld) => format!(
-            "Conversations over {} not used for {} days",
-            bytes(app.config.large_threshold_bytes()),
-            app.config.old_after_days
-        ),
-        Cleanup::Worktrees => "Worktrees with no conversation and nothing to lose".into(),
-        Cleanup::Jobs => "Background job folders with no conversation".into(),
-    }
-}
-
 fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     let widths = [Constraint::Min(20), Constraint::Length(8), Constraint::Length(10)];
     let header = Row::new(["Suggestion", "   Items", "     Frees"]).style(Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED));
@@ -91,7 +77,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 Style::new()
             };
-            let name = if marked { format!("● {}", label(app, line)) } else { label(app, line) };
+            let name = if marked { format!("● {}", label(&app.config, line)) } else { label(&app.config, line) };
             Row::new([Cell::from(name), Cell::from(format!("{count:>8}")), Cell::from(format!("{freed:>10}"))]).style(style)
         })
         .collect();
@@ -107,66 +93,13 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut state);
 }
 
-fn explanation(app: &App, line: Cleanup) -> Vec<String> {
-    let empty = "Nothing matches this right now, so there's nothing to delete here.";
-    let checked = app.tally(line).is_some();
-    let is_empty = app.tally(line).is_some_and(|t| t.count == 0);
-    let first = match line {
-        Cleanup::Conversations(Suggestion::NoReply) => {
-            "Conversations where Claude never replied, often started by mistake or cut off at once.".to_string()
-        }
-        Cleanup::Conversations(Suggestion::FolderGone) => {
-            "The folder these started in no longer exists. Resuming one would recreate it empty.".to_string()
-        }
-        Cleanup::Conversations(Suggestion::LargeOld) => format!(
-            "Larger than {} and not active for {} days. Change these with large_threshold_mb and old_after_days in config.toml.",
-            bytes(app.config.large_threshold_bytes()),
-            app.config.old_after_days
-        ),
-        Cleanup::Worktrees => {
-            let what = if !checked {
-                "Still checking the worktrees."
-            } else if is_empty {
-                empty
-            } else {
-                "d removes all of them, and their branches are kept. Space marks lines to delete several at once. Enter shows them in the worktree view, to look through them or remove only some."
-            };
-            return vec![
-                "Worktrees no conversation worked in, with no changes, no unpushed commits and a branch, or whose folder is gone.".into(),
-                "Locked ones, and ones a running session is in, aren't suggested. Only repositories your conversations used are checked.".into(),
-                what.into(),
-            ];
-        }
-        Cleanup::Jobs => {
-            let what = if app.leftovers.is_none() {
-                "Job folders can't be checked."
-            } else if is_empty {
-                empty
-            } else {
-                "d deletes the ones ccm can, and Space marks lines to delete several at once. Enter lists them, where c copies the claude rm commands."
-            };
-            return vec![
-                "Folders in ~/.claude/jobs whose conversation is gone, untouched for a day and not running.".into(),
-                "Ones that may have a worktree are only listed, with the claude rm command that removes them safely.".into(),
-                what.into(),
-            ];
-        }
-    };
-    let what = if is_empty {
-        empty
-    } else {
-        "d deletes all of them, and Space marks lines to delete several at once. Enter shows them in the list, to look through them or delete only some."
-    };
-    vec![first, "Open ones aren't suggested.".into(), what.into()]
-}
-
 fn draw_detail(f: &mut Frame, app: &App, area: Rect, now_ms: i64) {
     let line = Cleanup::ALL[app.cleanup_row.min(Cleanup::ALL.len() - 1)];
     let block = Block::new().borders(Borders::TOP).title(" About this suggestion ");
     let inner = block.inner(area);
     f.render_widget(block, area);
     let width = inner.width.saturating_sub(1) as usize;
-    let mut text: Vec<Line> = explanation(app, line).iter().flat_map(|l| super::wrap(l, width)).map(|l| Line::from(format!(" {l}"))).collect();
+    let mut text: Vec<Line> = explanation(&app.config, line, app.tally(line)).iter().flat_map(|l| super::wrap(l, width)).map(|l| Line::from(format!(" {l}"))).collect();
     if line == Cleanup::Jobs
         && let Some(found) = &app.leftovers
         && !found.is_empty()
@@ -175,20 +108,15 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect, now_ms: i64) {
         text.extend(found.iter().map(|l| Line::from(format!(" {}", job_line(l, width.saturating_sub(1), now_ms)))));
     }
     text.push(Line::from(""));
-    let safety = "Nothing is deleted without asking. Each one is checked again just before, and any that opened meanwhile are kept.";
     let grey = Style::new().fg(Color::DarkGray);
-    text.extend(super::wrap(safety, width).into_iter().map(|l| Line::from(Span::styled(format!(" {l}"), grey))));
+    text.extend(super::wrap(SAFETY, width).into_iter().map(|l| Line::from(Span::styled(format!(" {l}"), grey))));
     f.render_widget(Paragraph::new(text), inner);
 }
 
 /// One job folder: its ID, size and age, then what's known of it.
 pub(super) fn job_line(l: &ccm_core::jobs::Leftover, width: usize, now_ms: i64) -> String {
-    let what = match (&l.name, l.no_state) {
-        (_, true) => "no state file".to_string(),
-        (Some(name), _) => sanitize(name),
-        (None, _) => "unnamed".to_string(),
-    };
-    let note = if l.worktree { "  may have a worktree, kept" } else { "" };
+    let what = job_what(l);
+    let note = if l.worktree { format!("  {JOB_KEPT_NOTE}") } else { String::new() };
     let head = format!("{}  {:>7}  {:>4} ago  ", sanitize(&l.short()), bytes(l.bytes), ago(now_ms, l.last_ms));
     let room = width.saturating_sub(head.width() + note.width()).max(MIN_NAME_WIDTH);
     format!("{head}{}{note}", fit_end(&what, room))

@@ -241,7 +241,7 @@ fn delete_dialog(app: &App) -> Dialog {
         top.push(("From the clean-up suggestions:".into(), plain));
         for (line, tally) in &confirm.from {
             let size = tally.bytes.map_or("size unknown".into(), bytes);
-            top.push((format!("  {}: {}, {size}", cleanup::label(app, *line), tally.count), plain));
+            top.push((format!("  {}: {}, {size}", crate::cleanup::label(&app.config, *line), tally.count), plain));
         }
         top.push((String::new(), plain));
     }
@@ -344,7 +344,7 @@ fn summary_line(app: &App) -> Line<'static> {
         text.push_str(&format!("  showing {shown}"));
     }
     if let Some(suggestion) = app.shown_suggestion() {
-        let label = cleanup::label(app, crate::app::Cleanup::Conversations(suggestion));
+        let label = crate::cleanup::label(&app.config, crate::app::Cleanup::Conversations(suggestion));
         let label = label.trim_start_matches("Conversations ");
         text.push_str(&format!("  clean-up: {label}"));
     }

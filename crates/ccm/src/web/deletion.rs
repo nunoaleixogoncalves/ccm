@@ -1,17 +1,19 @@
 //! Deleting from the page. The plan stays here and the page only refers to it, so nothing it
 //! sends can add to what goes. The countdown is also kept here, as a page can be changed.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ccm_core::delete::{Plan, Skipped};
 use ccm_core::format::{sanitize, short_path};
+use ccm_core::jobs::Leftover;
 use ccm_core::model::Session;
 use ccm_core::removal;
 use serde_json::{json, Value};
 
 use super::{lock, read, write, State};
 use crate::app::Countdown;
-use crate::wording::{delete_report, planned_lines, removal_report, Tone};
+use crate::wording::{delete_report, jobs_report, planned_lines, removal_report, Tone};
 
 const OUT_OF_DATE: &str = "This confirmation is out of date, so nothing was deleted. Start the delete again.";
 
@@ -22,9 +24,23 @@ pub struct Pending {
     offered: removal::Plan,
     include_worktrees: bool,
     countdown: Countdown,
+    /// Worktrees going for their own sake, from the worktree view or the clean-up screen.
+    remove: Option<removal::Plan>,
+    /// Job folders from the clean-up screen. Ones that may have a worktree are only listed.
+    jobs: Vec<Leftover>,
 }
 
-fn refused(message: &str) -> Value {
+/// What a new confirmation is about.
+#[derive(Default)]
+pub(super) struct Held {
+    pub plan: Plan,
+    pub offered: removal::Plan,
+    pub remove: Option<removal::Plan>,
+    pub jobs: Vec<Leftover>,
+    pub countdown: Countdown,
+}
+
+pub(super) fn refused(message: &str) -> Value {
     json!({ "ok": false, "message": sanitize(message) })
 }
 
@@ -42,7 +58,7 @@ fn tone(t: Tone) -> &'static str {
 }
 
 /// What deleting these would do, leaving out any just resumed.
-fn plan_for(state: &State, sessions: &[Session], ids: &[String]) -> Plan {
+pub(super) fn plan_for(state: &State, sessions: &[Session], ids: &[String]) -> Plan {
     let picked = |s: &&Session| ids.contains(&s.id);
     let (targets, unsupported): (Vec<&Session>, Vec<&Session>) = sessions.iter().filter(picked).partition(|s| s.source.features().delete);
     let starting_now = lock(&state.starting);
@@ -65,13 +81,38 @@ pub fn plan(state: &State, body: &Value) -> Value {
     }
     let deleting: Vec<String> = plan.items.iter().map(|i| i.id.clone()).collect();
     let offered = (state.effects.offer)(&deleting, &sessions);
+    hold(state, &sessions, Held { plan, offered, ..Held::default() }, |_| {})
+}
+
+/// Keeps a confirmation for its answer, replacing any older one, and says what's in it.
+pub(super) fn hold(state: &State, sessions: &[Session], held: Held, extra: impl FnOnce(&mut Value)) -> Value {
     let id = match ccm_core::resume::new_session_id() {
         Ok(id) => id,
         Err(e) => return refused(&format!("Couldn't start the delete: {e}")),
     };
-    let reply = describe(state, &sessions, &id, &plan, &offered);
-    *lock(&state.pending_delete) = Some(Pending { id, plan, offered, include_worktrees: false, countdown: Countdown::default() });
+    let Held { plan, offered, remove, jobs, countdown } = held;
+    let mut reply = describe(state, sessions, &id, &plan, &offered);
+    reply["seconds_left"] = json!(countdown.seconds_left());
+    extra(&mut reply);
+    *lock(&state.pending_delete) = Some(Pending { id, plan, offered, include_worktrees: false, countdown, remove, jobs });
     reply
+}
+
+pub(super) fn toned(lines: Vec<(String, Tone)>) -> Vec<Value> {
+    lines.into_iter().filter(|(text, _)| !text.is_empty()).map(|(text, t)| json!({ "text": text, "tone": tone(t) })).collect()
+}
+
+/// What goes with each worktree of a plan, then the ones that can't go and why.
+pub(super) fn removal_lines(state: &State, sessions: &[Session], plan: &removal::Plan) -> Vec<Value> {
+    let mut lines: Vec<(String, Tone)> = plan.items.iter().flat_map(|item| planned_lines(item, sessions, &state.home)).collect();
+    lines.extend(plan.refused.iter().map(|r| (format!("Skipping {}: {}", sanitize(&short_path(&r.path.to_string_lossy(), &state.home)), sanitize(&r.reason)), Tone::Plain)));
+    toned(lines)
+}
+
+/// Lets a test act as if the wait has run out.
+#[cfg(test)]
+pub(super) fn run_out(state: &State) {
+    lock(&state.pending_delete).as_mut().unwrap().countdown.run_out();
 }
 
 /// One line each with a short ID, so a long or repeated name can't pass for other rows.
@@ -84,21 +125,31 @@ fn describe(state: &State, sessions: &[Session], id: &str, plan: &Plan, offered:
     let skipped: Vec<String> = plan.skipped.iter().map(|s| format!("Skipping {}: {}", name_in(sessions, &s.id), sanitize(&s.reason))).collect();
     let warnings: Vec<String> = plan.warnings.iter().map(|w| sanitize(w)).collect();
     let notes: Vec<String> = plan.notes.iter().map(|n| sanitize(&n.name())).collect();
-    let worktrees: Vec<Value> = offered
-        .items
-        .iter()
-        .flat_map(|item| {
-            // Only the conversations being deleted worked there, and they're listed above.
-            let item = removal::Planned { links: Vec::new(), ..item.clone() };
-            planned_lines(&item, sessions, &state.home)
-        })
-        .filter(|(text, _)| !text.is_empty())
-        .map(|(text, t)| json!({ "text": text, "tone": tone(t) }))
-        .collect();
+    let worktrees = toned(
+        offered
+            .items
+            .iter()
+            .flat_map(|item| {
+                // Only the conversations being deleted worked there, and they're listed above.
+                let item = removal::Planned { links: Vec::new(), ..item.clone() };
+                planned_lines(&item, sessions, &state.home)
+            })
+            .collect(),
+    );
     let stays: Vec<String> = offered.refused.iter().map(|r| format!("{} stays: {}", sanitize(&short_path(&r.path.to_string_lossy(), &state.home)), sanitize(&r.reason))).collect();
     json!({
         "ok": true,
         "plan_id": id,
+        "kind": "delete",
+        "head": [],
+        "from": [],
+        "removing": [],
+        "removing_count": 0,
+        "jobs": [],
+        "job_count": 0,
+        "kept_jobs": 0,
+        "rm_commands": null,
+        "nothing": false,
         "conversations": conversations,
         "skipped": skipped,
         "warnings": warnings,
@@ -107,6 +158,8 @@ fn describe(state: &State, sessions: &[Session], id: &str, plan: &Plan, offered:
             "conversations": plan.bytes(),
             "notes": plan.note_bytes(),
             "worktrees": offered.items.iter().map(|i| i.bytes).sum::<u64>(),
+            "removing": 0,
+            "jobs": 0,
         },
         "worktree_count": offered.items.len(),
         "worktrees": worktrees,
@@ -147,41 +200,55 @@ pub fn confirm(state: &State, body: &Value) -> Value {
         p.countdown.restart();
         return json!({ "ok": false, "restarted": true, "seconds_left": p.countdown.seconds_left() });
     }
-    let Some(Pending { plan, offered, include_worktrees, .. }) = guard.take() else { return refused(OUT_OF_DATE) };
+    let Some(Pending { plan, offered, include_worktrees, remove, jobs, .. }) = guard.take() else { return refused(OUT_OF_DATE) };
     let notes = body["notes"].as_bool().unwrap_or(false) && !plan.notes.is_empty();
 
     let mut summaries = Vec::new();
     let mut lines = Vec::new();
     let mut deleted = Vec::new();
-    match (state.effects.delete)(&plan, notes) {
-        Ok(outcome) => {
-            let sessions = Arc::clone(&read(&state.live).sessions);
-            let (summary, more) = delete_report(&plan, notes, &outcome, |id| name_in(&sessions, id));
-            summaries.push(summary);
-            lines.extend(more);
-            let mut live = write(&state.live);
-            Arc::make_mut(&mut live.sessions).retain(|s| !outcome.deleted.contains(&s.id));
-            live.version += 1;
-            deleted = outcome.deleted;
+    if plan.items.is_empty() {
+        let sessions = Arc::clone(&read(&state.live).sessions);
+        lines.extend(plan.skipped.iter().map(|s| format!("Skipped {}: {}", name_in(&sessions, &s.id), s.reason)));
+    } else {
+        match (state.effects.delete)(&plan, notes) {
+            Ok(outcome) => {
+                let sessions = Arc::clone(&read(&state.live).sessions);
+                let (summary, more) = delete_report(&plan, notes, &outcome, |id| name_in(&sessions, id));
+                summaries.push(summary);
+                lines.extend(more);
+                let mut live = write(&state.live);
+                Arc::make_mut(&mut live.sessions).retain(|s| !outcome.deleted.contains(&s.id));
+                live.version += 1;
+                deleted = outcome.deleted;
+            }
+            Err(e) => lines.push(sanitize(&e)),
         }
-        Err(e) => lines.push(sanitize(&e)),
     }
-    if include_worktrees {
+    if let Some(going) = remove.or(include_worktrees.then_some(offered)) {
         // After the conversations, so what's still here is what a worktree is checked against.
         let sessions = Arc::clone(&read(&state.live).sessions);
-        let outcome = if offered.items.is_empty() { removal::Outcome::default() } else { (state.effects.remove)(&offered, &sessions) };
-        let (summary, more) = removal_report(&offered, &outcome);
-        if !offered.items.is_empty() {
+        let outcome = if going.items.is_empty() { removal::Outcome::default() } else { (state.effects.remove)(&going, &sessions) };
+        lock(&state.worktrees).forget(&outcome.removed, &sessions);
+        let (summary, more) = removal_report(&going, &outcome);
+        if !going.items.is_empty() {
             summaries.push(summary);
         }
         lines.extend(more);
+    }
+    let dirs: Vec<PathBuf> = jobs.iter().filter(|j| !j.worktree).map(|j| j.dir.clone()).collect();
+    if !dirs.is_empty() {
+        let (summary, more) = jobs_report(&(state.effects.remove_jobs)(&dirs));
+        summaries.push(summary);
+        lines.extend(more);
+        let found = (state.effects.leftovers)();
+        *lock(&state.leftovers) = Some(found);
     }
     json!({ "ok": true, "summary": summaries.join(" "), "lines": lines, "deleted": deleted })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Mutex;
 
     use ccm_core::delete::{Item, Note, Outcome};
@@ -249,10 +316,6 @@ mod tests {
         let out = plan(state, &json!({ "ids": ids }));
         let id = out["plan_id"].as_str().unwrap_or_default().to_string();
         (out, id)
-    }
-
-    fn run_out(state: &State) {
-        lock(&state.pending_delete).as_mut().unwrap().countdown.run_out();
     }
 
     #[test]

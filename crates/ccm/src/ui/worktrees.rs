@@ -1,17 +1,17 @@
 //! The worktree view. It's laid out like the conversation list, with the conversations that
 //! worked in the selected worktree where the preview would be.
 
-use ccm_core::format::{ago, bytes, sanitize, short_path};
+use ccm_core::format::{sanitize, short_path};
 use ccm_core::removal::Planned;
 use ccm_core::model::Session;
-use ccm_core::worktree::{Link, State, Worktree};
+use ccm_core::worktree::{Link, Worktree};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use crate::wording::{planned_lines, plural, share, Tone};
+use crate::wording::{changes_text, conversations_text, link_notes, planned_lines, removal_head, state_lines, unpushed_text, worktree_status, Tone};
 use super::{draw_dialog, Dialog, draw_footer, fit_end, fit_start, footer_rows, header_only_lines, COLUMN_SPACING, MIN_HEIGHT_FOR_PREVIEW};
 use crate::app::App;
 use crate::worktrees::Row as ListRow;
@@ -108,43 +108,19 @@ fn session<'a>(app: &'a App, id: &str) -> Option<&'a Session> {
 }
 
 fn status(app: &App, w: &Worktree, links: &[Link]) -> &'static str {
-    if w.prunable {
-        "missing"
-    } else if w.from_windows() {
-        "Windows"
-    } else if open_count(app, links) > 0 {
-        "open"
-    } else if w.locked {
-        "locked"
-    } else {
-        ""
-    }
+    worktree_status(w, open_count(app, links))
 }
 
 fn cell_text(app: &App, field: Field, w: &Worktree, links: &[Link], width: usize) -> String {
-    let unknown = if w.prunable { "-" } else { "?" };
     match field {
         Field::Folder if app.worktrees.marked.contains(&w.path) => {
             format!("● {}", fit_start(&sanitize(&short_path(&w.path.to_string_lossy(), &app.home)), width.saturating_sub(2)))
         }
         Field::Folder => fit_start(&sanitize(&short_path(&w.path.to_string_lossy(), &app.home)), width),
         Field::Branch => fit_end(&w.branch.as_deref().map_or("(detached)".to_string(), sanitize), width),
-        Field::Changes => match w.state {
-            None => unknown.into(),
-            Some(State { changes: 0, .. }) => "-".into(),
-            Some(State { changes: 1, .. }) => "1 file".into(),
-            Some(s) => format!("{} files", s.changes),
-        },
-        Field::Unpushed => match w.state {
-            None => unknown.into(),
-            Some(State { unpushed: 0, .. }) => "-".into(),
-            Some(s) => s.unpushed.to_string(),
-        },
-        Field::Conversations => match (links.len(), open_count(app, links)) {
-            (0, _) => "-".into(),
-            (n, 0) => n.to_string(),
-            (n, open) => format!("{n} ({open} open)"),
-        },
+        Field::Changes => changes_text(w),
+        Field::Unpushed => unpushed_text(w),
+        Field::Conversations => conversations_text(links.len(), open_count(app, links)),
         Field::Status => status(app, w, links).into(),
     }
 }
@@ -202,35 +178,6 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut app.worktrees.table);
 }
 
-/// What the state means, in words. Remote branches are as Git last saw them, as `ccm` never
-/// fetches.
-fn state_lines(w: &Worktree) -> Vec<String> {
-    if w.prunable {
-        return vec!["Its folder is gone. Git still lists it until it's pruned.".into()];
-    }
-    if w.from_windows() {
-        return vec!["Made by Git for Windows. Git here can't reach its folder, so ccm leaves it alone. Manage it from Windows.".into()];
-    }
-    let Some(s) = w.state else {
-        return vec!["Git couldn't say whether it has changes or unpushed commits.".into()];
-    };
-    let changes = match s.changes {
-        0 => "No uncommitted changes.".to_string(),
-        n => format!("{} not committed.", plural(n, "file", "files")),
-    };
-    let unpushed = match (s.unpushed, s.has_remote) {
-        (0, true) => "Every commit is on a remote branch, as of the last fetch.".to_string(),
-        (0, false) => "No remote, and every commit is on another branch too.".to_string(),
-        (n, true) => format!("{} on no remote branch, as of the last fetch.", plural(n, "commit", "commits")),
-        (n, false) => format!("No remote, and {} on no other branch.", plural(n, "commit is", "commits are")),
-    };
-    let mut lines = vec![format!("{changes} {unpushed}")];
-    if s.upstream_gone {
-        lines.push("Its remote branch was deleted, which usually means it was merged. ccm can't check.".into());
-    }
-    lines
-}
-
 fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::new().borders(Borders::TOP).title(" Details ");
     let Some((w, _)) = app.worktrees.selected() else {
@@ -257,21 +204,17 @@ pub(super) fn remove_dialog(app: &App) -> Dialog {
     let plain = Style::new();
     let bold = plain.add_modifier(Modifier::BOLD);
     let warn = Style::new().fg(Color::Yellow);
-    let count = plan.items.len();
-    let mut top = vec![(format!("{count} worktree{} will be removed. Branches stay, so commits are kept.", if count == 1 { "" } else { "s" }), bold)];
-    let danger = Style::new().fg(Color::Red).add_modifier(Modifier::BOLD);
-    let ahead: Vec<&Planned> = plan.items.iter().filter(|i| i.unpushed > 0).collect();
-    if !ahead.is_empty() {
-        let commits: u64 = ahead.iter().map(|i| i.unpushed).sum();
-        let (of, have) = if count == 1 { ("It".to_string(), "has") } else { (format!("{} of these", ahead.len()), "have") };
-        let commits = plural(commits, "unpushed commit", "unpushed commits");
-        top.push((format!("Warning: {of} {have} {commits}. Branches keep them, but only on this machine."), danger));
-    }
-    let ignored: u64 = plan.items.iter().map(|i| i.ignored_bytes).sum();
-    if plan.items.iter().any(|i| !i.ignored.is_empty()) {
-        let at_least = if plan.items.iter().any(|i| i.ignored_more) { "at least " } else { "" };
-        top.push((format!("Files Git ignores go too, {at_least}{}. This can't be undone.", bytes(ignored)), warn.add_modifier(Modifier::BOLD)));
-    }
+    let top = removal_head(plan)
+        .into_iter()
+        .map(|(text, tone)| {
+            let style = match tone {
+                Tone::Danger => Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Tone::Warn => warn.add_modifier(Modifier::BOLD),
+                _ => bold,
+            };
+            (text, style)
+        })
+        .collect();
 
     let mut body = Vec::new();
     for item in &plan.items {
@@ -330,13 +273,7 @@ fn draw_conversations(f: &mut Frame, app: &App, area: Rect, now_ms: i64) {
         .iter()
         .map(|l| {
             let s = session(app, &l.id);
-            let mut notes = vec![format!("last here {}", ago(now_ms, l.last_ms)), format!("{} of its activity", share(l))];
-            if l.last_here {
-                notes.push("still here when it stopped".into());
-            }
-            if l.started_here {
-                notes.push("started here".into());
-            }
+            let notes = link_notes(l, now_ms);
             let state = match s {
                 Some(s) if s.open => "open  ",
                 Some(s) if s.crashed => "crashed  ",
@@ -361,7 +298,7 @@ mod tests {
     use crate::app::View;
     use ccm_core::config::Config;
     use ccm_core::model::{FolderVisit, Source};
-    use ccm_core::worktree::Scan;
+    use ccm_core::worktree::{Scan, State};
     use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;

@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 
 use ccm_core::config::Config;
 use ccm_core::delete::{Outcome, Plan, Skipped};
-use ccm_core::format::bytes;
 use ccm_core::model::{Session, Source};
 use ccm_core::preview::Preview;
 use ccm_core::tools::{self, Features};
@@ -20,8 +19,10 @@ use crossterm::event::{KeyCode, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 
+pub use crate::cleanup::{Cleanup, Tally};
+use crate::cleanup::{self, KEPT_JOBS};
 use crate::repos::{RepoRequest, Repos};
-use crate::wording::{delete_report, removal_report};
+use crate::wording::{delete_report, jobs_report, removal_report};
 use crate::worktrees::{folders_of, Worktrees};
 
 /// An action reachable from both a key and a footer button.
@@ -55,32 +56,6 @@ pub enum Action {
     /// Opens the selected clean-up suggestion.
     OpenSuggestion,
     Quit,
-}
-
-/// One line of the clean-up screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Cleanup {
-    Conversations(Suggestion),
-    Worktrees,
-    Jobs,
-}
-
-impl Cleanup {
-    pub const ALL: [Cleanup; 5] = [
-        Cleanup::Conversations(Suggestion::NoReply),
-        Cleanup::Conversations(Suggestion::FolderGone),
-        Cleanup::Conversations(Suggestion::LargeOld),
-        Cleanup::Worktrees,
-        Cleanup::Jobs,
-    ];
-}
-
-/// How many items a clean-up line has and what removing them would free. `bytes` is `None`
-/// when some of them haven't been measured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Tally {
-    pub count: usize,
-    pub bytes: Option<u64>,
 }
 
 /// How the conversation list is grouped. `g` steps through them in this order.
@@ -154,7 +129,6 @@ const DELETE_REPORT: &str = " Delete finished ";
 const REOPEN_REPORT: &str = " Reopen finished ";
 const REMOVE_REPORT: &str = " Remove finished ";
 const JOBS_REPORT: &str = " Job folders ";
-const KEPT_JOBS: &str = "These job folders may have worktrees, so ccm leaves them. Press Enter on the line, then c, to copy the claude rm commands.";
 
 pub type SearchFn = Box<dyn FnMut(&str) -> Result<Option<HashSet<String>>, String>>;
 
@@ -512,23 +486,7 @@ impl App {
 
     /// What a clean-up line holds. `None` while it's still being checked.
     pub fn tally(&self, line: Cleanup) -> Option<Tally> {
-        match line {
-            Cleanup::Conversations(_) => {
-                let rows = self.cleanup_conversations(line);
-                Some(Tally { count: rows.len(), bytes: Some(rows.iter().map(|&i| self.sessions[i].size_bytes).sum()) })
-            }
-            Cleanup::Worktrees => {
-                self.worktrees.scan.as_ref()?;
-                let idle = self.worktrees.idle();
-                let bytes = idle.iter().map(|w| if w.prunable { Some(0) } else { self.worktrees.sizes.get(&w.path).copied() }).sum();
-                Some(Tally { count: idle.len(), bytes })
-            }
-            Cleanup::Jobs => {
-                let found = self.leftovers.as_ref()?;
-                // Ones that may have a worktree stay, so they free nothing here.
-                Some(Tally { count: found.len(), bytes: Some(found.iter().filter(|l| !l.worktree).map(|l| l.bytes).sum()) })
-            }
-        }
+        cleanup::tally(line, &self.sessions, &self.config, (self.clock)(), &self.worktrees, self.leftovers.as_deref())
     }
 
     /// The suggestion the list is showing, when its filters are exactly one's.
@@ -565,15 +523,7 @@ impl App {
 
     /// The conversations on a clean-up line, as indexes. Other lines have none.
     fn cleanup_conversations(&self, line: Cleanup) -> Vec<usize> {
-        match line {
-            // Only what can be deleted from here is suggested.
-            Cleanup::Conversations(suggestion) => suggestion
-                .select(&self.sessions, self.config.limits((self.clock)()))
-                .into_iter()
-                .filter(|i| self.sessions[*i].source.features().delete)
-                .collect(),
-            Cleanup::Worktrees | Cleanup::Jobs => Vec::new(),
-        }
+        cleanup::conversations(line, &self.sessions, &self.config, (self.clock)())
     }
 
     /// The lines a delete on the clean-up screen acts on: the marked ones, or else the selected one.
@@ -633,16 +583,7 @@ impl App {
             None
         } else {
             let Some(planner) = self.remove_planner.as_mut() else { return };
-            let mut remove = planner(&worktrees, &self.sessions);
-            // Only worktrees with nothing to lose are suggested. One that gained commits since
-            // goes through the worktree view, where removing it has its own countdown.
-            let (ahead, fine): (Vec<_>, Vec<_>) = remove.items.into_iter().partition(|i| i.unpushed > 0);
-            remove.items = fine;
-            remove.refused.extend(ahead.into_iter().map(|i| removal::Refused {
-                path: i.target.path,
-                reason: "it has unpushed commits now. Remove it from the worktree view".into(),
-            }));
-            Some(remove)
+            Some(cleanup::without_unpushed(planner(&worktrees, &self.sessions)))
         };
         if plan.items.is_empty() && remove.as_ref().is_none_or(|r| r.items.is_empty()) && jobs.iter().all(|j| j.worktree) {
             let reason = plan
@@ -699,7 +640,7 @@ impl App {
             }
             KeyCode::Delete => self.remove_jobs(),
             KeyCode::Char('c') => {
-                let command = rm_commands(confirm);
+                let command = cleanup::rm_commands(&confirm.items);
                 self.confirm_jobs = None;
                 match command {
                     Some(command) => self.copy(command),
@@ -727,11 +668,7 @@ impl App {
     /// Deletes job folders, checking each again first, and says what happened.
     fn run_job_removal(&mut self, dirs: &[PathBuf]) -> (String, Vec<String>) {
         let Some(remover) = self.job_remover.as_mut() else { return (String::new(), Vec::new()) };
-        let outcome = remover(dirs);
-        let count = outcome.removed.len();
-        let summary = format!("Deleted {count} job folder{}, freed {}.", if count == 1 { "" } else { "s" }, bytes(outcome.bytes));
-        let lines: Vec<String> =
-            outcome.kept.iter().map(|(p, why)| format!("Kept {}: {}", sanitize(&p.display().to_string()), sanitize(why))).collect();
+        let (summary, lines) = jobs_report(&remover(dirs));
         self.find_leftovers();
         (summary, lines)
     }
@@ -1801,15 +1738,6 @@ impl App {
             }
         }
     }
-}
-
-/// One `claude rm` per job that may have a worktree, ready to paste. A name that isn't plainly
-/// safe in a shell is left out.
-fn rm_commands(confirm: &ConfirmJobs) -> Option<String> {
-    let safe = |n: &str| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    let commands: Vec<String> =
-        confirm.items.iter().filter(|l| l.worktree).map(Leftover::short).filter(|n| safe(n)).map(|n| format!("claude rm {n}")).collect();
-    (!commands.is_empty()).then(|| commands.join("; "))
 }
 
 /// Keeps a fork's cooldown apart from a resume's, so one doesn't block the other.
