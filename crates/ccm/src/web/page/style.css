@@ -241,6 +241,10 @@ tr.group .count { margin-left: 10px; color: var(--muted); font-weight: 400; }
 .col-folder { direction: rtl; text-align: left; font-family: var(--mono); font-size: 12px; }
 th.col-folder { direction: ltr; font-family: var(--sans); }
 
+.col-mark { width: 30px; padding: 0 0 0 9px; text-align: left; }
+.col-mark input { margin: 0; vertical-align: middle; cursor: pointer; }
+tr.marked td { color: var(--you); }
+
 .col-tool { width: 66px; }
 .col-name { width: auto; }
 .col-folder { width: 190px; }
@@ -331,6 +335,19 @@ dialog li { padding: 3px 0; }
 dialog label { display: flex; gap: 8px; align-items: baseline; }
 dialog .where { color: var(--muted); font-family: var(--mono); font-size: 12px; }
 dialog .warn { color: var(--crashed); font-size: 13px; }
+dialog h3 { margin: 14px 0 4px; font-size: 14px; }
+dialog .row-size { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+dialog .row { display: flex; gap: 10px; align-items: baseline; }
+dialog .row-id { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+dialog .toggle { margin: 6px 0; }
+dialog .tone-bold { font-weight: 600; margin-top: 6px; }
+dialog .tone-warn { color: var(--you); }
+dialog .tone-danger { color: var(--crashed); font-weight: 600; }
+dialog .line { white-space: pre-wrap; font-size: 13px; }
+dialog .foot { min-height: 1.4em; margin: 12px 0 0; color: var(--crashed); font-size: 13px; }
+.chip.danger { background: var(--crashed); border-color: var(--crashed); color: var(--bg); font-weight: 600; }
+.chip.danger kbd { color: inherit; }
+.chip.danger:hover { background: var(--crashed); }
 .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 
 .preview {

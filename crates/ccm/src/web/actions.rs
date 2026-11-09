@@ -6,8 +6,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ccm_core::delete;
 use ccm_core::format::{sanitize, short_path};
 use ccm_core::model::{Session, Source};
+use ccm_core::removal;
 use ccm_core::resume::{decide, decide_fork, Decision, Fork};
 use ccm_core::tools::Features;
 use serde_json::{json, Value};
@@ -21,12 +23,20 @@ const NOTHING_TO_REOPEN: &str = "Nothing to reopen. Crash information needs ccm 
 type ResumeFn = Box<dyn Fn(&str, Source, Option<&Fork>, &Path) -> Result<String, String> + Send + Sync>;
 type RenameFn = Box<dyn Fn(&str, Source, &Path, &str) -> Result<String, String> + Send + Sync>;
 type DismissFn = Box<dyn Fn(&[String]) -> Result<(), String> + Send + Sync>;
+type PlanDeleteFn = Box<dyn Fn(&[Session]) -> delete::Plan + Send + Sync>;
+type DeleteFn = Box<dyn Fn(&delete::Plan, bool) -> Result<delete::Outcome, String> + Send + Sync>;
+type OfferFn = Box<dyn Fn(&[String], &[Session]) -> removal::Plan + Send + Sync>;
+type RemoveFn = Box<dyn Fn(&removal::Plan, &[Session]) -> removal::Outcome + Send + Sync>;
 
 /// What actually touches the system. Tests swap these.
 pub struct Effects {
     pub resume: ResumeFn,
     pub rename: RenameFn,
     pub dismiss: DismissFn,
+    pub plan_delete: PlanDeleteFn,
+    pub delete: DeleteFn,
+    pub offer: OfferFn,
+    pub remove: RemoveFn,
 }
 
 /// Conversations just started, as they don't show as open at once.
@@ -34,7 +44,7 @@ pub struct Effects {
 pub struct Starting(HashMap<String, Instant>);
 
 impl Starting {
-    fn recent(&self, key: &str) -> bool {
+    pub(super) fn recent(&self, key: &str) -> bool {
         self.0.get(key).is_some_and(|t| t.elapsed() < COOLDOWN)
     }
 
@@ -73,6 +83,7 @@ pub fn abilities(state: &State, s: &Session) -> Value {
         "resume": features.resume && !s.open && !just_resumed,
         "fork": features.fork,
         "rename": features.rename && !s.open && !just_resumed,
+        "delete": features.delete && !s.open && !just_resumed,
     })
 }
 
@@ -413,9 +424,9 @@ mod tests {
         let mut open = real(dir.path(), A);
         open.open = true;
         let (state, _) = state(dir.path(), vec![open.clone(), real(dir.path(), B)], fine());
-        assert_eq!(abilities(&state, &open), json!({ "resume": false, "fork": true, "rename": false }));
+        assert_eq!(abilities(&state, &open), json!({ "resume": false, "fork": true, "rename": false, "delete": false }));
         let closed = find(&state, B).unwrap();
-        assert_eq!(abilities(&state, &closed), json!({ "resume": true, "fork": true, "rename": true }));
+        assert_eq!(abilities(&state, &closed), json!({ "resume": true, "fork": true, "rename": true, "delete": true }));
         resume(&state, &json!({ "id": B }));
         assert_eq!(abilities(&state, &closed)["resume"], false);
     }

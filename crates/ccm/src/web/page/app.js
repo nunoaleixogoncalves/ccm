@@ -9,6 +9,10 @@ const DETAILS_WAIT_MS = 60;
 const PAGE_ROWS = 10;
 const FORK_WAIT_MS = 15 * 60 * 1000;
 const MAX_NAME = 200;
+// Two clicks this close together are a double-click, so a second one isn't its own decision.
+const DOUBLE_CLICK_MS = 400;
+// Del both opens and confirms a delete, so a held key must not do both.
+const DEL_PAUSE_MS = 1000;
 const GROUPS = ["off", "folder", "repo"];
 const GROUP_LABELS = { off: "Group", folder: "Group: folder", repo: "Group: repo" };
 
@@ -41,6 +45,16 @@ let shownDetails = null;
 let current = null;
 // A fork just started, to select once its tool saves it.
 let awaitingFork = null;
+// Conversations picked for a delete, which otherwise acts on the selected one.
+const marked = new Set();
+let summaryText = "";
+// What the open dialog does with a key, and when it's dismissed.
+let dialogKeys = null;
+let dialogCancel = null;
+let closingDialog = false;
+// A delete is being worked out, which reads every conversation. Keys wait, so one pressed meanwhile
+// can't act on something else.
+let planning = false;
 
 function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
@@ -128,6 +142,7 @@ async function loadList() {
   drawChips();
   drawEmpty(data);
   keepSelection();
+  drawMarks();
   loadDetails();
 }
 
@@ -137,14 +152,63 @@ function drawSummary(data) {
   if (data.crashed) parts.push(`${data.crashed} crashed`);
   if (data.loading) parts.push("scanning…");
   if (data.notice) parts.push(data.notice);
-  $("summary").textContent = parts.join("  ·  ");
+  summaryText = parts.join("  ·  ");
+}
+
+function bytes(n) {
+  const K = 1024, M = K * K, G = M * K;
+  if (n < K) return `${n}B`;
+  if (n < M) return `${Math.floor(n / K)}K`;
+  if (n < G) return `${Math.floor(n / M)}M`;
+  return `${(n / G).toFixed(1)}G`;
+}
+
+function markedShown() {
+  return items().filter((row) => marked.has(row.id));
+}
+
+// Marks change far more often than the rows, and don't need them drawn again.
+function drawMarks() {
+  for (const tr of $("rows").querySelectorAll("tr[data-id]")) {
+    const on = marked.has(tr.dataset.id);
+    tr.classList.toggle("marked", on);
+    tr.querySelector(".col-mark input").checked = on;
+  }
+  const shown = markedShown();
+  const size = shown.reduce((sum, row) => sum + row.bytes, 0);
+  $("summary").textContent = summaryText + (shown.length ? `  ·  ${shown.length} marked ${bytes(size)}` : "");
+  const button = $("delete-button");
+  if (button) {
+    button.firstChild.textContent = shown.length ? `Delete ${shown.length} ` : "Delete ";
+    button.disabled = !shown.length && !(current && current.can.delete);
+  }
+}
+
+function toggleMark(id) {
+  if (!marked.delete(id)) marked.add(id);
+  drawMarks();
+}
+
+function markAndMove() {
+  if (selected === null) return;
+  toggleMark(selected);
+  move(1);
+}
+
+// Marks everything shown, or clears those marks if they're all set already.
+function markAll() {
+  const shown = items().map((row) => row.id);
+  if (shown.every((id) => marked.has(id))) shown.forEach((id) => marked.delete(id));
+  else shown.forEach((id) => marked.add(id));
+  drawMarks();
 }
 
 function drawHead() {
   const state = JSON.stringify([columns, view.sort, view.desc]);
   if (state === drawnColumns) return;
   drawnColumns = state;
-  $("head").replaceChildren(...columns.map((column) => {
+  const markHead = el("th", { className: "col-mark", scope: "col", ariaLabel: "Marked" });
+  $("head").replaceChildren(markHead, ...columns.map((column) => {
     const sorted = column.key === view.sort;
     const button = el("button", { textContent: column.title + (sorted ? (view.desc ? " ▼" : " ▲") : "") });
     button.addEventListener("click", () => sortBy(column));
@@ -167,10 +231,11 @@ function rowClass(cells) {
 function drawRow(row) {
   if (row.header !== undefined) {
     const count = el("span", { className: "count", textContent: `${row.count}  ·  ${row.size}` });
-    return el("tr", { className: "group" }, el("td", { colSpan: columns.length, textContent: row.header }, count));
+    return el("tr", { className: "group" }, el("td", { colSpan: columns.length + 1, textContent: row.header }, count));
   }
   const tr = el("tr", { className: rowClass(row.cells) });
   tr.dataset.id = row.id;
+  tr.append(el("td", { className: "col-mark" }, el("input", { type: "checkbox", tabIndex: -1, ariaLabel: `Mark ${row.cells.name}` })));
   for (const column of columns) {
     const td = el("td", { className: "col-" + column.key, title: row.cells[column.key] });
     if (column.key === "folder") {
@@ -296,6 +361,12 @@ function actionButton(label, key, action, enabled = true, main = false) {
   return button;
 }
 
+function deleteButton(data) {
+  const button = actionButton("Delete ", "d", startDelete, data.can.delete);
+  button.id = "delete-button";
+  return button;
+}
+
 function drawDetails(data) {
   current = data;
   const details = $("details");
@@ -325,9 +396,11 @@ function drawDetails(data) {
     actionButton("Resume", "Enter", () => resume(), data.can.resume, true),
     actionButton("Fork", "f", () => resume(true), data.can.fork),
     actionButton("Rename", "R", startRename, data.can.rename),
+    deleteButton(data),
     actionButton("Copy ID", "y", () => copy(data.id)),
     actionButton("Copy command", "Y", () => copy(data.command)));
   details.replaceChildren(el("h2", { textContent: data.name }), actions, facts);
+  drawMarks();
   if (data.notes.length) {
     details.append(el("ul", { className: "notes" }, ...data.notes.map((note) => el("li", { textContent: note }))));
   }
@@ -361,15 +434,18 @@ async function copy(text) {
   }
 }
 
-function openDialog(title, body, buttons, onSubmit) {
+function openDialog(title, body, buttons, onSubmit, keys = null, onCancel = () => say("Cancelled.")) {
   $("dialog-title").textContent = title;
   $("dialog-body").replaceChildren(...body);
   $("dialog-buttons").replaceChildren(...buttons);
   dialogSubmit = onSubmit;
-  $("dialog").showModal();
+  dialogKeys = keys;
+  dialogCancel = onCancel;
+  if (!$("dialog").open) $("dialog").showModal();
 }
 
 function closeDialog() {
+  closingDialog = true;
   $("dialog").close();
 }
 
@@ -380,7 +456,7 @@ function dialogButton(label, action, primary = false) {
 }
 
 function cancelButton() {
-  return dialogButton("Cancel", () => { closeDialog(); say("Cancelled."); });
+  return dialogButton("Cancel", () => { closeDialog(); dialogCancel(); });
 }
 
 let dialogSubmit = null;
@@ -455,6 +531,193 @@ async function startReopen() {
     openDialog("Reopen finished", result.lines.map((line) => el("p", { textContent: line })), [dialogButton("OK", null, true)], closeDialog);
     loadList();
   });
+}
+
+function joined(parts) {
+  return parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts.join("");
+}
+
+async function startDelete() {
+  if (planning) return;
+  const shown = markedShown().map((row) => row.id);
+  if (!shown.length && !(current && current.can.delete)) {
+    say("This conversation is open, so it can't be deleted.", true);
+    return;
+  }
+  const ids = shown.length ? shown : [selected];
+  planning = true;
+  say("Working out what would go…");
+  const plan = await post("/api/delete/plan", { ids });
+  planning = false;
+  say("");
+  if (!plan) return;
+  if (!plan.ok) {
+    say(plan.message, true);
+    return;
+  }
+  showDeletePlan(plan);
+}
+
+function section(title) {
+  return el("h3", { textContent: title });
+}
+
+function showDeletePlan(plan) {
+  const opened = Date.now();
+  let delPressed = opened;
+  let notes = false;
+  let worktrees = false;
+  let unlockAt = null;
+  let restarted = false;
+  let busy = false;
+  let timer = 0;
+
+  const lead = el("p", { className: "tone-bold" });
+  const foot = el("p", { className: "foot", role: "status" });
+  const list = el("ul", {}, ...plan.conversations.map((c) => el("li", { className: "row" },
+    el("span", { textContent: c.name }), el("span", { className: "row-id", textContent: c.short }), el("span", { className: "row-size", textContent: bytes(c.bytes) }))));
+  const body = [lead, list];
+  for (const line of [...plan.skipped, ...plan.warnings]) body.push(el("p", { className: "line", textContent: line }));
+
+  const notesHead = section("");
+  const notesBox = el("input", { type: "checkbox" });
+  if (plan.notes.length) {
+    body.push(notesHead, el("ul", {}, ...plan.notes.map((name) => el("li", { className: "line", textContent: name }))),
+      el("label", { className: "toggle" }, notesBox, el("span", { textContent: "Delete these notes too " }), el("kbd", { textContent: "m" })));
+  }
+
+  const treesHead = section("");
+  const treesBox = el("input", { type: "checkbox" });
+  if (plan.worktree_count || plan.stays.length) {
+    body.push(treesHead, ...plan.worktrees.map((line) => el("p", { className: `line tone-${line.tone}`, textContent: line.text })));
+    for (const line of plan.stays) body.push(el("p", { className: "line", textContent: line }));
+    if (plan.worktree_count) {
+      body.push(el("label", { className: "toggle" }, treesBox, el("span", { textContent: "Remove these worktrees too " }), el("kbd", { textContent: "w" })));
+    }
+  }
+  body.push(foot);
+
+  const deleteBtn = el("button", { type: "submit", className: "chip danger" }, "Delete ", el("kbd", { textContent: "y" }));
+  const cancel = cancelButton();
+
+  function secondsLeft() {
+    return unlockAt === null ? 0 : Math.max(0, Math.ceil((unlockAt - Date.now()) / 1000));
+  }
+
+  function update() {
+    const count = plan.conversations.length;
+    const what = [`${count} conversation${count === 1 ? "" : "s"}`];
+    if (worktrees) what.push(`${plan.worktree_count} worktree${plan.worktree_count === 1 ? "" : "s"}`);
+    const freed = plan.bytes.conversations + (notes ? plan.bytes.notes : 0) + (worktrees ? plan.bytes.worktrees : 0);
+    lead.textContent = `${joined(what)}, ${bytes(freed)} freed. This can't be undone.`;
+    notesHead.textContent = `Memory notes nothing else wrote ${notes ? "will be deleted" : "will be kept"}:`;
+    treesHead.textContent = !plan.worktree_count ? "Worktrees nothing else used:"
+      : worktrees ? "Worktrees nothing else used will be removed too. Their branches stay, so commits are kept:"
+      : "Worktrees nothing else used are kept unless you tick the box:";
+    const left = secondsLeft();
+    deleteBtn.disabled = busy || left > 0;
+    if (left > 0) {
+      foot.textContent = `${restarted ? "Too early, so it started over. " : ""}Delete unlocks in ${left}s, because of the unpushed commits. Pressing y or Del before then starts it over. Unticking the worktrees ends the wait.`;
+    } else if (!busy && foot.dataset.note !== "keep") {
+      foot.textContent = "";
+    }
+  }
+
+  function setCountdown(seconds) {
+    unlockAt = seconds ? Date.now() + seconds * 1000 : null;
+    clearInterval(timer);
+    if (seconds) {
+      timer = setInterval(() => {
+        update();
+        if (secondsLeft() === 0) clearInterval(timer);
+      }, 200);
+    }
+    update();
+  }
+
+  function finished() {
+    clearInterval(timer);
+  }
+
+  function toggleNotes() {
+    notes = notesBox.checked;
+    update();
+  }
+
+  async function toggleWorktrees() {
+    busy = true;
+    update();
+    const result = await post("/api/delete/worktrees", { plan_id: plan.plan_id, include: treesBox.checked });
+    busy = false;
+    if (!result || !result.ok) {
+      finished();
+      closeDialog();
+      if (result) say(result.message, true);
+      return;
+    }
+    worktrees = result.include;
+    restarted = false;
+    setCountdown(result.seconds_left);
+  }
+
+  async function confirmDelete() {
+    if (busy) return;
+    busy = true;
+    foot.textContent = "Deleting…";
+    update();
+    const result = await post("/api/delete/confirm", { plan_id: plan.plan_id, notes, worktrees });
+    busy = false;
+    if (result && result.restarted) {
+      restarted = true;
+      setCountdown(result.seconds_left);
+      return;
+    }
+    finished();
+    closeDialog();
+    if (!result) return;
+    if (!result.ok) {
+      say(result.message, true);
+      return;
+    }
+    result.deleted.forEach((id) => marked.delete(id));
+    if (result.lines.length) {
+      const lines = [result.summary, ...result.lines].filter(Boolean);
+      openDialog("Delete finished", lines.map((line) => el("p", { textContent: line })), [dialogButton("OK", null, true)], closeDialog, null, () => {});
+    } else {
+      say(result.summary);
+    }
+    loadList();
+  }
+
+  notesBox.addEventListener("change", toggleNotes);
+  treesBox.addEventListener("change", toggleWorktrees);
+
+  const keys = {
+    y: confirmDelete,
+    Delete: () => {
+      if (secondsLeft() === 0 && Date.now() - delPressed < DEL_PAUSE_MS) {
+        delPressed = Date.now();
+        foot.dataset.note = "keep";
+        foot.textContent = "Too quick. Wait a moment, then press Del again.";
+        return;
+      }
+      foot.dataset.note = "";
+      confirmDelete();
+    },
+  };
+  if (plan.notes.length) keys.m = () => { notesBox.checked = !notesBox.checked; toggleNotes(); };
+  if (plan.worktree_count) keys.w = () => { treesBox.checked = !treesBox.checked; toggleWorktrees(); };
+
+  openDialog("Delete permanently?", body, [cancel, deleteBtn], () => {
+    // A second click of a double-click that opened this isn't an answer.
+    if (Date.now() - opened >= DOUBLE_CLICK_MS) confirmDelete();
+  }, keys, () => {
+    finished();
+    post("/api/delete/cancel", { plan_id: plan.plan_id });
+    say("Cancelled. Nothing was deleted.");
+  });
+  update();
+  cancel.focus();
 }
 
 function sortBy(column) {
@@ -553,6 +816,10 @@ const KEYS = {
   y: () => { if (current) copy(current.id); },
   Y: () => { if (current) copy(current.command); },
   O: startReopen,
+  d: startDelete,
+  Delete: startDelete,
+  " ": markAndMove,
+  a: markAll,
   g: nextGroup,
   s: nextSort,
   r: reverse,
@@ -560,8 +827,20 @@ const KEYS = {
 
 document.addEventListener("keydown", (event) => {
   if (event.ctrlKey || event.metaKey || event.altKey) return;
-  if ($("dialog").open) return;
-  if (event.key === "Enter" && event.target.closest("button")) return;
+  if (planning) {
+    event.preventDefault();
+    return;
+  }
+  if ($("dialog").open) {
+    const action = dialogKeys && dialogKeys[event.key];
+    if (action && !event.repeat && !event.target.matches('input[type="text"]')) {
+      event.preventDefault();
+      action();
+    }
+    return;
+  }
+  if (event.repeat && (event.key === "d" || event.key === "Delete")) return;
+  if ((event.key === "Enter" || event.key === " ") && event.target.closest("button")) return;
   if (event.target === $("search")) {
     onSearchKey(event);
     return;
@@ -576,15 +855,26 @@ document.addEventListener("keydown", (event) => {
 $("search").addEventListener("input", (event) => setQuery(event.target.value));
 $("rows").addEventListener("click", (event) => {
   const tr = event.target.closest("tr[data-id]");
-  if (tr) select(tr.dataset.id);
+  if (!tr) return;
+  if (event.target.matches(".col-mark input")) toggleMark(tr.dataset.id);
+  else select(tr.dataset.id);
 });
 $("rows").addEventListener("dblclick", (event) => {
   const tr = event.target.closest("tr[data-id]");
-  if (tr) resume(false, false, tr.dataset.id);
+  if (tr && !event.target.matches(".col-mark input")) resume(false, false, tr.dataset.id);
 });
 $("dialog-form").addEventListener("submit", (event) => {
   event.preventDefault();
   if (dialogSubmit) dialogSubmit();
+});
+// Closed by anything but this page, which is Esc. The browser doesn't always say "cancel" first.
+$("dialog").addEventListener("close", () => {
+  if (!closingDialog && dialogCancel) dialogCancel();
+  closingDialog = false;
+});
+// After a mouse click, keys should go back to the list rather than repeat the button.
+document.addEventListener("click", (event) => {
+  if (event.detail > 0 && !$("dialog").open) event.target.closest("button")?.blur();
 });
 $("status-copy").addEventListener("click", () => copy($("status-copy").dataset.command));
 for (const chip of document.querySelectorAll("[data-filter]")) {
@@ -595,6 +885,7 @@ $("group").addEventListener("click", nextGroup);
 $("reverse").addEventListener("click", reverse);
 $("clear").addEventListener("click", clearFilters);
 $("reopen").addEventListener("click", startReopen);
+$("mark-all").addEventListener("click", markAll);
 
 async function poll() {
   if (document.hidden) return;

@@ -124,6 +124,7 @@ fn item(view: &View, s: &Session, grouping: Grouping) -> Value {
     let or_dash = |v: Option<&str>| v.map_or("-".to_string(), sanitize);
     json!({
         "id": s.id,
+        "bytes": s.size_bytes,
         "tag": tag,
         "cells": {
             "tool": s.source.short(),

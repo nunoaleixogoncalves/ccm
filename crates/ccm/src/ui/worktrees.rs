@@ -2,7 +2,7 @@
 //! worked in the selected worktree where the preview would be.
 
 use ccm_core::format::{ago, bytes, sanitize, short_path};
-use ccm_core::removal::{Planned, NAMED_IGNORED};
+use ccm_core::removal::Planned;
 use ccm_core::model::Session;
 use ccm_core::worktree::{Link, State, Worktree};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table};
 use ratatui::Frame;
 
+use crate::wording::{planned_lines, plural, share, Tone};
 use super::{draw_dialog, Dialog, draw_footer, fit_end, fit_start, footer_rows, header_only_lines, COLUMN_SPACING, MIN_HEIGHT_FOR_PREVIEW};
 use crate::app::App;
 use crate::worktrees::Row as ListRow;
@@ -201,10 +202,6 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_stateful_widget(table, area, &mut app.worktrees.table);
 }
 
-fn plural(n: u64, one: &str, many: &str) -> String {
-    format!("{n} {}", if n == 1 { one } else { many })
-}
-
 /// What the state means, in words. Remote branches are as Git last saw them, as `ccm` never
 /// fetches.
 fn state_lines(w: &Worktree) -> Vec<String> {
@@ -298,51 +295,19 @@ pub(super) fn remove_dialog(app: &App) -> Dialog {
 }
 
 pub(super) fn item_lines(app: &App, item: &Planned, bold: Style, warn: Style, plain: Style) -> Vec<(String, Style)> {
-    let path = sanitize(&short_path(&item.target.path.to_string_lossy(), &app.home));
-    let branch = item.branch.as_deref().map_or("(detached)".to_string(), sanitize);
-    let mut lines = vec![(format!("{path}  {branch}"), bold)];
     let danger = Style::new().fg(Color::Red);
-    match (item.unpushed, item.has_remote) {
-        (0, _) => {}
-        (n, true) => lines.push((format!("  {} on no remote branch, as of the last fetch.", plural(n, "commit", "commits")), danger)),
-        (n, false) => lines.push((format!("  No remote, so {} only on this machine.", plural(n, "commit is", "commits are")), danger)),
-    }
-    if item.unpushed > 0 && item.upstream_gone {
-        lines.push(("  Its remote branch was deleted, which usually means it was merged. ccm can't check.".into(), plain));
-    }
-    if item.gone {
-        lines.push(("  Its folder is already gone. This only clears Git's record of it.".into(), plain));
-    }
-    if !item.ignored.is_empty() {
-        let at_least = if item.ignored_more { "at least " } else { "" };
-        let mut names: Vec<String> = item.ignored.iter().take(NAMED_IGNORED).map(|n| sanitize(n)).collect();
-        if item.ignored.len() > NAMED_IGNORED {
-            names.push(format!("and {} more", item.ignored.len() - NAMED_IGNORED));
-        }
-        lines.push((format!("  Deletes ignored files, {at_least}{}: {}", bytes(item.ignored_bytes), names.join(", ")), warn));
-    }
-    match item.links.len() {
-        0 => {}
-        1 => lines.push(("  1 conversation worked here:".into(), plain)),
-        n => lines.push((format!("  {n} conversations worked here:"), warn)),
-    }
-    let mut links: Vec<&Link> = item.links.iter().collect();
-    links.sort_by_key(|l| std::cmp::Reverse(l.last_ms));
-    for l in links {
-        let name = session(app, &l.id).map_or(l.id.clone(), |s| sanitize(&s.display_name()));
-        lines.push((format!("    {name}  ({} of its activity)", share(l)), plain));
-        if l.started_here {
-            lines.push(("      It started here, so resuming it later recreates this folder empty.".into(), plain));
-        }
-    }
-    lines.push((String::new(), plain));
-    lines
-}
-
-/// How much of a conversation happened here, which tells working here from passing through.
-fn share(l: &Link) -> String {
-    let percent = (l.records * 100).checked_div(l.total).unwrap_or(0);
-    if percent == 0 { "under 1%".into() } else { format!("{percent}%") }
+    planned_lines(item, &app.sessions, &app.home)
+        .into_iter()
+        .map(|(text, tone)| {
+            let style = match tone {
+                Tone::Plain => plain,
+                Tone::Bold => bold,
+                Tone::Warn => warn,
+                Tone::Danger => danger,
+            };
+            (text, style)
+        })
+        .collect()
 }
 
 fn draw_conversations(f: &mut Frame, app: &App, area: Rect, now_ms: i64) {

@@ -3,6 +3,7 @@ mod clipboard;
 mod repos;
 mod ui;
 mod web;
+mod wording;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
