@@ -46,6 +46,16 @@ It then runs `ccm setup`, which shows the changes it would make to Claude Code's
 
 The Linux programs are static, so they work on any distribution. The macOS ones aren't signed: installing with the command above is fine, but macOS may refuse one you download with a browser until you allow it in **System Settings → Privacy & Security**.
 
+### Trying the beta
+
+`2.0.0-beta` is a pre-release, so the command above still installs the last stable version. To install the beta instead:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nunoaleixogoncalves/ccm/main/install.sh | CCM_RELEASE_URL=https://github.com/nunoaleixogoncalves/ccm/releases/download/v2.0.0-beta sh
+```
+
+Codex support is new and is still being tested with real Codex conversations. To go back to the stable version, run the install command above.
+
 ### Build from source
 
 You need Git, [Rust](https://rustup.rs) (current stable) and a C compiler to build the bundled SQLite. Open a new terminal after installing Rust, so `cargo` is found.

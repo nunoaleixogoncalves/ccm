@@ -81,6 +81,14 @@ jobs:
         run: |
           awk -v head="## [${GITHUB_REF_NAME#v}]" 'index($0, "## [") == 1 { if (found) exit; found = index($0, head) == 1; next } found' CHANGELOG.md > notes.md
           grep -q '[^[:space:]]' notes.md || { echo "CHANGELOG.md has no section for ${GITHUB_REF_NAME#v}"; exit 1; }
-      - run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --notes "$(cat notes.md)"
+      # A tag with a dash, such as v2.0.0-beta, is a pre-release. GitHub doesn't count those as the
+      # latest release, so the install command keeps giving everyone the last stable version.
+      - name: Publish
+        run: |
+          case "$GITHUB_REF_NAME" in
+            *-*) set -- --prerelease ;;
+            *) set -- ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --notes "$(cat notes.md)" "$@"
         env:
           GH_TOKEN: ${{ github.token }}
