@@ -2,7 +2,9 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::path::Path;
 
+use crate::format::sanitize;
 use crate::model::{Session, Source};
 use crate::repo::{infer, Place};
 
@@ -120,6 +122,17 @@ pub fn status_rank(s: &Session) -> u8 {
     }
 }
 
+/// What the status column says.
+pub fn status_text(s: &Session) -> &'static str {
+    match status_rank(s) {
+        4 => "open",
+        3 => "crashed",
+        2 => "missing",
+        1 => "junk",
+        _ => "",
+    }
+}
+
 fn compare(a: &Session, b: &Session, key: SortKey) -> Ordering {
     match key {
         SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
@@ -224,6 +237,13 @@ pub fn worktree_of<'a>(s: &'a Session, places: &'a HashMap<String, Place>) -> Op
         }
         Place::NotGit => None,
     }
+}
+
+/// The branch and the worktree, which tell apart the work in one repository group.
+pub fn repo_tag(s: &Session, places: &HashMap<String, Place>) -> Option<String> {
+    let worktree = worktree_of(s, places).map(|w| Path::new(w).file_name().map_or(w.into(), |n| n.to_string_lossy()));
+    let parts: Vec<String> = s.branch.as_deref().into_iter().map(sanitize).chain(worktree.map(|w| sanitize(&w))).collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 fn group_by(sessions: &[Session], rows: &[usize], key: impl Fn(&Session) -> Group) -> Vec<GroupRow> {

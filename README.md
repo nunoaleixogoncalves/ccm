@@ -29,6 +29,7 @@ If you run a lot of Claude Code sessions, they pile up:
 - **Clean up:** one screen lists what could be cleaned up and how much space it would free, and deletes it after asking: conversations Claude never replied to, ones whose folder is gone, large ones you haven't used for a while, worktrees nothing needs, and leftover background job folders.
 - **Recover:** after a crash, see what was running and reopen it all at once.
 - **Worktrees:** see the Git worktrees of the repositories your conversations used, with their uncommitted changes, unpushed commits and the conversations that worked in each, and remove the ones you're done with.
+- **Web version:** browse, search and preview in a browser, on this computer only. See [Web version](#web-version).
 - **Codex:** Codex conversations show in the same list, and can be searched, previewed, resumed, forked, renamed and deleted. See [Codex](#codex).
 
 ## Install
@@ -91,6 +92,7 @@ Run `ccm` from anywhere.
 | Command | What it does |
 |---|---|
 | `ccm` | Opens the list |
+| `ccm web` | Opens the list in a browser. See [Web version](#web-version) |
 | `ccm setup` | Installs the hooks crash recovery needs, after showing the changes |
 | `ccm --help` | Shows the commands |
 | `ccm --version` | Shows the version |
@@ -236,6 +238,26 @@ Codex conversations can be resumed, forked and deleted, through Codex's own comm
 
 **Rename** works the way Codex's own `/rename` does: one more line in `session_index.jsonl`, written while holding Codex's `session_index.jsonl.lock`, and Codex shows the newest one. An open conversation is renamed from Codex itself. So is one using Codex's opt-in paginated history, which keeps names in Codex's database. Files Codex compressed (`.jsonl.zst`) aren't read yet.
 
+## Web version
+
+`ccm web` shows the same list in a browser: search, filters, sorting, grouping and the preview, with the same keys. It updates by itself, and can run alongside the terminal app. For now it only reads. Nothing can be changed from it yet.
+
+It opens your browser and prints a link, then runs until you press `Ctrl+C`.
+
+| Option | What it does |
+|---|---|
+| `--port N` | Uses this port instead of a free one |
+| `--no-browser` | Only prints the link |
+
+It's for this computer only:
+
+- It only accepts connections from this computer, and only at the address it printed.
+- The link holds a secret that works once and is swapped for a cookie, so the page keeps working in that browser until `ccm web` stops. To use another browser, start `ccm web` again.
+- It refuses requests that other websites try to send it.
+- Conversation text is always shown as plain text, and the page loads nothing from anywhere else.
+
+On another computer over SSH, forward the same port on both sides, such as `ssh -L 9000:127.0.0.1:9000`, and run `ccm web --port 9000 --no-browser`.
+
 ## Configuration
 
 Everything is optional. The file is `~/.config/ccm/config.toml`:
@@ -268,7 +290,7 @@ On WSL, `ccm` opens a new Windows Terminal tab when `terminal` isn't set. It sta
 
 ## What it touches on your machine
 
-`ccm` reads Claude Code's files in `~/.claude`, or in `CLAUDE_CONFIG_DIR` if that's set, and Codex's conversation files in `~/.codex/sessions` and its `session_index.jsonl`, or in `CODEX_HOME`. It only changes Codex's data through `codex delete`, plus the prompt history edit and the name line described in [Codex](#codex), and never opens its databases. It sends nothing over the network.
+`ccm` reads Claude Code's files in `~/.claude`, or in `CLAUDE_CONFIG_DIR` if that's set, and Codex's conversation files in `~/.codex/sessions` and its `session_index.jsonl`, or in `CODEX_HOME`. It only changes Codex's data through `codex delete`, plus the prompt history edit and the name line described in [Codex](#codex), and never opens its databases. It sends nothing over the network. [`ccm web`](#web-version) serves its page to this computer only.
 
 While the [worktree view](#worktrees) is open, it runs Git in the repositories your conversations worked in. While [grouping by repository](#grouping), it asks Git which repository each folder belongs to. The [clean-up screen](#cleaning-up) runs the same Git checks as the worktree view, and measures the size of the worktrees it suggests. Only `git worktree remove` changes anything, and only after you confirm. It ignores `GIT_*` variables from its own environment, stops a repository's `core.fsmonitor` setting from running a program, takes no optional locks and never fetches.
 
@@ -317,6 +339,8 @@ Only sessions started after `ccm setup` are tracked. Codex conversations need no
 | macOS | Built and tested on Intel and Apple Silicon by automated checks, but not yet used by hand |
 | WSL | Works like Linux. Resuming opens a Windows Terminal tab, which hasn't yet been checked by hand |
 | Windows | Not supported outside WSL |
+
+`ccm web` has been used by hand in Chrome on Linux so far.
 
 Tested with Claude Code 2.1.318. Claude Code's file format isn't documented and can change, so `ccm` skips anything it doesn't recognise and warns you rather than crashing.
 

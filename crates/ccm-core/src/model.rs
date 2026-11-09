@@ -79,6 +79,11 @@ fn yes() -> bool {
 }
 
 impl Session {
+    /// The name to show, for a list or a dialog.
+    pub fn display_name(&self) -> String {
+        if self.name.is_empty() { "(untitled)".to_string() } else { self.name.clone() }
+    }
+
     pub fn messages(&self) -> u64 {
         self.prompts + self.replies
     }

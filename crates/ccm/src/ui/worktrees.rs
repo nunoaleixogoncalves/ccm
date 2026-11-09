@@ -1,7 +1,7 @@
 //! The worktree view. It's laid out like the conversation list, with the conversations that
 //! worked in the selected worktree where the preview would be.
 
-use ccm_core::format::{ago, bytes, sanitize};
+use ccm_core::format::{ago, bytes, sanitize, short_path};
 use ccm_core::removal::{Planned, NAMED_IGNORED};
 use ccm_core::model::Session;
 use ccm_core::worktree::{Link, State, Worktree};
@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table};
 use ratatui::Frame;
 
-use super::{display_name, draw_dialog, Dialog, draw_footer, fit_end, fit_start, footer_rows, header_only_lines, short_path, COLUMN_SPACING, MIN_HEIGHT_FOR_PREVIEW};
+use super::{draw_dialog, Dialog, draw_footer, fit_end, fit_start, footer_rows, header_only_lines, COLUMN_SPACING, MIN_HEIGHT_FOR_PREVIEW};
 use crate::app::App;
 use crate::worktrees::Row as ListRow;
 
@@ -329,7 +329,7 @@ pub(super) fn item_lines(app: &App, item: &Planned, bold: Style, warn: Style, pl
     let mut links: Vec<&Link> = item.links.iter().collect();
     links.sort_by_key(|l| std::cmp::Reverse(l.last_ms));
     for l in links {
-        let name = session(app, &l.id).map_or(l.id.clone(), |s| sanitize(&display_name(s)));
+        let name = session(app, &l.id).map_or(l.id.clone(), |s| sanitize(&s.display_name()));
         lines.push((format!("    {name}  ({} of its activity)", share(l)), plain));
         if l.started_here {
             lines.push(("      It started here, so resuming it later recreates this folder empty.".into(), plain));
@@ -378,7 +378,7 @@ fn draw_conversations(f: &mut Frame, app: &App, area: Rect, now_ms: i64) {
                 _ => "",
             };
             let tail = format!("  {state}{}", notes.join(", "));
-            let name = s.map_or(l.id.clone(), |s| sanitize(&display_name(s)));
+            let name = s.map_or(l.id.clone(), |s| sanitize(&s.display_name()));
             let room = width.saturating_sub(unicode_width::UnicodeWidthStr::width(tail.as_str())).max(10);
             let style = match s {
                 Some(s) if s.open => Style::new().fg(Color::Green),
