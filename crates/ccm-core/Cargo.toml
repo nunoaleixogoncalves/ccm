@@ -1,6 +1,6 @@
 [package]
 name = "ccm-core"
-version = "1.1.1"
+version = "2.0.0-beta"
 edition = "2024"
 description = "The library behind ccm"
 repository = "https://github.com/nunoaleixogoncalves/ccm"

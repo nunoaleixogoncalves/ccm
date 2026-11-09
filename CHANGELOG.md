@@ -2,7 +2,9 @@
 
 Every release of `ccm` and what changed in it. Each section is also used as the notes of its release on GitHub.
 
-## Unreleased
+## [2.0.0-beta] - 2026-11-09
+
+A pre-release, so the install command keeps giving you the last stable version. To try this one, see [Trying the beta](https://github.com/nunoaleixogoncalves/ccm#trying-the-beta). Codex support is new and is still being tested with real Codex conversations. `ccm web` has been tested in Chrome on Linux.
 
 ### Added
 
@@ -65,6 +67,7 @@ The first release.
 - `ccm setup` to install the hooks crash recovery needs, after showing the changes and asking.
 - Ready-made programs for Linux (static, x86-64 and ARM) and macOS (Intel and Apple silicon), and an install script that checks their checksums.
 
+[2.0.0-beta]: https://github.com/nunoaleixogoncalves/ccm/compare/v1.1.1...v2.0.0-beta
 [1.1.1]: https://github.com/nunoaleixogoncalves/ccm/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/nunoaleixogoncalves/ccm/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/nunoaleixogoncalves/ccm/releases/tag/v1.0.0
