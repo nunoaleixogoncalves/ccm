@@ -351,12 +351,17 @@ mod tests {
         let mut made = State::for_tests(dir.path(), vec![worked_in(A, "/home/me/shop-tidy")]);
         let asked: Asked = Arc::default();
         let log = Arc::clone(&asked);
+        // Holds the scan until the page has been told it's still looking, or it could finish first.
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let held = Arc::clone(&gate);
         Arc::get_mut(&mut made).unwrap().effects.scan = Box::new(move |folders, measure| {
             log.lock().unwrap().push((folders.to_vec(), measure));
+            held.wait();
             (Scan { worktrees: vec![worktree("/home/me/shop-tidy", 0, 0)], errors: Vec::new() }, Some(HashMap::from([(PathBuf::from("/home/me/shop-tidy"), 7)])), HashSet::new())
         });
         lock(&made.worktrees).measure_due = true;
         assert_eq!(list(&made, &no_params())["empty"], "Looking for worktrees…");
+        gate.wait();
         for _ in 0..200 {
             if lock(&made.worktrees).scan.is_some() {
                 break;
