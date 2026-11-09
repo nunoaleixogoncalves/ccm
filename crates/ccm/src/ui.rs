@@ -2,6 +2,7 @@ use ccm_core::delete::Item;
 use ccm_core::format::{ago, bytes, sanitize};
 use ccm_core::model::{Session, Source};
 use ccm_core::preview::{Preview, Role};
+use ccm_core::removal;
 use ccm_core::query::{worktree_of, Group, GroupRow, SortKey};
 use ccm_core::repo::Place;
 use chrono::{Local, TimeZone};
@@ -217,9 +218,9 @@ fn delete_dialog(app: &App) -> Dialog {
     let plain = Style::new();
     let bold = plain.add_modifier(Modifier::BOLD);
 
-    let removing = confirm.worktrees.as_ref().map_or(&[][..], |r| r.items.as_slice());
+    let removing = if confirm.include_worktrees { confirm.offered.items.as_slice() } else { confirm.worktrees.as_ref().map_or(&[][..], |r| r.items.as_slice()) };
     // A worktree's whole folder goes, as far as it was measured.
-    let worktree_bytes: u64 = removing.iter().filter_map(|i| app.worktrees.sizes.get(&i.target.path)).sum();
+    let worktree_bytes: u64 = removing.iter().map(|i| app.worktrees.sizes.get(&i.target.path).copied().unwrap_or(i.bytes)).sum();
     let freed = plan.bytes() + if confirm.include_notes { plan.note_bytes() } else { 0 } + worktree_bytes;
     let count = plan.items.len();
     let jobs: Vec<_> = confirm.jobs.iter().filter(|j| !j.worktree).collect();
@@ -263,6 +264,29 @@ fn delete_dialog(app: &App) -> Dialog {
         body.push((format!("Memory notes nothing else wrote {what}:"), bold));
         body.extend(plan.notes.iter().map(|n| (format!("  {}", sanitize(&n.name())), plain)));
     }
+    let offered = &confirm.offered;
+    if !offered.items.is_empty() || !offered.refused.is_empty() {
+        body.push((String::new(), plain));
+        let title = match (offered.items.is_empty(), confirm.include_worktrees) {
+            (true, _) => "Worktrees nothing else used:",
+            (false, true) => "Worktrees nothing else used will be removed too. Their branches stay, so commits are kept:",
+            (false, false) => "Worktrees nothing else used are kept unless you press w:",
+        };
+        body.push((title.into(), bold));
+        let warn = Style::new().fg(Color::Yellow);
+        for item in &offered.items {
+            // Only the conversations being deleted worked there, and they're listed above.
+            let item = removal::Planned { links: Vec::new(), ..item.clone() };
+            body.extend(worktrees::item_lines(app, &item, bold, warn, plain));
+        }
+        body.extend(offered.refused.iter().map(|r| {
+            let path = sanitize(&short_path(&r.path.to_string_lossy(), &app.home));
+            (format!("{path} stays: {}", sanitize(&r.reason)), plain)
+        }));
+        if body.last().is_some_and(|(l, _)| l.is_empty()) {
+            body.pop();
+        }
+    }
     if let Some(remove) = &confirm.worktrees {
         let warn = Style::new().fg(Color::Yellow);
         if !body.is_empty() {
@@ -303,7 +327,14 @@ fn delete_dialog(app: &App) -> Dialog {
         body.extend(confirm.jobs.iter().map(|l| (cleanup::job_line(l, width, now_ms), plain)));
     }
     let notes = if plan.notes.is_empty() { "" } else { "m toggle notes   " };
-    let bottom = format!("y or Del delete   {notes}any other key cancels   or click Delete again");
+    let offer = if offered.items.is_empty() { "" } else { "w toggle worktrees   " };
+    let bottom = match confirm.countdown.seconds_left() {
+        Some(left) => {
+            let again = if confirm.countdown.restarted { "Too early, so it started over. " } else { "" };
+            format!("{again}Delete unlocks in {left}s, because of the unpushed commits. Pressing y, Del or Delete before then starts it over.   w leaves the worktrees.   Any other key cancels.")
+        }
+        None => format!("y or Del delete   {notes}{offer}any other key cancels   or click Delete again"),
+    };
     Dialog { title: " Delete permanently? ", top, body, bottom }
 }
 
@@ -1364,6 +1395,126 @@ mod tests {
         assert!(render(&mut a, 160, 20).contains("Press q to quit."));
         a.on_key(KeyCode::Char('q'));
         assert!(a.quit);
+    }
+
+    type Removed = Rc<RefCell<Vec<(Vec<std::path::PathBuf>, Vec<String>)>>>;
+
+    /// Deleting offers one worktree. Removal records what it was given and which conversations were left.
+    fn offers(a: &mut App, unpushed: u64) -> Removed {
+        a.worktree_offer = Some(Box::new(move |_, _| removal::Plan {
+            items: vec![removal::Planned {
+                target: removal::Target { path: "/home/me/app-fix".into(), repo: "/home/me/app".into() },
+                branch: Some("fix".into()),
+                gone: false,
+                ignored: Vec::new(),
+                ignored_bytes: 0,
+                ignored_more: false,
+                links: Vec::new(),
+                unpushed,
+                has_remote: true,
+                upstream_gone: false,
+                bytes: 3 * 1024 * 1024,
+            }],
+            refused: Vec::new(),
+            unused_only: true,
+        }));
+        let removed: Removed = Rc::default();
+        let log = removed.clone();
+        a.remover = Some(Box::new(move |plan, sessions| {
+            let paths: Vec<std::path::PathBuf> = plan.items.iter().map(|i| i.target.path.clone()).collect();
+            log.borrow_mut().push((paths.clone(), sessions.iter().map(|s| s.id.clone()).collect()));
+            removal::Outcome { removed: paths, ..removal::Outcome::default() }
+        }));
+        removed
+    }
+
+    #[test]
+    fn a_worktree_only_goes_with_a_delete_when_asked_for() {
+        let mut a = app();
+        let calls = deletable(&mut a, &[]);
+        let removed = offers(&mut a, 0);
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Char('d'));
+        let screen = render(&mut a, 140, 40);
+        assert!(screen.contains("are kept unless you press w") && screen.contains("~/app-fix  fix") && screen.contains("w toggle worktrees"), "{screen}");
+        assert!(!screen.contains("1 worktree"), "{screen}");
+        a.on_key(KeyCode::Char('y'));
+        a.perform_delete();
+        assert_eq!(calls.borrow().len(), 1);
+        assert!(removed.borrow().is_empty(), "off by default");
+    }
+
+    #[test]
+    fn w_adds_the_worktree_and_it_goes_after_the_conversation() {
+        let mut a = app();
+        let calls = deletable(&mut a, &[]);
+        let removed = offers(&mut a, 0);
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Char('d'));
+        a.on_key(KeyCode::Char('w'));
+        let screen = render(&mut a, 140, 40);
+        assert!(screen.contains("will be removed too") && screen.contains("and 1 worktree"), "{screen}");
+        a.on_key(KeyCode::Char('w'));
+        assert!(render(&mut a, 140, 40).contains("are kept unless you press w"), "w turns it off again");
+        a.on_key(KeyCode::Char('w'));
+        a.on_key(KeyCode::Char('y'));
+        a.perform_delete();
+        assert_eq!(calls.borrow().len(), 1);
+        let removed = removed.borrow();
+        assert_eq!(removed[0].0, [std::path::PathBuf::from("/home/me/app-fix")]);
+        assert!(!removed[0].1.contains(&"id-old".to_string()), "the conversation was already gone");
+        assert!(a.status.as_deref().is_some_and(|s| s.contains("Deleted 1 conversation") && s.contains("Removed 1 worktree")), "{:?}", a.status);
+    }
+
+    #[test]
+    fn unpushed_commits_lock_the_delete_only_while_the_worktree_is_included() {
+        let mut a = app();
+        deletable(&mut a, &[]);
+        let removed = offers(&mut a, 2);
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Char('d'));
+        assert!(render(&mut a, 140, 40).contains("2 commits on no remote branch"));
+        a.on_key(KeyCode::Char('w'));
+        assert!(render(&mut a, 140, 40).contains("Delete unlocks in 5s"));
+        a.on_key(KeyCode::Char('y'));
+        assert!(!a.has_pending_delete() && a.confirm_delete.as_ref().is_some_and(|c| c.countdown.restarted));
+        assert!(render(&mut a, 140, 40).contains("Too early, so it started over."));
+        a.on_key(KeyCode::Char('w'));
+        a.on_key(KeyCode::Char('w'));
+        a.end_countdown();
+        a.on_key(KeyCode::Char('y'));
+        a.perform_delete();
+        assert_eq!(removed.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_click_during_the_countdown_starts_it_over() {
+        let mut a = app();
+        deletable(&mut a, &[]);
+        offers(&mut a, 1);
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Char('d'));
+        a.on_key(KeyCode::Char('w'));
+        a.age_confirmation();
+        render(&mut a, 140, 40);
+        let (rect, _) = a.hit.buttons.iter().find(|(_, x)| *x == Action::Delete).copied().unwrap();
+        a.on_mouse(MouseEventKind::Down(MouseButton::Left), rect.x, rect.y);
+        assert!(!a.has_pending_delete() && a.confirm_delete.as_ref().is_some_and(|c| c.countdown.restarted));
+    }
+
+    #[test]
+    fn a_worktree_that_has_to_stay_says_why_and_w_is_not_offered() {
+        let mut a = app();
+        deletable(&mut a, &[]);
+        a.worktree_offer = Some(Box::new(|_, _| removal::Plan {
+            refused: vec![removal::Refused { path: "/home/me/app-fix".into(), reason: "it has 1 uncommitted file".into() }],
+            unused_only: true,
+            ..removal::Plan::default()
+        }));
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Char('d'));
+        let screen = render(&mut a, 140, 40);
+        assert!(screen.contains("~/app-fix stays: it has 1 uncommitted file") && !screen.contains("w toggle worktrees"), "{screen}");
     }
 
     #[test]

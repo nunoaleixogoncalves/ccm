@@ -131,6 +131,8 @@ pub type RenameFn = Box<dyn FnMut(&str, Source, &Path, &str) -> Result<String, S
 pub type DismissFn = Box<dyn FnMut(&[String]) -> Result<(), String>>;
 /// Works out what removing these worktrees would do, without changing anything.
 pub type RemovePlanFn = Box<dyn FnMut(&[Target], &[Session]) -> removal::Plan>;
+/// The worktrees deleting these conversations would leave unused, to offer in the popup.
+pub type OfferFn = Box<dyn FnMut(&[String], &[Session]) -> removal::Plan>;
 /// Removes the worktrees of a plan, checking each again first.
 pub type RemoveFn = Box<dyn FnMut(&removal::Plan, &[Session]) -> removal::Outcome>;
 /// Copies text and returns what to tell the user.
@@ -191,21 +193,42 @@ pub struct ConfirmDelete {
     pub worktrees: Option<removal::Plan>,
     /// Job folders from the clean-up screen. Ones that may have a worktree are only listed.
     pub jobs: Vec<Leftover>,
+    /// Worktrees only these conversations used, which go too if asked for.
+    pub offered: removal::Plan,
+    pub include_worktrees: bool,
+    /// Runs while the worktrees asked for have unpushed commits.
+    pub countdown: Countdown,
+}
+
+impl ConfirmDelete {
+    fn toggle_worktrees(&mut self) {
+        self.include_worktrees = !self.include_worktrees;
+        self.countdown = Countdown::new(self.include_worktrees && self.offered.items.iter().any(|i| i.unpushed > 0));
+    }
 }
 
 /// A worktree removal waiting for an answer. Nothing has changed yet.
 pub struct ConfirmRemove {
     pub plan: removal::Plan,
     opened: Instant,
-    /// Set when a worktree has unpushed commits. Confirming stays locked until then, and trying
-    /// early starts it over, so a held key or a quick double press can't get through.
+    pub countdown: Countdown,
+}
+
+/// Keeps a confirmation locked while worktrees with unpushed commits are going, so the warning
+/// gets read. Trying early starts it over, so a held key or a quick double press can't get through.
+#[derive(Default)]
+pub struct Countdown {
     unlocks: Option<Instant>,
     /// Confirming was tried early at least once. Said in the popup, because a status message
-    /// would replace the footer's Remove button.
+    /// would replace the footer's button.
     pub restarted: bool,
 }
 
-impl ConfirmRemove {
+impl Countdown {
+    fn new(locked: bool) -> Self {
+        Self { unlocks: locked.then(|| Instant::now() + UNPUSHED_COUNTDOWN), restarted: false }
+    }
+
     /// Whole seconds left before confirming works, or `None` once it does.
     pub fn seconds_left(&self) -> Option<u64> {
         let left = self.unlocks?.checked_duration_since(Instant::now())?;
@@ -321,6 +344,7 @@ pub struct App {
     pub remove_planner: Option<RemovePlanFn>,
     pub remover: Option<RemoveFn>,
     pub confirm_remove: Option<ConfirmRemove>,
+    pub worktree_offer: Option<OfferFn>,
     pending_remove: Option<ConfirmRemove>,
     /// The selected line of the clean-up screen.
     pub cleanup_row: usize,
@@ -388,6 +412,7 @@ impl App {
             remove_planner: None,
             remover: None,
             confirm_remove: None,
+            worktree_offer: None,
             pending_remove: None,
             cleanup_row: 0,
             cleanup_marked: HashSet::new(),
@@ -653,7 +678,17 @@ impl App {
             return;
         }
         self.dialog_scroll = 0;
-        self.confirm_delete = Some(ConfirmDelete { plan, include_notes: false, opened: Instant::now(), from, worktrees: remove, jobs });
+        self.confirm_delete = Some(ConfirmDelete {
+            plan,
+            include_notes: false,
+            opened: Instant::now(),
+            from,
+            worktrees: remove,
+            jobs,
+            offered: removal::Plan::default(),
+            include_worktrees: false,
+            countdown: Countdown::default(),
+        });
     }
 
     fn on_cleanup_key(&mut self, key: KeyCode) {
@@ -754,10 +789,11 @@ impl App {
     /// Whether the delete or remove button can do anything in the current view.
     pub fn can_press_delete(&self) -> bool {
         match self.view {
+            View::Conversations if self.confirm_delete.as_ref().is_some_and(|c| c.countdown.seconds_left().is_some()) => false,
             View::Conversations => {
                 (self.can_change() && self.selected().is_some_and(|s| s.source.features().delete)) || !self.marked_shown().is_empty()
             }
-            View::Worktrees if self.confirm_remove.as_ref().is_some_and(|c| c.seconds_left().is_some()) => false,
+            View::Worktrees if self.confirm_remove.as_ref().is_some_and(|c| c.countdown.seconds_left().is_some()) => false,
             View::Worktrees => self.worktrees.selected().is_some() || !self.worktrees.marked_shown().is_empty(),
             View::Cleanup => self.cleanup_targets().into_iter().any(|l| self.tally(l).is_some_and(|t| t.count > 0)),
         }
@@ -776,8 +812,8 @@ impl App {
             return;
         }
         self.dialog_scroll = 0;
-        let unlocks = plan.items.iter().any(|i| i.unpushed > 0).then(|| Instant::now() + UNPUSHED_COUNTDOWN);
-        self.confirm_remove = Some(ConfirmRemove { plan, opened: Instant::now(), unlocks, restarted: false });
+        let countdown = Countdown::new(plan.items.iter().any(|i| i.unpushed > 0));
+        self.confirm_remove = Some(ConfirmRemove { plan, opened: Instant::now(), countdown });
     }
 
     fn answer_remove(&mut self, key: KeyCode) {
@@ -785,8 +821,8 @@ impl App {
             return;
         }
         let Some(confirm) = self.confirm_remove.as_mut() else { return };
-        if matches!(key, KeyCode::Char('y') | KeyCode::Delete) && confirm.seconds_left().is_some() {
-            confirm.restart();
+        if matches!(key, KeyCode::Char('y') | KeyCode::Delete) && confirm.countdown.seconds_left().is_some() {
+            confirm.countdown.restart();
             return;
         }
         match key {
@@ -853,13 +889,17 @@ impl App {
     #[cfg(test)]
     pub fn end_countdown(&mut self) {
         if let Some(confirm) = self.confirm_remove.as_mut() {
-            confirm.unlocks = confirm.unlocks.map(|_| Instant::now());
+            confirm.countdown.unlocks = confirm.countdown.unlocks.map(|_| Instant::now());
+        }
+        if let Some(confirm) = self.confirm_delete.as_mut() {
+            confirm.countdown.unlocks = confirm.countdown.unlocks.map(|_| Instant::now());
         }
     }
 
     /// True while something on screen counts down, so it needs redrawing without input.
     pub fn counting_down(&self) -> bool {
-        self.confirm_remove.as_ref().is_some_and(|c| c.unlocks.is_some_and(|t| t.elapsed() < Duration::from_secs(1)))
+        let ticking = |c: &Countdown| c.unlocks.is_some_and(|t| t.elapsed() < Duration::from_secs(1));
+        self.confirm_remove.as_ref().is_some_and(|c| ticking(&c.countdown)) || self.confirm_delete.as_ref().is_some_and(|c| ticking(&c.countdown))
     }
 
     /// Recomputes the rows and keeps the selection on the same conversation where possible.
@@ -1001,7 +1041,19 @@ impl App {
             return;
         }
         self.dialog_scroll = 0;
-        self.confirm_delete = Some(ConfirmDelete { plan, include_notes: false, opened: Instant::now(), from: Vec::new(), worktrees: None, jobs: Vec::new() });
+        let ids: Vec<String> = plan.items.iter().map(|i| i.id.clone()).collect();
+        let offered = self.worktree_offer.as_mut().map_or_else(removal::Plan::default, |offer| offer(&ids, &self.sessions));
+        self.confirm_delete = Some(ConfirmDelete {
+            plan,
+            include_notes: false,
+            opened: Instant::now(),
+            from: Vec::new(),
+            worktrees: None,
+            jobs: Vec::new(),
+            offered,
+            include_worktrees: false,
+            countdown: Countdown::default(),
+        });
     }
 
     /// What deleting these would do, leaving out any just resumed.
@@ -1044,6 +1096,10 @@ impl App {
             return;
         }
         let Some(confirm) = self.confirm_delete.as_mut() else { return };
+        if matches!(key, KeyCode::Char('y') | KeyCode::Delete) && confirm.countdown.seconds_left().is_some() {
+            confirm.countdown.restart();
+            return;
+        }
         match key {
             KeyCode::Char('y') => self.confirm(),
             KeyCode::Delete if confirm.opened.elapsed() < DEL_PAUSE => {
@@ -1052,6 +1108,7 @@ impl App {
             }
             KeyCode::Delete => self.confirm(),
             KeyCode::Char('m') if !confirm.plan.notes.is_empty() => confirm.include_notes = !confirm.include_notes,
+            KeyCode::Char('w') if !confirm.offered.items.is_empty() => confirm.toggle_worktrees(),
             _ => {
                 self.confirm_delete = None;
                 self.status = Some("Cancelled. Nothing was deleted.".into());
@@ -1081,7 +1138,8 @@ impl App {
         if self.pending_remove.is_some() {
             return self.perform_remove();
         }
-        let Some(ConfirmDelete { plan, include_notes, worktrees, jobs, .. }) = self.pending_delete.take() else { return };
+        let Some(ConfirmDelete { plan, include_notes, worktrees, jobs, offered, include_worktrees, .. }) = self.pending_delete.take() else { return };
+        let worktrees = worktrees.or(include_worktrees.then_some(offered));
         self.status = None;
         let mut summaries = Vec::new();
         let mut lines = Vec::new();
@@ -1735,10 +1793,14 @@ impl App {
             return self.answer_folder(KeyCode::Esc);
         }
         let inside = |r: &Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
-        if let Some(confirm) = &self.confirm_delete {
+        if let Some(confirm) = self.confirm_delete.as_mut() {
             let on_delete = self.hit.buttons.iter().any(|(r, a)| *a == Action::Delete && inside(r));
             // The second click must be its own decision, not the tail of a double-click.
             if on_delete && confirm.opened.elapsed() < DOUBLE_CLICK {
+                return;
+            }
+            if on_delete && confirm.countdown.seconds_left().is_some() {
+                confirm.countdown.restart();
                 return;
             }
             if on_delete {
@@ -1754,8 +1816,8 @@ impl App {
             if on_remove && confirm.opened.elapsed() < DOUBLE_CLICK {
                 return;
             }
-            if on_remove && confirm.seconds_left().is_some() {
-                confirm.restart();
+            if on_remove && confirm.countdown.seconds_left().is_some() {
+                confirm.countdown.restart();
                 return;
             }
             if on_remove { self.confirm_removal() } else { self.cancel_removal() }

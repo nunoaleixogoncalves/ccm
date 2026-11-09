@@ -10,7 +10,12 @@ Every release of `ccm` and what changed in it. Each section is also used as the 
 - **Resume, fork and delete Codex conversations,** through Codex's own `codex resume`, `codex fork` and `codex delete` commands. A delete also takes the conversation's prompts out of Codex's prompt history, and Codex conversations are now suggested on the clean-up screen. A fork made in Codex shows which conversation it came from. ([#38](https://github.com/nunoaleixogoncalves/ccm/issues/38))
 - **Open and crashed Codex conversations,** from the locks Codex holds while it runs, with no setup. `Shift+O` reopens crashed ones with `codex resume`. ([#39](https://github.com/nunoaleixogoncalves/ccm/issues/39))
 - **Rename Codex conversations,** the way Codex's `/rename` does, so the new name also shows in Codex. ([#40](https://github.com/nunoaleixogoncalves/ccm/issues/40))
+- **Remove a conversation's worktree with it.** When a delete leaves a worktree with no conversation, the popup lists it and `w` adds it to the delete, under the same rules as the worktree view. ([#26](https://github.com/nunoaleixogoncalves/ccm/issues/26))
 - New setting `tools` in `config.toml` to choose which tools to read. By default, every tool whose folder exists is read.
+
+### Fixed
+
+- A worktree a running Codex conversation was last working in can no longer be removed. ([#26](https://github.com/nunoaleixogoncalves/ccm/issues/26))
 
 ## [1.1.1] - 2026-11-06
 

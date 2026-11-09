@@ -15,7 +15,7 @@ use crate::format::sanitize;
 use crate::model::Session;
 use crate::paths::Paths;
 use crate::registry::{has_unreadable_entry, live_roster, live_sessions, Live};
-use crate::worktree::{connect, git, inspect, parse_list, run, text, Link};
+use crate::worktree::{connect, git, inspect, listed, parse_list, run, text, Link};
 
 /// Entries counted when measuring ignored files, so a huge `node_modules` can't stall the popup.
 const MAX_COUNTED: usize = 200_000;
@@ -48,6 +48,8 @@ pub struct Planned {
     pub unpushed: u64,
     pub has_remote: bool,
     pub upstream_gone: bool,
+    /// The size of the whole folder, measured only when offered along with a delete.
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +62,9 @@ pub struct Refused {
 pub struct Plan {
     pub items: Vec<Planned>,
     pub refused: Vec<Refused>,
+    /// Offered because a delete leaves these with no conversation, so one that still has a
+    /// conversation when its turn comes stays.
+    pub unused_only: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -123,6 +128,11 @@ fn busy_reason(busy: &Busy, root: &Path, sessions: &[Session], links: &[Link]) -
         if last.is_some_and(|f| inside(Path::new(f), root)) {
             return Some(format!("{} is open and was last working in it", name_of(sessions, &live.id)));
         }
+    }
+    // Tools that keep no registry of running sessions are only known by this flag.
+    let open = sessions.iter().find(|s| s.open && s.last_folder().is_some_and(|f| inside(Path::new(f), root)));
+    if let Some(s) = open {
+        return Some(format!("{} is open and was last working in it", name_of(sessions, &s.id)));
     }
     let now = SystemTime::now();
     for link in links {
@@ -199,6 +209,7 @@ fn check(target: &Target, busy: &Busy, sessions: &[Session]) -> Result<Planned, 
         unpushed: 0,
         has_remote: false,
         upstream_gone: false,
+        bytes: 0,
     };
     if w.prunable {
         return Ok(planned);
@@ -244,6 +255,40 @@ pub fn plan(paths: &Paths, proc_root: &Path, targets: &[Target], sessions: &[Ses
     plan
 }
 
+/// The worktrees deleting these conversations would leave unused: one of them started there or
+/// was last working there, and no other conversation was ever there. One a conversation only
+/// passed through isn't offered, as a single conversation can touch many. Reads only.
+pub fn offer(paths: &Paths, proc_root: &Path, deleting: &[String], sessions: &[Session]) -> Plan {
+    let going: HashSet<&str> = deleting.iter().map(String::as_str).collect();
+    // A folder inside a worktree can be gone while the worktree isn't, so start from what's left.
+    let folders: Vec<String> = sessions
+        .iter()
+        .filter(|s| going.contains(s.id.as_str()))
+        .flat_map(|s| s.folder.as_deref().into_iter().chain(s.last_folder()))
+        .filter_map(|f| Path::new(f).ancestors().find(|a| a.is_dir()))
+        .map(|f| f.to_string_lossy().into_owned())
+        .collect();
+    let list = listed(&folders);
+    let links = connect(&list, sessions);
+    let targets: Vec<Target> = list
+        .iter()
+        .zip(&links)
+        .filter(|(w, _)| w.is_linked() && !w.from_windows())
+        .filter(|(_, l)| l.iter().all(|l| going.contains(l.id.as_str())) && l.iter().any(|l| l.started_here || l.last_here))
+        .map(|(w, _)| Target { path: w.path.clone(), repo: w.repo.clone() })
+        .collect();
+    if targets.is_empty() {
+        return Plan::default();
+    }
+    let mut plan = plan(paths, proc_root, &targets, sessions);
+    plan.unused_only = true;
+    for item in &mut plan.items {
+        let mut budget = MAX_COUNTED;
+        item.bytes = size_within(&item.target.path, &mut budget);
+    }
+    plan
+}
+
 /// Removes what the plan lists, checking each worktree again first. One that changed in a way
 /// that matters, including new ignored files the popup didn't show, is skipped.
 pub fn execute(paths: &Paths, proc_root: &Path, plan: &Plan, sessions: &[Session]) -> Outcome {
@@ -258,6 +303,10 @@ pub fn execute(paths: &Paths, proc_root: &Path, plan: &Plan, sessions: &[Session
                 continue;
             }
         };
+        if let Some(link) = now.links.first().filter(|_| plan.unused_only) {
+            outcome.skipped.push(Refused { path, reason: format!("{} worked in it and is still here", name_of(sessions, &link.id)) });
+            continue;
+        }
         if now.unpushed > item.unpushed {
             outcome.skipped.push(Refused { path, reason: "it has more unpushed commits than when you confirmed".into() });
             continue;
@@ -582,6 +631,75 @@ mod tests {
         fs::create_dir_all(&job).unwrap();
         fs::write(job.join("state.json"), format!(r#"{{"sessionId":"{B}","bgIsolation":"worktree","cwd":"{}"}}"#, t.path.display())).unwrap();
         assert!(reason(&f.plan(&[t], &[])).contains("claude rm"));
+    }
+
+    #[test]
+    fn an_open_conversation_of_a_tool_with_no_registry_refuses() {
+        let f = Fixture::new();
+        let t = f.worktree("codex");
+        let mut s = f.session(A, "Work", &[&t.path]);
+        s.source = Source::Codex;
+        s.open = true;
+        let plan = f.plan(std::slice::from_ref(&t), &[s]);
+        assert!(reason(&plan).contains("is open and was last working in it"), "{plan:?}");
+    }
+
+    #[test]
+    fn a_delete_offers_the_worktree_it_started_or_ended_in() {
+        let f = Fixture::new();
+        let started = f.worktree("started");
+        let ended = f.worktree("ended");
+        let passed = f.worktree("passed");
+        let s = f.session(A, "Work", &[&started.path, &passed.path, &ended.path]);
+        let plan = offer(&f.paths, &f.proc, &[A.to_string()], std::slice::from_ref(&s));
+        let offered: Vec<&PathBuf> = plan.items.iter().map(|i| &i.target.path).collect();
+        assert_eq!(offered, [&ended.path, &started.path], "not the one it only passed through");
+        assert!(plan.unused_only);
+        assert!(plan.items.iter().all(|i| i.bytes > 0), "{plan:?}");
+    }
+
+    #[test]
+    fn a_delete_never_offers_what_another_conversation_touched_or_the_main_worktree() {
+        let f = Fixture::new();
+        let t = f.worktree("shared");
+        let mine = f.session(A, "Mine", &[&t.path]);
+        let other = f.session(B, "Other", &[&f.repo, &t.path, &f.repo]);
+        let plan = offer(&f.paths, &f.proc, &[A.to_string()], &[mine.clone(), other.clone()]);
+        assert_eq!(plan, Plan::default(), "the other one only passed through, and that's enough");
+        let plan = offer(&f.paths, &f.proc, &[A.to_string(), B.to_string()], &[mine, other]);
+        assert_eq!(plan.items.len(), 1, "both going, and the main worktree isn't offered: {plan:?}");
+    }
+
+    #[test]
+    fn a_worktree_that_cant_go_is_offered_with_the_reason() {
+        let f = Fixture::new();
+        let t = f.worktree("dirty");
+        fs::write(t.path.join("wip.txt"), "x").unwrap();
+        let s = f.session(A, "Work", &[&t.path]);
+        let plan = offer(&f.paths, &f.proc, &[A.to_string()], &[s]);
+        assert!(reason(&plan).contains("1 uncommitted file"), "{plan:?}");
+    }
+
+    #[test]
+    fn a_folder_gone_inside_a_worktree_still_finds_it() {
+        let f = Fixture::new();
+        let t = f.worktree("deep");
+        let s = f.session(A, "Work", &[&t.path.join("gone/sub")]);
+        let plan = offer(&f.paths, &f.proc, &[A.to_string()], &[s]);
+        assert_eq!(plan.items.len(), 1, "{plan:?}");
+    }
+
+    #[test]
+    fn an_offered_worktree_stays_if_its_conversation_wasnt_deleted() {
+        let f = Fixture::new();
+        let t = f.worktree("kept");
+        let s = f.session(A, "Work", &[&t.path]);
+        let plan = offer(&f.paths, &f.proc, &[A.to_string()], std::slice::from_ref(&s));
+        let outcome = f.execute(&plan, std::slice::from_ref(&s));
+        assert!(outcome.removed.is_empty() && t.path.exists());
+        assert!(outcome.skipped[0].reason.contains("is still here"), "{outcome:?}");
+        let outcome = f.execute(&plan, &[]);
+        assert_eq!(outcome.removed, std::slice::from_ref(&t.path));
     }
 
     #[test]

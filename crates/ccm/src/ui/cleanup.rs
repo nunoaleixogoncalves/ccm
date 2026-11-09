@@ -679,6 +679,7 @@ mod tests {
                     unpushed: u64::from(t.path.ends_with(ahead)),
                     has_remote: true,
                     upstream_gone: false,
+                    bytes: 0,
                 });
             }
             plan
