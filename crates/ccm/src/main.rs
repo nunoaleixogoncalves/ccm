@@ -1,6 +1,8 @@
 mod app;
 mod clipboard;
+mod repos;
 mod ui;
+mod web;
 mod worktrees;
 
 use std::collections::{HashMap, HashSet};
@@ -24,7 +26,7 @@ use ccm_core::paths::Paths;
 use ccm_core::recovery;
 use ccm_core::registry;
 use ccm_core::removal;
-use ccm_core::repo::{self, Place};
+use ccm_core::repo::Place;
 use ccm_core::rename;
 use ccm_core::forks;
 use ccm_core::resume::{self, Fork, Launch};
@@ -34,7 +36,7 @@ use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, Key
 use crossterm::execute;
 use ratatui::DefaultTerminal;
 
-use app::{App, RepoRequest};
+use app::App;
 
 /// Often enough to feel live, and cheap: a poll only stats files unless something changed.
 /// Polling is needed anyway, because a killed process produces no file event.
@@ -44,6 +46,8 @@ const RESIZE_EVERY: u32 = 30;
 const PROC: &str = "/proc";
 
 const USAGE: &str = "Usage: ccm          browse your conversations
+       ccm web      browse them in a browser, on this computer only
+                    [--port N] choose the port  [--no-browser] only print the link
        ccm setup    install the hooks crash recovery needs, after showing the changes
        ccm --version";
 
@@ -52,6 +56,13 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] => browse(paths),
+        ["web", rest @ ..] => match web::Options::parse(rest) {
+            Some(options) => web::serve(paths, options),
+            None => {
+                eprintln!("{USAGE}");
+                std::process::exit(2);
+            }
+        },
         ["setup"] => run_setup(&paths),
         ["hook"] => {
             run_hook(|input| recovery::record_hook(&paths, input, now_ms()));
@@ -117,23 +128,41 @@ fn run_setup(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn browse(paths: Paths) -> Result<()> {
+/// What every front end starts from.
+struct Start {
+    config: Config,
+    config_error: Option<String>,
+    codex_home: PathBuf,
+    /// Where conversations are looked for, for an empty list.
+    looked_in: String,
+    tools: Vec<Source>,
+    catalog: Catalog,
+    cached: Vec<Session>,
+    searcher: Searcher,
+}
+
+fn start(paths: &Paths) -> Result<Start> {
     let (config, config_error) = Config::load(&paths.config);
     let codex_home = Codex::home_from(|v| std::env::var(v).ok(), Path::new(&home()));
-    let tools = tools::detect(&paths, Path::new(PROC), &codex_home, config.tools.as_deref());
+    let tools = tools::detect(paths, Path::new(PROC), &codex_home, config.tools.as_deref());
     let sources: Vec<Source> = tools.iter().map(|t| t.source()).collect();
     let catalog = Catalog::with_tools(&paths.index, tools).context("opening the index")?;
     let cached = catalog.cached();
     let searcher = Searcher::open(&paths.index).context("opening the search index")?;
-
-    let config_terminal = config.terminal.clone();
     let looked_in = match config.tools.as_deref() {
         Some(wanted) if !wanted.contains(&ToolName::Codex) => paths.claude.display().to_string(),
         Some(wanted) if !wanted.contains(&ToolName::Claude) => codex_home.display().to_string(),
         _ => format!("{} or {}", paths.claude.display(), codex_home.display()),
     };
+    let tools = if sources.is_empty() { vec![Source::ClaudeCode] } else { sources };
+    Ok(Start { config, config_error, codex_home, looked_in, tools, catalog, cached, searcher })
+}
+
+fn browse(paths: Paths) -> Result<()> {
+    let Start { config, config_error, codex_home, looked_in, tools, catalog, cached, searcher } = start(&paths)?;
+    let config_terminal = config.terminal.clone();
     let mut app = App::new(config, looked_in, home());
-    app.tools = if sources.is_empty() { vec![Source::ClaudeCode] } else { sources };
+    app.tools = tools;
     app.status = config_error;
     let terminal_command = config_terminal.clone();
     let claude_json = paths.claude_json.clone();
@@ -309,27 +338,6 @@ fn spawn_refresher(mut catalog: Catalog) -> Receiver<Update> {
     rx
 }
 
-/// Answers what each folder's repository is, reusing what the index saved before. Folders that
-/// weren't in Git are asked about again on a full request, in case one has become a repository.
-fn look_up_repos(index: &Path, request: &RepoRequest) -> HashMap<String, Place> {
-    let mut index = Index::open(index).ok();
-    let saved = index.as_ref().and_then(|i| i.repos().ok()).unwrap_or_default();
-    let reusable = |f: &String| match saved.get(f) {
-        Some(Place::Repo { .. }) => true,
-        Some(_) => !request.full,
-        None => false,
-    };
-    let ask: Vec<String> = request.folders.iter().filter(|f| !reusable(f)).cloned().collect();
-    let answers = repo::look_up_all(&ask);
-    if let Some(index) = index.as_mut() {
-        let _ = index.save_repos(&answers, &request.used);
-    }
-    let mut out: HashMap<String, Place> =
-        request.folders.iter().filter_map(|f| saved.get(f).filter(|_| reusable(f)).map(|p| (f.clone(), p.clone()))).collect();
-    out.extend(answers);
-    out
-}
-
 /// Sizes of the worktrees removing could lose nothing from, for the clean-up screen. Which of
 /// them no conversation used is only known later, so this measures a few more than needed.
 fn measure_worktrees(scan: &Scan) -> HashMap<PathBuf, u64> {
@@ -359,7 +367,7 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, updates: Receiver<Update>,
             let (tx, rx) = mpsc::channel();
             let index = index.clone();
             thread::spawn(move || {
-                let _ = tx.send(look_up_repos(&index, &request));
+                let _ = tx.send(repos::look_up(&index, &request));
             });
             repo_lookup = Some(rx);
         }

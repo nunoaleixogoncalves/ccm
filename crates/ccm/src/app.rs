@@ -11,7 +11,7 @@ use ccm_core::tools::{self, Features};
 use ccm_core::rename::MAX_NAME;
 use ccm_core::resume::{decide, decide_fork, is_safe_folder, manual_command_for, Decision, Fork};
 use ccm_core::jobs::{self, Leftover};
-use ccm_core::query::{group_by_folder, group_by_repo, select, status_rank, Filters, GroupRow, SortKey, Suggestion};
+use ccm_core::query::{group_by_folder, group_by_repo, select, status_text, Filters, GroupRow, SortKey, Suggestion};
 use ccm_core::repo::Place;
 use ccm_core::window::{context_label, window_size};
 use ccm_core::format::sanitize;
@@ -20,6 +20,7 @@ use crossterm::event::{KeyCode, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::widgets::TableState;
 
+use crate::repos::{RepoRequest, Repos};
 use crate::worktrees::{folders_of, Worktrees};
 
 /// An action reachable from both a key and a footer button.
@@ -98,15 +99,6 @@ impl Grouping {
             Grouping::Repo => Grouping::Off,
         }
     }
-}
-
-/// Folders to ask Git about. A full request also asks again about folders that weren't in Git.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RepoRequest {
-    pub folders: Vec<String>,
-    /// Every folder a conversation started in, so answers for others can be dropped.
-    pub used: Vec<String>,
-    pub full: bool,
 }
 
 /// Which list is on screen.
@@ -289,12 +281,7 @@ pub struct App {
     pub descending: bool,
     pub grouping: Grouping,
     /// What Git said about each folder conversations started in.
-    pub places: HashMap<String, Place>,
-    /// Set when repository grouping is picked, so every folder is looked at again.
-    repo_full_due: bool,
-    repo_looking: bool,
-    /// Folders asked about since the last full look, so one Git can't answer isn't asked forever.
-    repo_asked: HashSet<String>,
+    pub repos: Repos,
     pub table: TableState,
     pub hit: Hit,
     pub status: Option<String>,
@@ -371,10 +358,7 @@ impl App {
             sort: SortKey::LastActive,
             descending: true,
             grouping: Grouping::Off,
-            places: HashMap::new(),
-            repo_full_due: false,
-            repo_looking: false,
-            repo_asked: HashSet::new(),
+            repos: Repos::default(),
             table: TableState::default(),
             hit: Hit::default(),
             status: None,
@@ -457,29 +441,14 @@ impl App {
     /// Folders to ask Git about, while grouping by repository. The caller runs Git elsewhere and
     /// hands the answers to `finish_repo_lookup`.
     pub fn repo_request(&mut self) -> Option<RepoRequest> {
-        if self.grouping != Grouping::Repo || self.repo_looking {
+        if self.grouping != Grouping::Repo {
             return None;
         }
-        let mut used: Vec<String> = self.sessions.iter().filter_map(|s| s.folder.clone()).collect();
-        used.sort_unstable();
-        used.dedup();
-        let full = std::mem::take(&mut self.repo_full_due);
-        if full {
-            self.repo_asked.clear();
-        }
-        let folders: Vec<String> =
-            used.iter().filter(|f| full || !(self.places.contains_key(*f) || self.repo_asked.contains(*f))).cloned().collect();
-        if folders.is_empty() {
-            return None;
-        }
-        self.repo_asked.extend(folders.iter().cloned());
-        self.repo_looking = true;
-        Some(RepoRequest { folders, used, full })
+        self.repos.request(&self.sessions)
     }
 
     pub fn finish_repo_lookup(&mut self, answers: HashMap<String, Place>) {
-        self.repo_looking = false;
-        self.places.extend(answers);
+        self.repos.finish(answers);
         self.rebuild();
     }
 
@@ -913,7 +882,7 @@ impl App {
             Grouping::Off => order.into_iter().map(GroupRow::Item).collect(),
             Grouping::Folder => group_by_folder(&self.sessions, &order),
             // Folders Git hasn't answered for yet stay grouped by folder meanwhile.
-            Grouping::Repo => group_by_repo(&self.sessions, &order, &self.places),
+            Grouping::Repo => group_by_repo(&self.sessions, &order, &self.repos.places),
         };
         let wanted = self.selected_id.as_deref().and_then(|id| {
             self.rows.iter().position(|r| matches!(r, GroupRow::Item(i) if self.sessions[*i].id == id))
@@ -1521,13 +1490,7 @@ impl App {
     }
 
     pub fn status_text(s: &Session) -> &'static str {
-        match status_rank(s) {
-            4 => "open",
-            3 => "crashed",
-            2 => "missing",
-            1 => "junk",
-            _ => "",
-        }
+        status_text(s)
     }
 
     pub fn sort_by(&mut self, key: SortKey) {
@@ -1559,7 +1522,9 @@ impl App {
             Action::ClearFilters => self.filters = Filters::default(),
             Action::ToggleGroup => {
                 self.grouping = self.grouping.next();
-                self.repo_full_due = self.grouping == Grouping::Repo;
+                if self.grouping == Grouping::Repo {
+                    self.repos.ask_again();
+                }
             }
             Action::NextSort => {
                 let at = SortKey::ALL.iter().position(|k| *k == self.sort).unwrap_or(0);

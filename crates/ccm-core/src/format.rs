@@ -69,6 +69,14 @@ fn skip_escape(first: char, chars: &mut std::iter::Peekable<std::str::Chars>) {
     }
 }
 
+/// A path with the home folder written as `~`.
+pub fn short_path(path: &str, home: &str) -> String {
+    match path.strip_prefix(home) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
 /// `87k`, `1.5M`, `1M`, `950`.
 pub fn tokens(n: u64) -> String {
     match n {

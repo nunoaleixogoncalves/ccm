@@ -1,10 +1,9 @@
 use ccm_core::delete::Item;
-use ccm_core::format::{ago, bytes, sanitize};
+use ccm_core::format::{ago, bytes, sanitize, short_path};
 use ccm_core::model::{Session, Source};
 use ccm_core::preview::{Preview, Role};
 use ccm_core::removal;
-use ccm_core::query::{worktree_of, Group, GroupRow, SortKey};
-use ccm_core::repo::Place;
+use ccm_core::query::{repo_tag, Group, GroupRow, SortKey};
 use chrono::{Local, TimeZone};
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -13,8 +12,6 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, HighlightSpacing, Paragraph,
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use std::collections::HashMap;
-use std::path::Path;
 
 use crate::app::{Action, App, Grouping, View};
 
@@ -191,7 +188,7 @@ fn reopen_dialog(app: &App) -> Dialog {
         .enumerate()
         .map(|(i, row)| {
             let session = app.sessions.iter().find(|s| s.id == row.id);
-            let name = session.map_or(row.id.clone(), |s| sanitize(&display_name(s)));
+            let name = session.map_or(row.id.clone(), |s| sanitize(&s.display_name()));
             let folder = session.and_then(|s| s.folder.as_deref()).map_or("-".to_string(), |p| sanitize(&short_path(p, &app.home)));
             let missing = if session.is_some_and(Session::is_folder_missing) { "  (folder missing, recreated if ticked)" } else { "" };
             let mark = if row.ticked { "[x]" } else { "[ ]" };
@@ -213,7 +210,7 @@ fn delete_dialog(app: &App) -> Dialog {
     let confirm = app.confirm_delete.as_ref().expect("checked by the caller");
     let plan = &confirm.plan;
     let name_of = |id: &str| {
-        app.sessions.iter().find(|s| s.id == id).map_or_else(|| id.to_string(), |s| sanitize(&display_name(s)))
+        app.sessions.iter().find(|s| s.id == id).map_or_else(|| id.to_string(), |s| sanitize(&s.display_name()))
     };
     let plain = Style::new();
     let bold = plain.add_modifier(Modifier::BOLD);
@@ -483,28 +480,11 @@ fn column_text(app: &App, s: &Session, key: SortKey, width: usize, now_ms: i64) 
 /// The name, followed in repository groups by the branch and the worktree, which tell apart the
 /// work in one repository. The name is shortened first, so the tag stays visible.
 fn name_text(app: &App, s: &Session, width: usize) -> String {
-    let tag = if app.grouping == Grouping::Repo { repo_tag(s, &app.places) } else { None };
-    let Some(tag) = tag else { return fit_end(&display_name(s), width) };
+    let tag = if app.grouping == Grouping::Repo { repo_tag(s, &app.repos.places) } else { None };
+    let Some(tag) = tag else { return fit_end(&s.display_name(), width) };
     let tag = fit_end(&format!(" [{tag}]"), width / 2);
-    let name = fit_end(&display_name(s), width.saturating_sub(tag.width()));
+    let name = fit_end(&s.display_name(), width.saturating_sub(tag.width()));
     format!("{name}{tag}")
-}
-
-fn repo_tag(s: &Session, places: &HashMap<String, Place>) -> Option<String> {
-    let worktree = worktree_of(s, places).map(|w| Path::new(w).file_name().map_or(w.into(), |n| n.to_string_lossy()));
-    let parts: Vec<String> = s.branch.as_deref().into_iter().map(sanitize).chain(worktree.map(|w| sanitize(&w))).collect();
-    (!parts.is_empty()).then(|| parts.join(" · "))
-}
-
-fn display_name(s: &Session) -> String {
-    if s.name.is_empty() { "(untitled)".to_string() } else { s.name.clone() }
-}
-
-fn short_path(path: &str, home: &str) -> String {
-    match path.strip_prefix(home) {
-        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => format!("~{rest}"),
-        _ => path.to_string(),
-    }
 }
 
 /// Shortens text keeping its start.
@@ -550,7 +530,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     };
     let folder = sanitize(s.folder.as_deref().unwrap_or("-"));
     let mut text = vec![
-        Line::from(format!("{}  {}", s.id, display_name(s))),
+        Line::from(format!("{}  {}", s.id, s.display_name())),
         Line::from(format!("Folder  {folder}{}", if s.is_folder_missing() { "  (missing)" } else { "" })),
         Line::from(format!("Started {}   Cost {cost}   Lines {lines}", date(s.started_at_ms))),
         Line::from(format!("PR      {}", s.pr_url.as_deref().unwrap_or("-"))),
@@ -560,13 +540,13 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         notes.push(format!("Continued in {}", sanitize(next)));
     }
     match app.forked_from(&s.id) {
-        Some(Some(original)) => notes.push(format!("Forked from {}", sanitize(&display_name(original)))),
+        Some(Some(original)) => notes.push(format!("Forked from {}", sanitize(&original.display_name()))),
         Some(None) => notes.push("Forked from a deleted conversation".into()),
         None => {}
     }
     let forks = app.forks_of(&s.id);
     if !forks.is_empty() {
-        let names: Vec<String> = forks.iter().map(|f| sanitize(&display_name(f))).collect();
+        let names: Vec<String> = forks.iter().map(|f| sanitize(&f.display_name())).collect();
         notes.push(format!("Forks: {}", names.join(", ")));
     }
     if s.bad_lines > 0 {
@@ -889,9 +869,11 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::RepoRequest;
+    use crate::repos::RepoRequest;
     use ccm_core::resume::Fork;
-    use std::path::PathBuf;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use ccm_core::repo::Place;
     use ccm_core::config::Config;
     use ccm_core::delete::{Failure, Note, Outcome, Plan, Skipped};
     use ccm_core::model::Source;

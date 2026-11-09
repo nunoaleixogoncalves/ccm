@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ccm</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <h1>ccm</h1>
+    <p id="summary" class="summary" aria-live="polite"></p>
+  </header>
+  <p id="banner" class="banner" role="alert" hidden></p>
+  <nav class="tools" aria-label="Search and filters">
+    <label class="search">
+      <span class="visually-hidden">Search conversations</span>
+      <input id="search" type="search" placeholder="Search everything said" autocomplete="off" spellcheck="false">
+      <kbd>/</kbd>
+    </label>
+    <div class="chips" id="chips">
+      <button class="chip" data-filter="open" aria-pressed="false">Open <kbd>o</kbd></button>
+      <button class="chip" data-filter="crashed" aria-pressed="false">Crashed <kbd>x</kbd></button>
+      <button class="chip" data-filter="junk" aria-pressed="false">Junk <kbd>J</kbd></button>
+      <button class="chip" data-filter="missing" aria-pressed="false">Missing <kbd>m</kbd></button>
+      <button class="chip" data-filter="large" aria-pressed="false">Large <kbd>l</kbd></button>
+      <button class="chip" id="tool" aria-pressed="false" hidden><span>Tool</span> <kbd>t</kbd></button>
+      <button class="chip" id="group" aria-pressed="false"><span>Group</span> <kbd>g</kbd></button>
+      <button class="chip" id="reverse">Reverse <kbd>r</kbd></button>
+      <button class="chip quiet" id="clear">Clear <kbd>c</kbd></button>
+    </div>
+  </nav>
+  <main class="panes">
+    <section class="list" id="list" tabindex="0" aria-label="Conversations">
+      <table>
+        <thead><tr id="head"></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <p id="empty" class="empty" hidden></p>
+    </section>
+    <section class="side" aria-label="Selected conversation">
+      <div id="details" class="details"></div>
+      <div id="preview" class="preview" tabindex="0" aria-label="Latest messages"></div>
+    </section>
+  </main>
+</body>
+</html>
