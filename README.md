@@ -29,7 +29,7 @@ If you run a lot of Claude Code sessions, they pile up:
 - **Clean up:** one screen lists what could be cleaned up and how much space it would free, and deletes it after asking: conversations Claude never replied to, ones whose folder is gone, large ones you haven't used for a while, worktrees nothing needs, and leftover background job folders.
 - **Recover:** after a crash, see what was running and reopen it all at once.
 - **Worktrees:** see the Git worktrees of the repositories your conversations used, with their uncommitted changes, unpushed commits and the conversations that worked in each, and remove the ones you're done with.
-- **Web version:** browse, search and preview in a browser, on this computer only. See [Web version](#web-version).
+- **Web version:** everything above in a browser, on this computer only. See [Web version](#web-version).
 - **Codex:** Codex conversations show in the same list, and can be searched, previewed, resumed, forked, renamed and deleted. See [Codex](#codex).
 
 ## Install
@@ -242,7 +242,9 @@ Codex conversations can be resumed, forked and deleted, through Codex's own comm
 
 `ccm web` shows the same list in a browser: search, filters, sorting, grouping and the preview, with the same keys. It updates by itself, and can run alongside the terminal app.
 
-Resume and fork open a terminal on this computer, the same way the terminal app does. If that fails, the page gives you the command to copy. Rename, copying the ID or command, reopening after a crash and deleting work as they do in the terminal, under the same rules. The delete popup lists what goes and offers the same worktrees, and the wait for unpushed commits is enforced by `ccm` itself, not the page. The worktree and clean-up screens are still only in the terminal app.
+Resume and fork open a terminal on this computer, the same way the terminal app does. If that fails, the page gives you the command to copy. Rename, copying the ID or command, reopening after a crash and deleting work as they do in the terminal, under the same rules. The delete popup lists what goes and offers the same worktrees, and the wait for unpushed commits is enforced by `ccm` itself, not the page.
+
+The worktree view (`w`) and the clean-up screen (`Shift+C`) are there too, with the same checks and the same keys.
 
 It opens your browser and prints a link, then runs until you press `Ctrl+C`.
 

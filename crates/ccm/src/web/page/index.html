@@ -11,10 +11,15 @@
 <body>
   <header class="top">
     <h1>ccm</h1>
+    <nav class="views" aria-label="Screens">
+      <button class="chip" id="go-conversations" aria-pressed="true">Conversations</button>
+      <button class="chip" id="go-worktrees" aria-pressed="false">Worktrees <kbd>w</kbd></button>
+      <button class="chip" id="go-cleanup" aria-pressed="false">Clean up <kbd>C</kbd></button>
+    </nav>
     <p id="summary" class="summary" aria-live="polite"></p>
   </header>
   <p id="banner" class="banner" role="alert" hidden></p>
-  <nav class="tools" aria-label="Search and filters">
+  <nav class="tools" id="tools" aria-label="Search and filters">
     <label class="search">
       <span class="visually-hidden">Search conversations</span>
       <input id="search" type="search" placeholder="Search everything said" autocomplete="off" spellcheck="false">
@@ -35,7 +40,7 @@
     </div>
   </nav>
   <p id="status" class="status" role="status" hidden><span id="status-text"></span> <button id="status-copy" class="chip" hidden>Copy the command</button></p>
-  <main class="panes">
+  <main class="panes" id="screen-conversations">
     <section class="list" id="list" tabindex="0" aria-label="Conversations">
       <table>
         <thead><tr id="head"></tr></thead>
@@ -47,6 +52,40 @@
       <div id="details" class="details"></div>
       <div id="preview" class="preview" tabindex="0" aria-label="Latest messages"></div>
     </section>
+  </main>
+  <main class="panes" id="screen-worktrees" hidden>
+    <section class="list" id="wt-list" tabindex="0" aria-label="Worktrees">
+      <table class="wt-table">
+        <thead><tr>
+          <th class="col-mark" scope="col" aria-label="Marked"></th>
+          <th class="wt-folder" scope="col">Folder</th>
+          <th class="wt-branch" scope="col">Branch</th>
+          <th class="wt-changes" scope="col">Changes</th>
+          <th class="wt-unpushed" scope="col">Unpushed</th>
+          <th class="wt-convs" scope="col">Conversations</th>
+          <th class="wt-status" scope="col">Status</th>
+        </tr></thead>
+        <tbody id="wt-rows"></tbody>
+      </table>
+      <p id="wt-empty" class="empty" hidden></p>
+    </section>
+    <section class="side" aria-label="Selected worktree">
+      <div id="wt-details" class="details"></div>
+      <div id="wt-worked" class="preview" tabindex="0" aria-label="Conversations that worked here"></div>
+    </section>
+  </main>
+  <main class="clean" id="screen-cleanup" hidden>
+    <div id="cleanup-actions" class="actions"></div>
+    <table class="clean-table">
+      <thead><tr>
+        <th class="col-mark" scope="col" aria-label="Marked"></th>
+        <th scope="col">Suggestion</th>
+        <th class="clean-num" scope="col">Items</th>
+        <th class="clean-num" scope="col">Frees</th>
+      </tr></thead>
+      <tbody id="cleanup-rows"></tbody>
+    </table>
+    <section id="cleanup-about" class="about" aria-label="About this suggestion"></section>
   </main>
   <dialog id="dialog" aria-labelledby="dialog-title"><form id="dialog-form" novalidate>
     <h2 id="dialog-title"></h2>

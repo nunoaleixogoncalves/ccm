@@ -55,6 +55,23 @@ let closingDialog = false;
 // A delete is being worked out, which reads every conversation. Keys wait, so one pressed meanwhile
 // can't act on something else.
 let planning = false;
+// Which screen is showing. Each keeps its own selection and marks.
+let screen = "conversations";
+let screenRequest = 0;
+let wtRows = [];
+let wtSelected = null;
+let wtIndex = 0;
+let wtSummary = "";
+let drawnWt = "";
+let drawnWtDetails = "";
+let onlyIdle = false;
+const wtMarked = new Set();
+let cleanupLines = [];
+let cleanupRow = 0;
+let cleanupSummary = "";
+let drawnCleanup = "";
+let drawnAbout = "";
+const cleanupMarked = new Set();
 
 function el(tag, props = {}, ...children) {
   const node = document.createElement(tag);
@@ -150,6 +167,7 @@ function drawSummary(data) {
   const parts = [`${data.total} conversations`, `${data.total_size} on disk`, `${data.open} open`];
   if (data.filtered) parts.push(`showing ${data.shown}`);
   if (data.crashed) parts.push(`${data.crashed} crashed`);
+  if (data.suggestion) parts.push(`clean-up: ${data.suggestion}`);
   if (data.loading) parts.push("scanning…");
   if (data.notice) parts.push(data.notice);
   summaryText = parts.join("  ·  ");
@@ -537,17 +555,12 @@ function joined(parts) {
   return parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts.at(-1)}` : parts.join("");
 }
 
-async function startDelete() {
+// Slow with huge conversations or big worktrees, so keys wait until it's done.
+async function askPlan(path, body) {
   if (planning) return;
-  const shown = markedShown().map((row) => row.id);
-  if (!shown.length && !(current && current.can.delete)) {
-    say("This conversation is open, so it can't be deleted.", true);
-    return;
-  }
-  const ids = shown.length ? shown : [selected];
   planning = true;
   say("Working out what would go…");
-  const plan = await post("/api/delete/plan", { ids });
+  const plan = await post(path, body);
   planning = false;
   say("");
   if (!plan) return;
@@ -558,11 +571,35 @@ async function startDelete() {
   showDeletePlan(plan);
 }
 
+function startDelete() {
+  const shown = markedShown().map((row) => row.id);
+  if (!shown.length && !(current && current.can.delete)) {
+    say("This conversation is open, so it can't be deleted.", true);
+    return;
+  }
+  return askPlan("/api/delete/plan", { ids: shown.length ? shown : [selected] });
+}
+
 function section(title) {
   return el("h3", { textContent: title });
 }
 
+function toneLine(line) {
+  return el("p", { className: `line tone-${line.tone}`, textContent: line.text });
+}
+
+function jobList(jobs) {
+  return el("ul", { className: "jobs" }, ...jobs.map((job) => el("li", {},
+    el("span", { className: "job-id", textContent: job.short }),
+    el("span", { className: "job-size", textContent: job.size }),
+    el("span", { className: "job-age", textContent: job.age }),
+    el("span", { textContent: job.what }),
+    el("span", { className: "job-note", textContent: job.note }))));
+}
+
 function showDeletePlan(plan) {
+  const removal = plan.kind === "remove";
+  const verb = removal ? "Remove" : "Delete";
   const opened = Date.now();
   let delPressed = opened;
   let notes = false;
@@ -574,9 +611,14 @@ function showDeletePlan(plan) {
 
   const lead = el("p", { className: "tone-bold" });
   const foot = el("p", { className: "foot", role: "status" });
-  const list = el("ul", {}, ...plan.conversations.map((c) => el("li", { className: "row" },
-    el("span", { textContent: c.name }), el("span", { className: "row-id", textContent: c.short }), el("span", { className: "row-size", textContent: bytes(c.bytes) }))));
-  const body = [lead, list];
+  const body = removal ? plan.head.map(toneLine) : [lead];
+  if (plan.from.length) {
+    body.push(el("p", { className: "line", textContent: "From the clean-up suggestions:" }), ...plan.from.map((line) => el("p", { className: "line", textContent: `  ${line}` })));
+  }
+  if (plan.conversations.length) {
+    body.push(el("ul", {}, ...plan.conversations.map((c) => el("li", { className: "row" },
+      el("span", { textContent: c.name }), el("span", { className: "row-id", textContent: c.short }), el("span", { className: "row-size", textContent: bytes(c.bytes) })))));
+  }
   for (const line of [...plan.skipped, ...plan.warnings]) body.push(el("p", { className: "line", textContent: line }));
 
   const notesHead = section("");
@@ -595,9 +637,13 @@ function showDeletePlan(plan) {
       body.push(el("label", { className: "toggle" }, treesBox, el("span", { textContent: "Remove these worktrees too " }), el("kbd", { textContent: "w" })));
     }
   }
+  body.push(...plan.removing.map(toneLine));
+  if (plan.jobs.length) {
+    body.push(section(plan.kept_jobs ? "Job folders. Ones that may have a worktree are kept, so remove them with claude rm:" : "Job folders to delete:"), jobList(plan.jobs));
+  }
   body.push(foot);
 
-  const deleteBtn = el("button", { type: "submit", className: "chip danger" }, "Delete ", el("kbd", { textContent: "y" }));
+  const deleteBtn = el("button", { type: "submit", className: "chip danger" }, `${verb} `, el("kbd", { textContent: "y" }));
   const cancel = cancelButton();
 
   function secondsLeft() {
@@ -606,10 +652,13 @@ function showDeletePlan(plan) {
 
   function update() {
     const count = plan.conversations.length;
-    const what = [`${count} conversation${count === 1 ? "" : "s"}`];
-    if (worktrees) what.push(`${plan.worktree_count} worktree${plan.worktree_count === 1 ? "" : "s"}`);
-    const freed = plan.bytes.conversations + (notes ? plan.bytes.notes : 0) + (worktrees ? plan.bytes.worktrees : 0);
-    lead.textContent = `${joined(what)}, ${bytes(freed)} freed. This can't be undone.`;
+    const trees = (n) => `${n} worktree${n === 1 ? "" : "s"}`;
+    const what = count || !(plan.removing_count || plan.job_count) ? [`${count} conversation${count === 1 ? "" : "s"}`] : [];
+    if (worktrees) what.push(trees(plan.worktree_count));
+    if (plan.removing_count) what.push(trees(plan.removing_count));
+    if (plan.job_count) what.push(`${plan.job_count} job folder${plan.job_count === 1 ? "" : "s"}`);
+    const freed = plan.bytes.conversations + (notes ? plan.bytes.notes : 0) + (worktrees ? plan.bytes.worktrees : 0) + plan.bytes.removing + plan.bytes.jobs;
+    lead.textContent = plan.nothing ? "ccm can't delete any of these. They may have worktrees, so remove them with claude rm." : `${joined(what)}, ${bytes(freed)} freed. This can't be undone.`;
     notesHead.textContent = `Memory notes nothing else wrote ${notes ? "will be deleted" : "will be kept"}:`;
     treesHead.textContent = !plan.worktree_count ? "Worktrees nothing else used:"
       : worktrees ? "Worktrees nothing else used will be removed too. Their branches stay, so commits are kept:"
@@ -617,7 +666,10 @@ function showDeletePlan(plan) {
     const left = secondsLeft();
     deleteBtn.disabled = busy || left > 0;
     if (left > 0) {
-      foot.textContent = `${restarted ? "Too early, so it started over. " : ""}Delete unlocks in ${left}s, because of the unpushed commits. Pressing y or Del before then starts it over. Unticking the worktrees ends the wait.`;
+      const again = restarted ? "Too early, so it started over. " : "";
+      foot.textContent = removal
+        ? `${again}Remove unlocks in ${left}s. Pressing y or Del before then starts it over.`
+        : `${again}Delete unlocks in ${left}s, because of the unpushed commits. Pressing y or Del before then starts it over. Unticking the worktrees ends the wait.`;
     } else if (!busy && foot.dataset.note !== "keep") {
       foot.textContent = "";
     }
@@ -661,9 +713,9 @@ function showDeletePlan(plan) {
   }
 
   async function confirmDelete() {
-    if (busy) return;
+    if (busy || plan.nothing) return;
     busy = true;
-    foot.textContent = "Deleting…";
+    foot.textContent = removal ? "Removing…" : "Deleting…";
     update();
     const result = await post("/api/delete/confirm", { plan_id: plan.plan_id, notes, worktrees });
     busy = false;
@@ -680,13 +732,14 @@ function showDeletePlan(plan) {
       return;
     }
     result.deleted.forEach((id) => marked.delete(id));
+    cleanupMarked.clear();
     if (result.lines.length) {
       const lines = [result.summary, ...result.lines].filter(Boolean);
-      openDialog("Delete finished", lines.map((line) => el("p", { textContent: line })), [dialogButton("OK", null, true)], closeDialog, null, () => {});
+      openDialog(`${verb} finished`, lines.map((line) => el("p", { textContent: line })), [dialogButton("OK", null, true)], closeDialog, null, () => {});
     } else {
       say(result.summary);
     }
-    loadList();
+    reloadScreen();
   }
 
   notesBox.addEventListener("change", toggleNotes);
@@ -708,16 +761,324 @@ function showDeletePlan(plan) {
   if (plan.notes.length) keys.m = () => { notesBox.checked = !notesBox.checked; toggleNotes(); };
   if (plan.worktree_count) keys.w = () => { treesBox.checked = !treesBox.checked; toggleWorktrees(); };
 
-  openDialog("Delete permanently?", body, [cancel, deleteBtn], () => {
+  function giveUp() {
+    finished();
+    post("/api/delete/cancel", { plan_id: plan.plan_id });
+  }
+
+  const buttons = [cancel];
+  if (plan.rm_commands) {
+    const copyCommands = () => { closingDialog = true; $("dialog").close(); giveUp(); copy(plan.rm_commands); };
+    keys.c = copyCommands;
+    buttons.push(dialogButton("Copy claude rm commands", copyCommands));
+  }
+  if (!plan.nothing) buttons.push(deleteBtn);
+
+  openDialog(removal ? "Remove worktrees?" : "Delete permanently?", body, buttons, () => {
     // A second click of a double-click that opened this isn't an answer.
     if (Date.now() - opened >= DOUBLE_CLICK_MS) confirmDelete();
   }, keys, () => {
-    finished();
-    post("/api/delete/cancel", { plan_id: plan.plan_id });
-    say("Cancelled. Nothing was deleted.");
+    giveUp();
+    say(`Cancelled. Nothing was ${removal ? "removed" : "deleted"}.`);
   });
-  update();
+  setCountdown(plan.seconds_left);
   cancel.focus();
+}
+
+function showScreen(name) {
+  screen = name;
+  screenRequest++;
+  for (const each of ["conversations", "worktrees", "cleanup"]) {
+    $(`screen-${each}`).hidden = each !== name;
+    $(`go-${each}`).setAttribute("aria-pressed", String(each === name));
+  }
+  $("tools").hidden = name !== "conversations";
+}
+
+function reloadScreen() {
+  if (screen === "worktrees") loadWorktrees();
+  else if (screen === "cleanup") loadCleanup();
+  else loadList();
+}
+
+function goConversations() {
+  showScreen("conversations");
+  drawMarks();
+  loadList();
+}
+
+function goWorktrees(idle = false) {
+  onlyIdle = idle;
+  if (idle) {
+    wtSelected = null;
+    wtIndex = 0;
+  }
+  drawnWt = "";
+  showScreen("worktrees");
+  $("summary").textContent = "";
+  loadWorktrees(true);
+}
+
+function goCleanup() {
+  // Marks last only for one visit, as the lines may hold other things by the next.
+  cleanupMarked.clear();
+  drawnCleanup = "";
+  showScreen("cleanup");
+  $("summary").textContent = "";
+  loadCleanup(true);
+}
+
+function wtItems() {
+  return wtRows.filter((row) => row.id !== undefined);
+}
+
+function wtRowOf(id) {
+  return id === null ? null : $("wt-rows").querySelector(`tr[data-id="${CSS.escape(id)}"]`);
+}
+
+async function loadWorktrees(fresh = false) {
+  const request = ++screenRequest;
+  const params = new URLSearchParams();
+  if (fresh) params.set("fresh", "1");
+  if (onlyIdle) params.set("idle", "1");
+  const data = await api("/api/worktrees?" + params);
+  if (!data || request !== screenRequest || screen !== "worktrees") return;
+  wtRows = data.rows;
+  wtSummary = data.summary;
+  const state = JSON.stringify(wtRows);
+  if (state !== drawnWt) {
+    drawnWt = state;
+    const list = $("wt-list");
+    const top = list.scrollTop;
+    $("wt-rows").replaceChildren(...wtRows.map(drawWtRow));
+    list.scrollTop = top;
+  }
+  const empty = wtRows.length ? "" : data.empty;
+  $("wt-empty").textContent = empty;
+  $("wt-empty").hidden = !empty;
+  const all = wtItems();
+  if (!all.some((row) => row.id === wtSelected)) {
+    wtSelected = all.length ? all[Math.min(wtIndex, all.length - 1)].id : null;
+  }
+  const present = new Set(all.map((row) => row.id));
+  if (!onlyIdle) [...wtMarked].filter((id) => !present.has(id)).forEach((id) => wtMarked.delete(id));
+  drawWtSelection();
+}
+
+function drawWtRow(row) {
+  if (row.header !== undefined) {
+    return el("tr", { className: "group" }, el("td", { colSpan: 7, textContent: row.header }, el("span", { className: "count", textContent: row.count })));
+  }
+  const tr = el("tr", { className: row.class });
+  tr.dataset.id = row.id;
+  tr.append(el("td", { className: "col-mark" }, el("input", { type: "checkbox", tabIndex: -1, ariaLabel: `Mark ${row.cells.folder}` })));
+  const cell = (key, name) => el("td", { className: `wt-${name}`, title: row.cells[key] });
+  const folder = cell("folder", "folder");
+  folder.append(el("bdi", { textContent: row.cells.folder }));
+  tr.append(folder);
+  for (const [key, name] of [["branch", "branch"], ["changes", "changes"], ["unpushed", "unpushed"], ["conversations", "convs"], ["status", "status"]]) {
+    const td = cell(key, name);
+    td.textContent = row.cells[key];
+    tr.append(td);
+  }
+  return tr;
+}
+
+function wtMarkedShown() {
+  return wtItems().filter((row) => wtMarked.has(row.id));
+}
+
+function drawWtSelection() {
+  wtIndex = Math.max(0, wtItems().findIndex((row) => row.id === wtSelected));
+  for (const tr of $("wt-rows").querySelectorAll("tr[data-id]")) {
+    const on = wtMarked.has(tr.dataset.id);
+    const picked = tr.dataset.id === wtSelected;
+    tr.classList.toggle("marked", on);
+    tr.classList.toggle("selected", picked);
+    if (picked) tr.setAttribute("aria-selected", "true");
+    else tr.removeAttribute("aria-selected");
+    tr.querySelector(".col-mark input").checked = on;
+  }
+  const count = wtMarkedShown().length;
+  $("summary").textContent = wtSummary + (count ? `  ·  ${count} marked` : "");
+  drawWtDetails();
+}
+
+function drawWtDetails() {
+  const row = wtItems().find((each) => each.id === wtSelected) || null;
+  const count = wtMarkedShown().length;
+  const state = JSON.stringify([row, count, onlyIdle]);
+  if (state === drawnWtDetails) return;
+  drawnWtDetails = state;
+  const actions = el("div", { className: "actions" },
+    actionButton(count ? `Remove ${count}` : "Remove", "d", startRemove, Boolean(row) || count > 0),
+    actionButton("All", "a", markAllWorktrees));
+  if (onlyIdle) actions.append(actionButton("Show all worktrees", "c", () => goWorktrees(false)));
+  if (!row) {
+    $("wt-details").replaceChildren(actions);
+    $("wt-worked").replaceChildren();
+    return;
+  }
+  const facts = el("dl");
+  fact(facts, "Folder", row.path, "mono");
+  fact(facts, "Branch", row.branch);
+  fact(facts, "Repository", row.repo, "mono");
+  const lines = el("div", { className: "state-lines" }, ...row.state.map((line) => el("p", { textContent: line })));
+  $("wt-details").replaceChildren(el("h2", { textContent: row.cells.folder }), actions, facts, lines);
+  const title = el("p", { className: "older-title", textContent: "Conversations that worked here" });
+  const worked = row.worked_here.length
+    ? el("ul", { className: "worked" }, ...row.worked_here.map((c) => el("li", { className: c.state },
+        el("span", { textContent: c.state ? `${c.name}  (${c.state})` : c.name }), el("small", { textContent: c.notes }))))
+    : el("p", { textContent: "None that ccm knows of." });
+  $("wt-worked").replaceChildren(title, worked);
+}
+
+function selectWorktree(id) {
+  wtSelected = id;
+  drawWtSelection();
+  wtRowOf(id)?.scrollIntoView({ block: "nearest" });
+}
+
+function moveWorktree(delta) {
+  const all = wtItems();
+  if (!all.length) return;
+  const at = all.findIndex((row) => row.id === wtSelected);
+  selectWorktree(all[Math.min(all.length - 1, Math.max(0, (at < 0 ? 0 : at) + delta))].id);
+}
+
+function toggleWtMark(id) {
+  if (!wtMarked.delete(id)) wtMarked.add(id);
+  drawWtSelection();
+}
+
+function markWorktreeAndMove() {
+  if (wtSelected === null) return;
+  toggleWtMark(wtSelected);
+  moveWorktree(1);
+}
+
+function markAllWorktrees() {
+  const shown = wtItems().map((row) => row.id);
+  if (shown.every((id) => wtMarked.has(id))) wtMarked.clear();
+  else shown.forEach((id) => wtMarked.add(id));
+  drawWtSelection();
+}
+
+function startRemove() {
+  const shown = wtMarkedShown().map((row) => row.id);
+  const paths = shown.length ? shown : wtSelected === null ? [] : [wtSelected];
+  if (paths.length) return askPlan("/api/worktrees/plan", { paths });
+}
+
+async function loadCleanup(fresh = false) {
+  const request = ++screenRequest;
+  const data = await api("/api/cleanup" + (fresh ? "?fresh=1" : ""));
+  if (!data || request !== screenRequest || screen !== "cleanup") return;
+  cleanupLines = data.lines;
+  cleanupSummary = data.summary;
+  const state = JSON.stringify(cleanupLines.map((line) => [line.key, line.label, line.items, line.frees, line.count]));
+  if (state !== drawnCleanup) {
+    drawnCleanup = state;
+    $("cleanup-rows").replaceChildren(...cleanupLines.map(drawCleanupRow));
+  }
+  drawCleanupState(data.safety);
+}
+
+function drawCleanupRow(line) {
+  const tr = el("tr", { className: line.count === 0 ? "is-dim" : "" });
+  tr.dataset.key = line.key;
+  tr.append(el("td", { className: "col-mark" }, el("input", { type: "checkbox", tabIndex: -1, ariaLabel: `Mark ${line.label}` })),
+    el("td", { textContent: line.label }), el("td", { className: "clean-num", textContent: line.items }), el("td", { className: "clean-num", textContent: line.frees }));
+  return tr;
+}
+
+function cleanupTargets() {
+  const marked = cleanupLines.filter((line) => cleanupMarked.has(line.key));
+  return marked.length ? marked : cleanupLines.slice(cleanupRow, cleanupRow + 1);
+}
+
+let cleanupSafety = "";
+
+function drawCleanupState(safety = cleanupSafety) {
+  cleanupSafety = safety;
+  $("cleanup-rows").querySelectorAll("tr").forEach((tr, i) => {
+    const on = cleanupMarked.has(tr.dataset.key);
+    tr.classList.toggle("marked", on);
+    tr.classList.toggle("selected", i === cleanupRow);
+    if (i === cleanupRow) tr.setAttribute("aria-selected", "true");
+    else tr.removeAttribute("aria-selected");
+    tr.querySelector(".col-mark input").checked = on;
+  });
+  const marked = cleanupLines.filter((line) => cleanupMarked.has(line.key)).length;
+  $("summary").textContent = cleanupSummary + (marked ? `  ·  ${marked} line${marked === 1 ? "" : "s"} marked` : "");
+  const line = cleanupLines[cleanupRow];
+  const canDelete = cleanupTargets().some((each) => each.count > 0);
+  const state = JSON.stringify([line, canDelete, marked, safety]);
+  if (state === drawnAbout || !line) return;
+  drawnAbout = state;
+  $("cleanup-actions").replaceChildren(
+    actionButton("Open", "Enter", openCleanupLine, true, true),
+    actionButton(marked ? `Delete ${marked} line${marked === 1 ? "" : "s"}` : "Delete", "d", startCleanupDelete, canDelete),
+    actionButton("Mark", "Space", toggleCleanupMark),
+    actionButton("All", "a", markAllCleanup));
+  const parts = line.about.map((text) => el("p", { textContent: text }));
+  if (line.jobs && line.jobs.length) parts.push(jobList(line.jobs));
+  parts.push(el("p", { className: "safety", textContent: safety }));
+  $("cleanup-about").replaceChildren(...parts);
+}
+
+function moveCleanup(to) {
+  cleanupRow = Math.min(cleanupLines.length - 1, Math.max(0, to));
+  drawCleanupState();
+}
+
+function toggleCleanupMark() {
+  const line = cleanupLines[cleanupRow];
+  if (!line) return;
+  if (!cleanupMarked.delete(line.key)) cleanupMarked.add(line.key);
+  drawCleanupState();
+}
+
+function markAllCleanup() {
+  const full = cleanupLines.filter((line) => line.count > 0).map((line) => line.key);
+  if (full.length && full.every((key) => cleanupMarked.has(key))) cleanupMarked.clear();
+  else {
+    cleanupMarked.clear();
+    full.forEach((key) => cleanupMarked.add(key));
+  }
+  drawCleanupState();
+}
+
+function startCleanupDelete() {
+  return askPlan("/api/cleanup/plan", { lines: cleanupTargets().map((line) => line.key) });
+}
+
+function openCleanupLine() {
+  const line = cleanupLines[cleanupRow];
+  if (!line) return;
+  if (line.key === "worktrees") {
+    goWorktrees(true);
+  } else if (line.key === "jobs") {
+    askPlan("/api/cleanup/plan", { lines: ["jobs"], list: true });
+  } else {
+    view.filters = new Set(line.filters);
+    view.tool = null;
+    $("search").value = "";
+    view.q = "";
+    selected = null;
+    selectedIndex = 0;
+    goConversations();
+  }
+}
+
+function backFromMarks(marks, back) {
+  if (marks.size) {
+    marks.clear();
+    if (screen === "worktrees") drawWtSelection();
+    else drawCleanupState();
+  } else {
+    back();
+  }
 }
 
 function sortBy(column) {
@@ -823,6 +1184,46 @@ const KEYS = {
   g: nextGroup,
   s: nextSort,
   r: reverse,
+  w: () => goWorktrees(),
+  C: goCleanup,
+};
+
+const WORKTREE_KEYS = {
+  ArrowDown: () => moveWorktree(1),
+  j: () => moveWorktree(1),
+  ArrowUp: () => moveWorktree(-1),
+  k: () => moveWorktree(-1),
+  PageDown: () => moveWorktree(PAGE_ROWS),
+  PageUp: () => moveWorktree(-PAGE_ROWS),
+  Home: () => moveWorktree(-Infinity),
+  End: () => moveWorktree(Infinity),
+  d: startRemove,
+  Delete: startRemove,
+  " ": markWorktreeAndMove,
+  a: markAllWorktrees,
+  c: () => { if (onlyIdle) goWorktrees(false); },
+  Escape: () => backFromMarks(wtMarked, goConversations),
+  w: goConversations,
+  C: goCleanup,
+};
+
+const CLEANUP_KEYS = {
+  ArrowDown: () => moveCleanup(cleanupRow + 1),
+  j: () => moveCleanup(cleanupRow + 1),
+  ArrowUp: () => moveCleanup(cleanupRow - 1),
+  k: () => moveCleanup(cleanupRow - 1),
+  Home: () => moveCleanup(0),
+  PageUp: () => moveCleanup(0),
+  End: () => moveCleanup(cleanupLines.length - 1),
+  PageDown: () => moveCleanup(cleanupLines.length - 1),
+  Enter: openCleanupLine,
+  d: startCleanupDelete,
+  Delete: startCleanupDelete,
+  " ": toggleCleanupMark,
+  a: markAllCleanup,
+  Escape: () => backFromMarks(cleanupMarked, goConversations),
+  C: goConversations,
+  w: () => goWorktrees(),
 };
 
 document.addEventListener("keydown", (event) => {
@@ -845,7 +1246,7 @@ document.addEventListener("keydown", (event) => {
     onSearchKey(event);
     return;
   }
-  const action = KEYS[event.key];
+  const action = (screen === "worktrees" ? WORKTREE_KEYS : screen === "cleanup" ? CLEANUP_KEYS : KEYS)[event.key];
   if (action) {
     event.preventDefault();
     action();
@@ -886,9 +1287,32 @@ $("reverse").addEventListener("click", reverse);
 $("clear").addEventListener("click", clearFilters);
 $("reopen").addEventListener("click", startReopen);
 $("mark-all").addEventListener("click", markAll);
+$("go-conversations").addEventListener("click", goConversations);
+$("go-worktrees").addEventListener("click", () => goWorktrees());
+$("go-cleanup").addEventListener("click", goCleanup);
+$("wt-rows").addEventListener("click", (event) => {
+  const tr = event.target.closest("tr[data-id]");
+  if (!tr) return;
+  if (event.target.matches(".col-mark input")) toggleWtMark(tr.dataset.id);
+  else selectWorktree(tr.dataset.id);
+});
+$("cleanup-rows").addEventListener("click", (event) => {
+  const tr = event.target.closest("tr[data-key]");
+  if (!tr) return;
+  cleanupRow = [...tr.parentNode.children].indexOf(tr);
+  if (event.target.matches(".col-mark input")) toggleCleanupMark();
+  else drawCleanupState();
+});
+$("cleanup-rows").addEventListener("dblclick", (event) => {
+  if (event.target.closest("tr[data-key]") && !event.target.matches(".col-mark input")) openCleanupLine();
+});
 
 async function poll() {
   if (document.hidden) return;
+  if (screen !== "conversations") {
+    reloadScreen();
+    return;
+  }
   const data = await api("/api/version");
   if (data && data.version !== version) loadList();
 }
@@ -896,5 +1320,5 @@ async function poll() {
 document.addEventListener("visibilitychange", poll);
 setInterval(poll, POLL_MS);
 // Keeps the "active" ages current while nothing else changes.
-setInterval(() => { if (!document.hidden) loadList(); }, AGES_MS);
+setInterval(() => { if (!document.hidden && screen === "conversations") loadList(); }, AGES_MS);
 loadList();

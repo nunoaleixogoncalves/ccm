@@ -6,7 +6,7 @@ use ccm_core::config::Config;
 use ccm_core::format::{ago, bytes, sanitize, sanitize_lines, short_path};
 use ccm_core::model::{Session, Source};
 use ccm_core::preview::{Preview, Role};
-use ccm_core::query::{group_by_folder, group_by_repo, repo_tag, select, status_text, Filters, Group, GroupRow, SortKey};
+use ccm_core::query::{group_by_folder, group_by_repo, repo_tag, select, status_text, Filters, Group, GroupRow, SortKey, Suggestion};
 use ccm_core::repo::Place;
 use ccm_core::resume::copy_command;
 use ccm_core::window::{context_label, window_size};
@@ -14,6 +14,7 @@ use chrono::{Local, TimeZone};
 use serde_json::{json, Value};
 
 use crate::app::Grouping;
+use crate::cleanup::{label, Cleanup};
 
 /// Every column, left to right, with the key the page uses for it.
 const COLUMNS: [(&str, &str, SortKey); 10] = [
@@ -92,8 +93,9 @@ impl Query {
             junk: on("junk"),
             missing: on("missing"),
             large: on("large"),
+            closed: on("closed"),
+            old: on("old"),
             tool: params.get("tool").and_then(|t| tools.iter().copied().find(|s| tool_key(*s) == t)),
-            ..Filters::default()
         };
         let sort = params.get("sort").and_then(|k| COLUMNS.iter().find(|(key, ..)| key == k)).map_or(SortKey::LastActive, |c| c.2);
         let descending = params.get("desc").map_or(sort.default_descending(), |d| d == "1");
@@ -177,6 +179,7 @@ pub fn render(view: &View, query: &Query, version: u64, loading: bool, notice: O
         .filter(|(key, ..)| many || *key != "tool")
         .map(|(key, title, sort)| json!({ "key": key, "title": title, "descending": sort.default_descending() }))
         .collect();
+    let suggestion = Suggestion::ALL.into_iter().find(|s| query.filters == s.filters()).map(|s| label(view.config, Cleanup::Conversations(s)).trim_start_matches("Conversations ").to_string());
     let tools: Vec<Value> = view.tools.iter().map(|t| json!({ "key": tool_key(*t), "label": t.short() })).collect();
     json!({
         "version": version,
@@ -189,6 +192,7 @@ pub fn render(view: &View, query: &Query, version: u64, loading: bool, notice: O
         "crashed": view.sessions.iter().filter(|s| s.crashed).count(),
         "shown": shown,
         "filtered": query.filters.any() || view.matches.is_some(),
+        "suggestion": suggestion,
         "columns": columns,
         "tools": tools,
         "rows": rows,
@@ -332,6 +336,15 @@ pub mod tests {
         assert!(!q.filters.old && !q.filters.closed);
         assert_eq!(q.filters.tool, Some(Source::Codex));
         assert_eq!((q.sort, q.descending, q.grouping, q.text.as_str()), (SortKey::Size, false, Grouping::Repo, "x"));
+    }
+
+    #[test]
+    fn a_clean_up_line_is_named_only_when_the_filters_are_exactly_its_own() {
+        let suggestion = |filters: &str| rendered(&[session("a")], None, &query(&[("filters", filters)]), &HashMap::new())["suggestion"].clone();
+        assert_eq!(suggestion("closed,junk"), "Claude never replied to");
+        assert_eq!(suggestion("closed,large,old"), "over 100M not used for 30 days");
+        assert!(suggestion("junk").is_null());
+        assert!(suggestion("closed,junk,large").is_null());
     }
 
     #[test]

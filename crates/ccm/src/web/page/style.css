@@ -35,12 +35,14 @@
 
 * { box-sizing: border-box; }
 
+[hidden] { display: none !important; }
+
 html, body { height: 100%; }
 
 body {
   margin: 0;
-  display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
   background: var(--bg);
   color: var(--text);
   font: 14px/1.45 var(--sans);
@@ -163,9 +165,52 @@ kbd {
 
 .panes {
   display: grid;
+  flex: 1 1 0;
   grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr);
   min-height: 0;
 }
+
+.views { display: flex; gap: 6px; }
+
+.wt-table th, .clean-table th {
+  padding: 7px 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.wt-folder { width: auto; direction: rtl; text-align: left; font-family: var(--mono); font-size: 12px; }
+th.wt-folder { direction: ltr; font-family: var(--sans); }
+.wt-branch { width: 170px; }
+.wt-changes { width: 80px; }
+.wt-unpushed { width: 76px; }
+.wt-convs { width: 110px; }
+.wt-status { width: 76px; }
+.wt-table tr.is-open td { color: var(--open); }
+.wt-table tr.marked td { color: var(--you); }
+
+@container (max-width: 640px) { .wt-table .wt-branch { width: 0; padding: 0; visibility: hidden; } }
+@container (max-width: 500px) { .wt-table .wt-convs { width: 0; padding: 0; visibility: hidden; } }
+
+.state-lines p { margin: 8px 0 0; font-size: 13px; }
+.worked { margin: 12px 0 0; padding: 0; list-style: none; }
+.worked li { padding: 4px 0; }
+.worked .open { color: var(--open); }
+.worked .crashed { color: var(--crashed); }
+.worked small { display: block; color: var(--muted); font-size: 12px; }
+.older-title { margin: 12px 0 0; color: var(--muted); font-size: 13px; font-weight: 600; }
+
+.clean { flex: 1 1 0; min-height: 0; padding: 12px 16px; overflow-y: auto; }
+.clean-table { max-width: 900px; }
+.clean-num { width: 90px; text-align: right; }
+.about { max-width: 900px; margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
+.about p { margin: 0 0 8px; }
+.about .safety { color: var(--muted); font-size: 13px; }
+.jobs { margin: 0 0 10px; padding: 0; list-style: none; font-size: 13px; }
+.jobs li { display: flex; flex-wrap: wrap; gap: 2px 12px; padding: 2px 0; }
+.jobs .job-id { font-family: var(--mono); font-size: 12px; }
+.jobs .job-note { color: var(--you); }
+.jobs .job-size, .jobs .job-age { color: var(--muted); font-variant-numeric: tabular-nums; }
 
 .list {
   position: relative;
@@ -381,5 +426,5 @@ dialog .foot { min-height: 1.4em; margin: 12px 0 0; color: var(--crashed); font-
   .details { max-height: 18vh; }
   .list { border-right: 0; border-bottom: 1px solid var(--line); }
   .search { flex-basis: 100%; }
-  .top { flex-wrap: wrap; gap: 2px 14px; }
+  .top { flex-wrap: wrap; gap: 6px 14px; }
 }
