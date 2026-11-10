@@ -8,7 +8,7 @@ use ccm_core::model::{Session, Source};
 use ccm_core::preview::Preview;
 use ccm_core::tools::{self, Features};
 use ccm_core::rename::MAX_NAME;
-use ccm_core::resume::{copy_command, decide, decide_fork, Decision, Fork};
+use ccm_core::resume::{copy_command, decide, decide_fork, Decision, Focus, Fork, FOCUS_NOT_CONTROLLED};
 use ccm_core::jobs::{self, Leftover};
 use ccm_core::query::{group_by_folder, group_by_repo, select, status_text, Filters, GroupRow, SortKey, Suggestion};
 use ccm_core::repo::Place;
@@ -28,6 +28,7 @@ use crate::worktrees::{folders_of, Worktrees};
 /// An action reachable from both a key and a footer button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    ToggleFocus,
     ToggleOpen,
     ToggleCrashed,
     ToggleJunk,
@@ -88,7 +89,8 @@ pub enum View {
 /// Runs a query. `None` means the query has nothing to search for.
 /// Starts a resumed conversation and returns what to tell the user.
 /// With a fork, it starts that fork instead.
-pub type ResumeFn = Box<dyn FnMut(&str, Source, Option<&Fork>, &Path) -> Result<String, String>>;
+pub type ResumeFn = Box<dyn FnMut(&str, Source, Option<&Fork>, &Path, Focus) -> Result<String, String>>;
+pub type SaveFocusFn = Box<dyn FnMut(bool) -> Result<(), String>>;
 /// Works out what a delete would remove, without changing anything.
 pub type PlanFn = Box<dyn FnMut(&[Session]) -> Plan>;
 /// Carries out a plan, including the memory notes when asked.
@@ -275,6 +277,12 @@ pub struct App {
     /// Lines scrolled back from the newest message.
     pub preview_scroll: usize,
     pub resume: Option<ResumeFn>,
+    /// The "Focus new conversation" setting, as last read.
+    pub focus_new: bool,
+    /// False where nothing can steer the focus, so the setting would do nothing.
+    pub controls_focus: bool,
+    pub read_focus: Option<Box<dyn FnMut() -> bool>>,
+    pub save_focus: Option<SaveFocusFn>,
     /// Waiting for `y` to recreate this folder for this conversation, and whether to fork it.
     pub confirm_folder: Option<(String, PathBuf, bool)>,
     /// Each fork `ccm` started, and the conversation it copied.
@@ -350,6 +358,10 @@ impl App {
             preview: None,
             preview_scroll: 0,
             resume: None,
+            focus_new: true,
+            controls_focus: false,
+            read_focus: None,
+            save_focus: None,
             confirm_folder: None,
             forks: HashMap::new(),
             awaiting_fork: None,
@@ -390,6 +402,10 @@ impl App {
     }
 
     pub fn set_sessions(&mut self, sessions: Vec<Session>) {
+        // `ccm web` may have changed it.
+        if let Some(read) = self.read_focus.as_mut() {
+            self.focus_new = read();
+        }
         self.sessions = sessions;
         for s in &self.sessions {
             if let Some(from) = &s.forked_from {
@@ -1203,7 +1219,7 @@ impl App {
         };
         let source = original.source;
         let Some(resume) = self.resume.as_mut() else { return };
-        self.status = Some(match resume(&id, source, Some(&fork), folder) {
+        self.status = Some(match resume(&id, source, Some(&fork), folder, Focus::AsSet) {
             Ok(message) if source == Source::ClaudeCode => {
                 self.just_resumed.insert(fork_key(&id), Instant::now());
                 self.forks.insert(fork.id.clone(), id);
@@ -1219,17 +1235,38 @@ impl App {
         });
     }
 
+    /// Flips "Focus new conversation", or says why there's nothing to flip.
+    fn toggle_focus(&mut self) {
+        if !self.controls_focus {
+            self.status = Some(FOCUS_NOT_CONTROLLED.into());
+            return;
+        }
+        // `ccm web` may have changed it since it was last read.
+        if let Some(read) = self.read_focus.as_mut() {
+            self.focus_new = read();
+        }
+        let Some(save) = self.save_focus.as_mut() else { return };
+        let on = !self.focus_new;
+        self.status = Some(match save(on) {
+            Ok(()) => {
+                self.focus_new = on;
+                crate::wording::focus_saved(on).to_string()
+            }
+            Err(e) => crate::wording::focus_not_saved(&e),
+        });
+    }
+
     fn launch(&mut self, id: String, folder: &Path) {
-        match self.start_resume(&id, folder) {
+        match self.start_resume(&id, folder, Focus::AsSet) {
             Ok(message) => self.status = Some(message),
             Err(e) => self.status = Some(e),
         }
     }
 
-    fn start_resume(&mut self, id: &str, folder: &Path) -> Result<String, String> {
+    fn start_resume(&mut self, id: &str, folder: &Path, focus: Focus) -> Result<String, String> {
         let source = self.sessions.iter().find(|s| s.id == id).map_or(Source::ClaudeCode, |s| s.source);
         let Some(resume) = self.resume.as_mut() else { return Err("Resume isn't available.".into()) };
-        match resume(id, source, None, folder) {
+        match resume(id, source, None, folder, focus) {
             Ok(message) => {
                 self.just_resumed.insert(id.to_string(), Instant::now());
                 Ok(message)
@@ -1303,10 +1340,10 @@ impl App {
     fn reopen_one(&mut self, id: &str) -> Result<String, String> {
         let session = self.sessions.iter().find(|s| s.id == id).ok_or("It's gone.")?;
         match decide(session) {
-            Decision::Go(folder) => self.start_resume(id, &folder),
+            Decision::Go(folder) => self.start_resume(id, &folder, Focus::Stay),
             Decision::FolderMissing(folder) => {
                 std::fs::create_dir_all(&folder).map_err(|e| format!("Couldn't create its folder: {e}"))?;
-                self.start_resume(id, &folder)
+                self.start_resume(id, &folder, Focus::Stay)
             }
             Decision::AlreadyOpen => Err("It's already open.".into()),
             Decision::NoFolder => Err("No folder is recorded.".into()),
@@ -1438,6 +1475,7 @@ impl App {
             }
             Action::ReverseSort => self.descending = !self.descending,
             Action::Search => self.typing = true,
+            Action::ToggleFocus => self.toggle_focus(),
             Action::Resume => self.resume_selected(),
             Action::Fork => self.fork_selected(),
             Action::Delete if self.view == View::Worktrees => self.start_remove(),
@@ -1567,6 +1605,7 @@ impl App {
             KeyCode::Char(']') => self.preview_scroll = self.preview_scroll.saturating_sub(3),
             KeyCode::Char('d') | KeyCode::Delete => self.run(Action::Delete),
             KeyCode::Char('R') => self.run(Action::Rename),
+            KeyCode::Char('F') => self.run(Action::ToggleFocus),
             KeyCode::Char('f') => self.run(Action::Fork),
             KeyCode::Char('y') => self.run(Action::CopyId),
             KeyCode::Char('Y') => self.run(Action::CopyCommand),

@@ -357,6 +357,9 @@ fn summary_line(app: &App) -> Line<'static> {
         let size: u64 = marked.iter().map(|s| s.size_bytes).sum();
         text.push_str(&format!("  {} marked {}", marked.len(), bytes(size)));
     }
+    if app.controls_focus && !app.focus_new {
+        text.push_str("  focus stays on ccm");
+    }
     if app.loading {
         text.push_str("  scanning…");
     }
@@ -870,7 +873,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
 mod tests {
     use super::*;
     use crate::repos::RepoRequest;
-    use ccm_core::resume::Fork;
+    use ccm_core::resume::{Focus, Fork};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use ccm_core::repo::Place;
@@ -1735,7 +1738,7 @@ mod tests {
     fn resumable(a: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<(String, std::path::PathBuf)>>> {
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let seen = calls.clone();
-        a.resume = Some(Box::new(move |id, _, _, folder| {
+        a.resume = Some(Box::new(move |id, _, _, folder, _| {
             seen.borrow_mut().push((id.to_string(), folder.to_owned()));
             Ok("Opened in a new terminal.".to_string())
         }));
@@ -1760,7 +1763,7 @@ mod tests {
     fn forkable(a: &mut App) -> ForkCalls {
         let calls: ForkCalls = Rc::new(RefCell::new(Vec::new()));
         let seen = calls.clone();
-        a.resume = Some(Box::new(move |id, _, fork, folder| {
+        a.resume = Some(Box::new(move |id, _, fork, folder, _| {
             seen.borrow_mut().push((id.to_string(), fork.cloned(), folder.to_owned()));
             Ok("Opened in a new terminal.".to_string())
         }));
@@ -1852,7 +1855,7 @@ mod tests {
     #[test]
     fn a_failed_start_can_be_retried() {
         let mut a = resume_app("/work/a", true, false);
-        a.resume = Some(Box::new(|_, _, _, _| Err("no terminal".to_string())));
+        a.resume = Some(Box::new(|_, _, _, _, _| Err("no terminal".to_string())));
         a.on_key(KeyCode::Enter);
         assert_eq!(a.status.as_deref(), Some("no terminal"));
         assert!(a.can_resume());
@@ -2648,7 +2651,7 @@ mod tests {
     #[test]
     fn one_failure_does_not_stop_the_others_and_is_reported() {
         let mut a = crashed_app();
-        a.resume = Some(Box::new(|id, _, _, _| if id == JUNK_ID { Err("no terminal".into()) } else { Ok("Opened.".into()) }));
+        a.resume = Some(Box::new(|id, _, _, _, _| if id == JUNK_ID { Err("no terminal".into()) } else { Ok("Opened.".into()) }));
         a.on_key(KeyCode::Char('O'));
         a.on_key(KeyCode::Enter);
         let screen = render(&mut a, 120, 30);
@@ -2745,7 +2748,7 @@ mod tests {
         let mut a = with_codex();
         let calls: Rc<RefCell<Vec<Launched>>> = Rc::default();
         let seen = calls.clone();
-        a.resume = Some(Box::new(move |id, source, fork, folder| {
+        a.resume = Some(Box::new(move |id, source, fork, folder, _| {
             seen.borrow_mut().push((id.to_string(), source, fork.is_some(), folder.to_owned()));
             Ok("Opened in a new terminal.".to_string())
         }));
@@ -2826,7 +2829,7 @@ mod tests {
         let mut a = with_codex();
         let calls: Rc<RefCell<Vec<Launched>>> = Rc::default();
         let seen = calls.clone();
-        a.resume = Some(Box::new(move |id, source, fork, folder| {
+        a.resume = Some(Box::new(move |id, source, fork, folder, _| {
             seen.borrow_mut().push((id.to_string(), source, fork.is_some(), folder.to_owned()));
             Ok("Opened.".to_string())
         }));
@@ -2848,5 +2851,83 @@ mod tests {
         a.on_key(KeyCode::Char('O'));
         a.on_key(KeyCode::Enter);
         assert_eq!(*calls.borrow(), [(id, Source::Codex, false, PathBuf::from("/home/me/c"))]);
+    }
+
+    type Logged<T> = Rc<RefCell<Vec<T>>>;
+
+    fn focus_app() -> (App, Logged<Focus>, Logged<bool>) {
+        let mut a = resume_app("/home/me/shop", true, false);
+        a.controls_focus = true;
+        let (focus, saved): (Logged<Focus>, Logged<bool>) = Default::default();
+        let seen = focus.clone();
+        a.resume = Some(Box::new(move |_, _, _, _, how| {
+            seen.borrow_mut().push(how);
+            Ok("Opened.".to_string())
+        }));
+        let log = saved.clone();
+        a.save_focus = Some(Box::new(move |on| {
+            log.borrow_mut().push(on);
+            Ok(())
+        }));
+        (a, focus, saved)
+    }
+
+    #[test]
+    fn shift_f_saves_the_setting_and_the_top_line_shows_when_it_is_off() {
+        let (mut a, _, saved) = focus_app();
+        a.on_key(KeyCode::Char('F'));
+        assert_eq!(a.status.as_deref(), Some("Focus new conversation is off: focus stays on ccm."));
+        assert!(!a.focus_new);
+        a.status = None;
+        assert!(render(&mut a, 200, 30).contains("focus stays on ccm"));
+        a.on_key(KeyCode::Char('F'));
+        assert!(a.focus_new);
+        assert_eq!(*saved.borrow(), [false, true]);
+        a.status = None;
+        assert!(!render(&mut a, 200, 30).contains("focus stays on ccm"));
+    }
+
+    #[test]
+    fn a_setting_that_cant_be_saved_stays_as_it_was_and_says_why() {
+        let (mut a, _, _) = focus_app();
+        a.save_focus = Some(Box::new(|_| Err("read-only".to_string())));
+        a.on_key(KeyCode::Char('F'));
+        assert!(a.focus_new);
+        assert_eq!(a.status.as_deref(), Some("Couldn't save the setting: read-only"));
+    }
+
+    #[test]
+    fn a_change_made_on_the_page_is_seen_before_flipping_it() {
+        let (mut a, _, saved) = focus_app();
+        a.read_focus = Some(Box::new(|| false));
+        a.on_key(KeyCode::Char('F'));
+        assert_eq!(*saved.borrow(), [true], "it was already off");
+    }
+
+    #[test]
+    fn where_focus_cant_be_controlled_the_key_says_so_and_saves_nothing() {
+        let (mut a, _, saved) = focus_app();
+        a.controls_focus = false;
+        a.on_key(KeyCode::Char('F'));
+        assert_eq!(a.status.as_deref(), Some(ccm_core::resume::FOCUS_NOT_CONTROLLED));
+        assert!(saved.borrow().is_empty());
+    }
+
+    #[test]
+    fn resume_follows_the_setting() {
+        let (mut a, focus, _) = focus_app();
+        a.on_key(KeyCode::Enter);
+        assert_eq!(*focus.borrow(), [Focus::AsSet]);
+    }
+
+    #[test]
+    fn reopening_after_a_crash_always_stays_on_ccm() {
+        let (mut a, focus, _) = focus_app();
+        let mut sessions = a.sessions.clone();
+        sessions[0].crashed = true;
+        a.set_sessions(sessions);
+        a.on_key(KeyCode::Char('O'));
+        a.on_key(KeyCode::Enter);
+        assert_eq!(*focus.borrow(), [Focus::Stay]);
     }
 }

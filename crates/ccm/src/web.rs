@@ -199,6 +199,15 @@ pub fn serve(paths: Paths, options: Options) -> Result<()> {
         index: paths.index.clone(),
         effects: actions::Effects {
             resume: Box::new(crate::resumer(&paths, terminal)),
+            read_focus: Box::new({
+                let paths = paths.clone();
+                move || crate::read_focus(&paths)
+            }),
+            save_focus: Box::new({
+                let path = paths.config.clone();
+                move |on| Config::save_focus(&path, on)
+            }),
+            controls_focus: crate::focus_control() != ccm_core::resume::FocusControl::None,
             rename: Box::new(crate::renamer(&paths, &start.codex_home)),
             dismiss: Box::new(crate::dismisser(&paths)),
             plan_delete: Box::new({
@@ -377,6 +386,7 @@ fn handle(state: &Arc<State>, guard: &Guard, method: &str, url: &str, headers: &
                 "/api/resume" => Reply::json(&actions::resume(state, &body)),
                 "/api/rename" => Reply::json(&actions::rename(state, &body)),
                 "/api/reopen" => Reply::json(&actions::reopen(state, &body)),
+                "/api/focus" => Reply::json(&actions::set_focus(state, &body)),
                 "/api/delete/plan" => Reply::json(&deletion::plan(state, &body)),
                 "/api/delete/worktrees" => Reply::json(&deletion::toggle_worktrees(state, &body)),
                 "/api/delete/confirm" => Reply::json(&deletion::confirm(state, &body)),
@@ -395,7 +405,7 @@ fn handle(state: &Arc<State>, guard: &Guard, method: &str, url: &str, headers: &
         "/icon.svg" => Reply::file("image/svg+xml", ICON),
         "/api/version" => {
             let live = read(&state.live);
-            Reply::json(&json!({ "version": live.version, "loading": live.loading }))
+            Reply::json(&json!({ "version": live.version, "loading": live.loading, "focus": actions::focus_state(state) }))
         }
         "/api/list" => Reply::json(&list_reply(state, &params)),
         "/api/reopen" => Reply::json(&actions::reopen_list(state)),
@@ -439,7 +449,9 @@ fn list_reply(state: &Arc<State>, params: &HashMap<String, String>) -> Value {
         now_ms: now_ms(),
     };
     let notice = problem.or(search_error).or_else(|| state.config_error.clone());
-    list::render(&view, &query, version, loading, notice.as_deref())
+    let mut reply = list::render(&view, &query, version, loading, notice.as_deref());
+    reply["focus"] = actions::focus_state(state);
+    reply
 }
 
 fn details_reply(state: &State, id: &str) -> Option<Value> {
@@ -469,7 +481,10 @@ impl State {
             tools: vec![Source::ClaudeCode],
             index,
             effects: actions::Effects {
-                resume: Box::new(|_, _, _, _| Ok("Opened in a new terminal.".into())),
+                resume: Box::new(|_, _, _, _, _| Ok("Opened in a new terminal.".into())),
+                read_focus: Box::new(|| true),
+                save_focus: Box::new(|_| Ok(())),
+                controls_focus: true,
                 rename: Box::new(|_, _, _, name| Ok(name.to_string())),
                 dismiss: Box::new(|_| Ok(())),
                 plan_delete: Box::new(|_| ccm_core::delete::Plan::default()),

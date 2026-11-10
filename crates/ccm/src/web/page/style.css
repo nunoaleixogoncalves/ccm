@@ -136,6 +136,9 @@ kbd {
 }
 
 .chip:hover { background: var(--surface); }
+.chip.check { display: inline-flex; align-items: center; gap: 5px; }
+.chip.check input { margin: 0; accent-color: var(--accent); }
+.chip.check.cannot { opacity: 0.45; }
 .chip:focus-visible, th button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .chip[aria-pressed="true"] {

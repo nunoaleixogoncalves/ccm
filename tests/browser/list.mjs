@@ -118,4 +118,9 @@ await send("Emulation.setDeviceMetricsOverride", { width: 1000, height: 700, dev
 await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "light" }] });
 await shot("7-narrow");
 
+await go(base + "/"); await sleep(1000);
+ok("where focus can't be controlled the box says so", (await js(`document.getElementById('focus-chip').title`)).includes("can't control focus"));
+await js(`document.getElementById('focus-new').click()`); await sleep(400);
+ok("and ticking it explains instead of working", (await js(`document.getElementById('status-text').textContent`)).includes("can't control focus") && !(await js(`document.getElementById('focus-new').checked`)));
+
 await finish(["403", "favicon", "blocked by CORS"]);

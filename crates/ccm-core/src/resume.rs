@@ -7,7 +7,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -33,6 +33,44 @@ const SESSION_VARS: [&str; 10] = [
 
 /// How long a terminal launcher gets to fail before it counts as started.
 const LAUNCH_GRACE: Duration = Duration::from_millis(300);
+
+/// How long `herdr-app` gets to show a tab it was only just told about.
+const HERDR_SELECT_WAIT: Duration = Duration::from_secs(2);
+/// How long a new window gets to appear and take the focus.
+const WINDOW_WAIT: Duration = Duration::from_secs(5);
+
+pub const FOCUS_NOT_CONTROLLED: &str = "ccm can't control focus here, so your terminal or window manager decides where it goes.";
+
+/// Where attention goes when a conversation opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    /// As the "Focus new conversation" setting says.
+    AsSet,
+    /// Always stay on `ccm`, as when reopening several at once.
+    Stay,
+}
+
+/// What can steer the focus where this `ccm` opens conversations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusControl {
+    /// New tabs open in the background, and can be selected.
+    Herdr,
+    /// New windows take the focus, and it can be given back.
+    Hyprland,
+    None,
+}
+
+/// Follows where conversations open: inside `herdr-app` they open there, whatever the desktop.
+pub fn focus_control(var: impl Fn(&str) -> Option<String>, path: &str) -> FocusControl {
+    let has = |program| find_program(program, path).is_some();
+    if in_herdr(&var) {
+        if has("herdr-app") { FocusControl::Herdr } else { FocusControl::None }
+    } else if var("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|x| !x.is_empty()) && has("hyprctl") {
+        FocusControl::Hyprland
+    } else {
+        FocusControl::None
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -313,6 +351,99 @@ pub fn herdr_terminals() -> io::Result<Vec<HerdrTerminal>> {
         .collect())
 }
 
+/// What to run to show a workspace or tab of `herdr-app`.
+fn herdr_select_args(command: &str, id: &str) -> Vec<String> {
+    vec!["do".into(), command.into(), "--id".into(), id.into()]
+}
+
+/// Goes to a tab `herdr_launch` just created. The window can need a moment to know about it.
+pub fn herdr_select(space: &str, tab: &str) -> Result<(), String> {
+    let deadline = Instant::now() + HERDR_SELECT_WAIT;
+    for (command, id) in [("space.select", space), ("tab.select", tab)] {
+        loop {
+            let tried = Command::new("herdr-app").args(herdr_select_args(command, id)).stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
+            let error = herdr_error(&tried.stdout).or_else(|| (!tried.status.success()).then(|| String::from_utf8_lossy(&tried.stderr).trim().to_string()));
+            let Some(error) = error else { break };
+            if Instant::now() >= deadline {
+                return Err(sanitize(&error));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Ok(())
+}
+
+/// `herdr-app do` reports a refused command as `{"error": "..."}`.
+fn herdr_error(stdout: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Reply {
+        error: Option<String>,
+    }
+    serde_json::from_slice::<Reply>(stdout).ok()?.error
+}
+
+/// Where the focus was before a new window opened, and the windows that already existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowOrigin {
+    window: String,
+    known: HashSet<String>,
+}
+
+impl WindowOrigin {
+    /// Only a window that wasn't there before counts, so a window the person moved to on
+    /// purpose is left alone.
+    fn took_focus(&self, active: &str) -> bool {
+        !self.known.contains(active)
+    }
+}
+
+/// Hyprland's windows are named by an address like `0x55d0c3a1b2c0`. Nothing else is passed on.
+fn is_address(a: &str) -> bool {
+    a.strip_prefix("0x").is_some_and(|hex| !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+#[derive(Deserialize)]
+struct HyprWindow {
+    address: String,
+}
+
+fn parse_window(json: &[u8]) -> Option<String> {
+    let w: HyprWindow = serde_json::from_slice(json).ok()?;
+    is_address(&w.address).then_some(w.address)
+}
+
+fn parse_windows(json: &[u8]) -> Option<HashSet<String>> {
+    let all: Vec<HyprWindow> = serde_json::from_slice(json).ok()?;
+    Some(all.into_iter().map(|w| w.address).collect())
+}
+
+fn hyprctl(args: &[&str]) -> Option<Vec<u8>> {
+    let out = Command::new("hyprctl").args(args).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// Notes the window to come back to, before opening a new one.
+pub fn window_origin() -> Option<WindowOrigin> {
+    let window = parse_window(&hyprctl(&["activewindow", "-j"])?)?;
+    let known = parse_windows(&hyprctl(&["clients", "-j"])?)?;
+    Some(WindowOrigin { window, known })
+}
+
+/// Gives the focus back once the new window has taken it. Runs on its own thread, as a window
+/// can take a while to appear and `ccm` shouldn't freeze meanwhile.
+pub fn return_focus(origin: WindowOrigin) {
+    thread::spawn(move || {
+        let deadline = Instant::now() + WINDOW_WAIT;
+        while Instant::now() < deadline {
+            if hyprctl(&["activewindow", "-j"]).and_then(|j| parse_window(&j)).is_some_and(|active| origin.took_focus(&active)) {
+                hyprctl(&["dispatch", "focuswindow", &format!("address:{}", origin.window)]);
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+}
+
 /// Whether `ccm` is running inside a `herdr-app` terminal, given a way to read the environment.
 pub fn in_herdr(var: impl Fn(&str) -> Option<String>) -> bool {
     ["HC_TERMINAL_ID", "HC_TERMINAL_SOCKET"].iter().all(|v| var(v).is_some_and(|x| !x.is_empty()))
@@ -433,6 +564,56 @@ pub fn is_trusted(claude_json: &Path, folder: &Path) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn window(list: &[&str]) -> WindowOrigin {
+        WindowOrigin { window: list[0].to_string(), known: list.iter().map(|w| w.to_string()).collect() }
+    }
+
+    #[test]
+    fn focus_control_follows_where_conversations_open() {
+        let dir = tempfile::tempdir().unwrap();
+        for program in ["herdr-app", "hyprctl"] {
+            let file = dir.path().join(program);
+            std::fs::write(&file, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        }
+        let path = dir.path().to_str().unwrap();
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |v: &str| pairs.iter().find(|(k, _)| *k == v).map(|(_, x)| x.to_string());
+        const HERDR: &[(&str, &str)] = &[("HC_TERMINAL_ID", "t1"), ("HC_TERMINAL_SOCKET", "/s")];
+        const BOTH: &[(&str, &str)] = &[("HC_TERMINAL_ID", "t1"), ("HC_TERMINAL_SOCKET", "/s"), ("HYPRLAND_INSTANCE_SIGNATURE", "x")];
+        const HYPR: &[(&str, &str)] = &[("HYPRLAND_INSTANCE_SIGNATURE", "x")];
+        assert_eq!(focus_control(env(HERDR), path), FocusControl::Herdr);
+        assert_eq!(focus_control(env(BOTH), path), FocusControl::Herdr, "it opens in herdr");
+        assert_eq!(focus_control(env(HYPR), path), FocusControl::Hyprland);
+        assert_eq!(focus_control(env(&[]), path), FocusControl::None);
+        assert_eq!(focus_control(env(HYPR), "/nowhere"), FocusControl::None, "no hyprctl");
+        assert_eq!(focus_control(env(BOTH), "/nowhere"), FocusControl::None, "inside herdr with no way to reach it");
+    }
+
+    #[test]
+    fn herdr_is_told_which_tab_with_separate_arguments() {
+        assert_eq!(herdr_select_args("tab.select", "tb1"), ["do", "tab.select", "--id", "tb1"]);
+        assert_eq!(herdr_error(br#"{"error":"no such tab"}"#).as_deref(), Some("no such tab"));
+        assert_eq!(herdr_error(b"{}"), None);
+        assert_eq!(herdr_error(b"shown"), None);
+    }
+
+    #[test]
+    fn only_a_window_that_is_new_counts_as_taking_the_focus() {
+        let origin = window(&["0xa", "0xb"]);
+        assert!(origin.took_focus("0xc"));
+        assert!(!origin.took_focus("0xb"), "moved there on purpose");
+        assert!(!origin.took_focus("0xa"));
+    }
+
+    #[test]
+    fn hyprland_replies_are_read_and_only_addresses_are_passed_on() {
+        assert_eq!(parse_window(br#"{"address":"0x55d0a1","title":"x"}"#).as_deref(), Some("0x55d0a1"));
+        assert_eq!(parse_window(b"{}"), None, "no window has the focus");
+        assert_eq!(parse_window(br#"{"address":"0xzz; exec evil"}"#), None);
+        assert_eq!(parse_windows(br#"[{"address":"0x1"},{"address":"0x2"}]"#).unwrap().len(), 2);
+        assert_eq!(parse_windows(b"nope"), None);
+    }
 
     #[test]
     fn codex_resumes_and_forks_in_the_folder_given_without_asking() {
