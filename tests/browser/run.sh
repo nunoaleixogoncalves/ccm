@@ -1,7 +1,7 @@
 #!/bin/bash
 # Checks ccm web in headless Chrome, with the terminal app open on the same data.
 #
-#   cargo build --locked && tests/browser/run.sh [list] [actions] [delete] [worktrees]
+#   cargo build --locked && tests/browser/run.sh [list] [actions] [delete] [focus] [worktrees]
 #
 # With no names, every suite runs. It needs Node 22 or later, Chrome, Python 3, Git, curl and ss.
 # CCM_BIN picks another program and CHROME another browser.
@@ -62,7 +62,26 @@ EOT
     echo "terminal = [\"$root/fake-term\"]" > "$home/.config/ccm/config.toml"
     python3 "$here/mark_open.py" "$home"
 
-    env -i PATH="$PATH" HOME="$home" GIT_OPTIONAL_LOCKS=0 "$bin" web --no-browser > "$root/server.txt" 2>&1 &
+    # Only this suite thinks it's on Hyprland. The fake shows window 0xa with the focus, then a new
+    # 0xb until the focus is given back.
+    local on_hyprland=()
+    if [ "$name" = focus ]; then
+        mkdir "$root/bin"
+        cat > "$root/bin/hyprctl" <<EOT
+#!/bin/sh
+echo "\$*" >> "$root/hyprctl.log"
+case "\$1" in
+    activewindow)
+        if [ -f "$root/new-window" ]; then echo '{"address":"0xb"}'; else touch "$root/new-window"; echo '{"address":"0xa"}'; fi ;;
+    clients) echo '[{"address":"0xa"}]' ;;
+    dispatch) rm -f "$root/new-window" ;;
+esac
+EOT
+        chmod +x "$root/bin/hyprctl"
+        on_hyprland=(HYPRLAND_INSTANCE_SIGNATURE=invented)
+    fi
+
+    env -i PATH="$root/bin:$PATH" HOME="$home" GIT_OPTIONAL_LOCKS=0 "${on_hyprland[@]}" "$bin" web --no-browser > "$root/server.txt" 2>&1 &
     server=$!
     for i in $(seq 40); do
         grep -q token= "$root/server.txt" && break
@@ -100,8 +119,8 @@ EOT
     fi
 }
 
-all=(list:data_list.py actions:data_list.py delete:data_delete.py worktrees:data_worktrees.py)
-[ $# -gt 0 ] || set -- list actions delete worktrees
+all=(list:data_list.py actions:data_list.py delete:data_delete.py focus:data_list.py worktrees:data_worktrees.py)
+[ $# -gt 0 ] || set -- list actions delete focus worktrees
 for wanted in "$@"; do
     found=
     for entry in "${all[@]}"; do

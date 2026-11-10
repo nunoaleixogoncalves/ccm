@@ -11,7 +11,7 @@ use ccm_core::jobs::{self, Leftover};
 use ccm_core::format::{sanitize, short_path};
 use ccm_core::model::{Session, Source};
 use ccm_core::removal::{self, Target};
-use ccm_core::resume::{decide, decide_fork, Decision, Fork};
+use ccm_core::resume::{decide, decide_fork, Decision, Focus, Fork, FOCUS_NOT_CONTROLLED};
 use ccm_core::tools::Features;
 use serde_json::{json, Value};
 
@@ -21,7 +21,9 @@ use super::{lock, read, write, State};
 const COOLDOWN: Duration = Duration::from_secs(20);
 const NOTHING_TO_REOPEN: &str = "Nothing to reopen. Crash information needs ccm setup, and only covers sessions started after it.";
 
-type ResumeFn = Box<dyn Fn(&str, Source, Option<&Fork>, &Path) -> Result<String, String> + Send + Sync>;
+type ResumeFn = Box<dyn Fn(&str, Source, Option<&Fork>, &Path, Focus) -> Result<String, String> + Send + Sync>;
+type ReadFocusFn = Box<dyn Fn() -> bool + Send + Sync>;
+type SaveFocusFn = Box<dyn Fn(bool) -> Result<(), String> + Send + Sync>;
 type RenameFn = Box<dyn Fn(&str, Source, &Path, &str) -> Result<String, String> + Send + Sync>;
 type DismissFn = Box<dyn Fn(&[String]) -> Result<(), String> + Send + Sync>;
 type PlanDeleteFn = Box<dyn Fn(&[Session]) -> delete::Plan + Send + Sync>;
@@ -36,6 +38,10 @@ type RemoveJobsFn = Box<dyn Fn(&[PathBuf]) -> jobs::Outcome + Send + Sync>;
 /// What actually touches the system. Tests swap these.
 pub struct Effects {
     pub resume: ResumeFn,
+    pub read_focus: ReadFocusFn,
+    pub save_focus: SaveFocusFn,
+    /// False where nothing can steer the focus, so the setting would do nothing.
+    pub controls_focus: bool,
     pub rename: RenameFn,
     pub dismiss: DismissFn,
     pub plan_delete: PlanDeleteFn,
@@ -134,7 +140,7 @@ fn failed(s: &Session, error: &str) -> Value {
 }
 
 fn start_resume(state: &State, s: &Session, folder: &Path, starting: &mut Starting, key: String) -> Value {
-    match (state.effects.resume)(&s.id, s.source, None, folder) {
+    match (state.effects.resume)(&s.id, s.source, None, folder, Focus::AsSet) {
         Ok(message) => {
             starting.note(key);
             done(&message)
@@ -148,7 +154,7 @@ fn start_fork(state: &State, s: &Session, folder: &Path, starting: &mut Starting
         Ok(fork) => fork,
         Err(e) => return refused(&format!("Couldn't make an ID for the fork: {e}")),
     };
-    match (state.effects.resume)(&s.id, s.source, Some(&fork), folder) {
+    match (state.effects.resume)(&s.id, s.source, Some(&fork), folder, Focus::AsSet) {
         Ok(message) => {
             starting.note(key);
             // Codex picks the fork's ID itself.
@@ -180,6 +186,22 @@ pub fn rename(state: &State, body: &Value) -> Value {
             done(&message)
         }
         Err(e) => refused(&e),
+    }
+}
+
+/// "Focus new conversation" as the page shows it. `note` says why it can't work here.
+pub fn focus_state(state: &State) -> Value {
+    json!({ "on": (state.effects.read_focus)(), "note": (!state.effects.controls_focus).then_some(FOCUS_NOT_CONTROLLED) })
+}
+
+pub fn set_focus(state: &State, body: &Value) -> Value {
+    if !state.effects.controls_focus {
+        return refused(FOCUS_NOT_CONTROLLED);
+    }
+    let Some(on) = body["on"].as_bool() else { return refused("That isn't a setting ccm knows.") };
+    match (state.effects.save_focus)(on) {
+        Ok(()) => json!({ "ok": true, "on": on, "message": crate::wording::focus_saved(on) }),
+        Err(e) => refused(&crate::wording::focus_not_saved(&e)),
     }
 }
 
@@ -222,7 +244,7 @@ fn reopen_one(state: &State, s: &Session) -> Result<String, String> {
         }
         other => return Err(other.refusal().unwrap_or("It can't be started.").into()),
     };
-    let message = (state.effects.resume)(&s.id, s.source, None, &folder)?;
+    let message = (state.effects.resume)(&s.id, s.source, None, &folder, Focus::Stay)?;
     starting.note(s.id.clone());
     Ok(message)
 }
@@ -279,8 +301,9 @@ mod tests {
         let mut made = State::for_tests(dir, sessions);
         let state = Arc::get_mut(&mut made).unwrap();
         let log = Arc::clone(&calls);
-        state.effects.resume = Box::new(move |id, source, fork, folder| {
-            log.lock().unwrap().push(format!("{} {id} {source:?} fork={} in {}", "start", fork.is_some(), folder.display()));
+        state.effects.resume = Box::new(move |id, source, fork, folder, focus| {
+            let stays = if focus == Focus::Stay { " stays" } else { "" };
+            log.lock().unwrap().push(format!("{} {id} {source:?} fork={} in {}{stays}", "start", fork.is_some(), folder.display()));
             result.clone()
         });
         let log = Arc::clone(&calls);
@@ -468,6 +491,7 @@ mod tests {
         assert_eq!(out["lines"][1], "1 unticked no longer show as crashed.");
         let calls = calls.lock().unwrap();
         assert!(calls[0].starts_with(&format!("start {A}")));
+        assert!(calls[0].ends_with(" stays"), "reopening never takes the focus: {}", calls[0]);
         assert_eq!(calls[1], format!("dismiss {B}"));
         assert!(!find(&state, B).unwrap().crashed);
     }
@@ -488,5 +512,36 @@ mod tests {
         let out = reopen(&state, &json!({ "ticked": [A, B] }));
         assert_eq!(out["lines"][0], format!("name {A}: not reopened. no terminal"));
         assert!(out["lines"][1].as_str().unwrap().contains("It's gone."));
+    }
+
+    #[test]
+    fn the_focus_setting_is_saved_and_a_bad_value_or_no_control_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut made, _) = state(dir.path(), Vec::new(), fine());
+        let saved: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let log = Arc::clone(&saved);
+        Arc::get_mut(&mut made).unwrap().effects.save_focus = Box::new(move |on| {
+            log.lock().unwrap().push(on);
+            Ok(())
+        });
+        let out = set_focus(&made, &json!({ "on": false }));
+        assert_eq!((out["ok"].as_bool(), out["on"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(out["message"], "Focus new conversation is off: focus stays on ccm.");
+        assert_eq!(set_focus(&made, &json!({ "on": "no" }))["ok"], false);
+        assert_eq!(*saved.lock().unwrap(), [false]);
+        assert!(focus_state(&made)["note"].is_null());
+
+        Arc::get_mut(&mut made).unwrap().effects.controls_focus = false;
+        assert_eq!(set_focus(&made, &json!({ "on": true }))["message"], FOCUS_NOT_CONTROLLED);
+        assert_eq!(focus_state(&made)["note"], FOCUS_NOT_CONTROLLED);
+        assert_eq!(*saved.lock().unwrap(), [false], "nothing saved where it would do nothing");
+    }
+
+    #[test]
+    fn a_setting_that_cant_be_saved_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut made, _) = state(dir.path(), Vec::new(), fine());
+        Arc::get_mut(&mut made).unwrap().effects.save_focus = Box::new(|_| Err("read-only".into()));
+        assert_eq!(set_focus(&made, &json!({ "on": false }))["message"], "Couldn't save the setting: read-only");
     }
 }

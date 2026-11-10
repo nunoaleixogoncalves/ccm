@@ -36,6 +36,7 @@ let drawnColumns = "";
 let selected = null;
 let selectedIndex = 0;
 let version = null;
+let focusState = { on: false, note: null };
 let listRequest = 0;
 let detailsRequest = 0;
 let detailsTimer = 0;
@@ -154,6 +155,7 @@ async function loadList() {
   tools = data.tools;
   rows = data.rows;
   drawSummary(data);
+  drawFocus(data.focus);
   drawHead();
   drawRows();
   drawChips();
@@ -161,6 +163,28 @@ async function loadList() {
   keepSelection();
   drawMarks();
   loadDetails();
+}
+
+function drawFocus(focus) {
+  focusState = focus;
+  $("focus-new").checked = focus.on && !focus.note;
+  $("focus-chip").classList.toggle("cannot", !!focus.note);
+  $("focus-chip").title = focus.note || "On: Resume and Fork go to the new conversation. Off: focus stays here.";
+}
+
+async function toggleFocus() {
+  if (focusState.note) {
+    say(focusState.note);
+    drawFocus(focusState);
+    return;
+  }
+  const reply = await post("/api/focus", { on: !focusState.on });
+  if (!reply) {
+    drawFocus(focusState);
+    return;
+  }
+  drawFocus(reply.ok ? { on: reply.on, note: null } : focusState);
+  say(reply.message, !reply.ok);
 }
 
 function drawSummary(data) {
@@ -1177,6 +1201,7 @@ const KEYS = {
   y: () => { if (current) copy(current.id); },
   Y: () => { if (current) copy(current.command); },
   O: startReopen,
+  F: toggleFocus,
   d: startDelete,
   Delete: startDelete,
   " ": markAndMove,
@@ -1254,6 +1279,8 @@ document.addEventListener("keydown", (event) => {
 });
 
 $("search").addEventListener("input", (event) => setQuery(event.target.value));
+// The box gives up the keyboard straight away, so the list's keys keep working.
+$("focus-new").addEventListener("change", (event) => { event.target.blur(); toggleFocus(); });
 $("rows").addEventListener("click", (event) => {
   const tr = event.target.closest("tr[data-id]");
   if (!tr) return;
@@ -1314,6 +1341,7 @@ async function poll() {
     return;
   }
   const data = await api("/api/version");
+  if (data) drawFocus(data.focus);
   if (data && data.version !== version) loadList();
 }
 

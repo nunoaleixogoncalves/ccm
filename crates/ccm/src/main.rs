@@ -31,7 +31,7 @@ use ccm_core::removal;
 use ccm_core::repo::Place;
 use ccm_core::rename;
 use ccm_core::forks;
-use ccm_core::resume::{self, Fork, Launch};
+use ccm_core::resume::{self, Focus, FocusControl, Fork, Launch};
 use ccm_core::setup;
 use ccm_core::worktree::{self, Scan};
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, KeyModifiers};
@@ -163,10 +163,17 @@ fn start(paths: &Paths) -> Result<Start> {
 fn browse(paths: Paths) -> Result<()> {
     let Start { config, config_error, codex_home, looked_in, tools, catalog, cached, searcher } = start(&paths)?;
     let config_terminal = config.terminal.clone();
+    let config_focus = config.focus_new_conversation;
     let mut app = App::new(config, looked_in, home());
     app.tools = tools;
     app.status = config_error;
     app.resume = Some(Box::new(resumer(&paths, config_terminal)));
+    app.focus_new = config_focus;
+    app.controls_focus = focus_control() != FocusControl::None;
+    let focus_paths = paths.clone();
+    app.read_focus = Some(Box::new(move || read_focus(&focus_paths)));
+    let focus_path = paths.config.clone();
+    app.save_focus = Some(Box::new(move |on| Config::save_focus(&focus_path, on)));
     app.forks = forks::load(&paths);
     app.search = Some(Box::new(move |q| searcher.search(q).map_err(|e| e.to_string())));
     let plan_paths = paths.clone();
@@ -200,16 +207,25 @@ fn browse(paths: Paths) -> Result<()> {
 }
 
 /// Opens a conversation, or a fork of it, the way the configuration and the surroundings ask.
-fn resumer(paths: &Paths, terminal: Option<Vec<String>>) -> impl Fn(&str, Source, Option<&Fork>, &Path) -> Result<String, String> + Send + Sync + 'static {
+fn resumer(paths: &Paths, terminal: Option<Vec<String>>) -> impl Fn(&str, Source, Option<&Fork>, &Path, Focus) -> Result<String, String> + Send + Sync + 'static {
     let paths = paths.clone();
-    let log = paths.state.join("launch.log");
-    move |id, source, fork, folder| {
+    move |id, source, fork, folder, focus| {
         // Codex records the original in the fork itself.
         if let (Some(fork), Source::ClaudeCode) = (fork, source) {
             forks::record(&paths, &fork.id, id, now_ms()).map_err(|e| format!("Couldn't note the fork, so it wasn't started: {e}"))?;
         }
-        resume_conversation(id, source, fork, folder, terminal.as_deref(), &paths.claude_json, &log)
+        // Read each time, as the other front end may have just changed it.
+        let go = focus == Focus::AsSet && read_focus(&paths);
+        resume_conversation(id, source, fork, folder, terminal.as_deref(), &paths, go)
     }
+}
+
+fn read_focus(paths: &Paths) -> bool {
+    Config::load(&paths.config).0.focus_new_conversation
+}
+
+fn focus_control() -> FocusControl {
+    resume::focus_control(|v| std::env::var(v).ok(), &std::env::var("PATH").unwrap_or_default())
 }
 
 fn renamer(paths: &Paths, codex_home: &Path) -> impl Fn(&str, Source, &Path, &str) -> Result<String, String> + Send + Sync + 'static {
@@ -276,19 +292,26 @@ fn resume_conversation(
     fork: Option<&Fork>,
     folder: &Path,
     terminal: Option<&[String]>,
-    claude_json: &Path,
-    log: &Path,
+    paths: &Paths,
+    go: bool,
 ) -> Result<String, String> {
+    let log = paths.state.join("launch.log");
     let var = |v: &str| std::env::var(v).ok();
     let claude = resume::tool_args(source, id, fork, folder);
+    let mut tab = None;
     let (launch, place) = if resume::in_herdr(var) {
-        herdr_plan(&claude, folder)?
+        let (launch, place, new_tab) = herdr_plan(&claude, folder)?;
+        tab = Some(new_tab);
+        (launch, place)
     } else if let Some(launch) = terminal.is_none().then(|| wsl_plan(&claude, folder)).flatten() {
         (launch, "a new Windows Terminal tab")
     } else {
         (resume::terminal_launch(&claude, folder, terminal), "a new terminal")
     };
-    if let Err(e) = resume::start(&launch, Some(log)) {
+    let control = focus_control();
+    // Noted first, as the new window can take the focus as soon as it starts.
+    let origin = (!go && control == FocusControl::Hyprland).then(resume::window_origin).flatten();
+    if let Err(e) = resume::start(&launch, Some(&log)) {
         let why = if e.kind() == std::io::ErrorKind::NotFound {
             format!("{} isn't installed. Set terminal in ccm's config.toml to your terminal", ccm_core::format::sanitize(&launch.program))
         } else {
@@ -297,11 +320,18 @@ fn resume_conversation(
         return Err(format!("Couldn't start it ({why}). Run: {}", resume::manual_command_for(source, id, fork, folder)));
     }
     // Claude Code asks this itself, in the new terminal. Only the user may answer it.
-    let warning = match (source, resume::is_trusted(claude_json, folder)) {
+    let warning = match (source, resume::is_trusted(&paths.claude_json, folder)) {
         (Source::ClaudeCode, Some(false)) => " Claude Code will ask you to trust this folder there first.",
         _ => "",
     };
-    Ok(format!("Opened in {place}.{warning}"))
+    if let Some(origin) = origin {
+        resume::return_focus(origin);
+    }
+    let moved = match tab {
+        Some((space, tab)) if go && control == FocusControl::Herdr => resume::herdr_select(&space, &tab).err().map(|e| format!(" Couldn't go to it: {e}.")),
+        _ => None,
+    };
+    Ok(format!("Opened in {place}.{warning}{}", moved.unwrap_or_default()))
 }
 
 /// Inside WSL, with Windows Terminal there to open, unless `terminal` says otherwise.
@@ -317,13 +347,14 @@ fn wsl_plan(claude: &[String], folder: &Path) -> Option<Launch> {
     Some(resume::wsl_launch(claude, folder, &distro, &claude_path, &env))
 }
 
-fn herdr_plan(claude: &[String], folder: &Path) -> Result<(Launch, &'static str), String> {
+fn herdr_plan(claude: &[String], folder: &Path) -> Result<(Launch, &'static str, (String, String)), String> {
     let terminals = resume::herdr_terminals().map_err(|e| format!("Couldn't read herdr's terminals: {e}"))?;
     let space = folder.to_str().and_then(|f| resume::find_space(&terminals, f));
     let new_id = |prefix| resume::new_herdr_id(prefix).map_err(|e| e.to_string());
     let place = if space.is_some() { "a new tab of its workspace" } else { "a new workspace" };
-    let launch = resume::herdr_launch(claude, folder, space.as_deref(), &new_id("tb")?, &new_id("sp")?);
-    Ok((launch, place))
+    let (tab, new_space) = (new_id("tb")?, new_id("sp")?);
+    let launch = resume::herdr_launch(claude, folder, space.as_deref(), &tab, &new_space);
+    Ok((launch, place, (space.unwrap_or(new_space), tab)))
 }
 
 fn home() -> String {

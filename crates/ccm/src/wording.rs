@@ -218,3 +218,12 @@ pub fn removal_report(plan: &removal::Plan, outcome: &removal::Outcome) -> (Stri
     lines.extend(outcome.skipped.iter().map(|s| format!("Skipped {}: {}", path(&s.path), sanitize(&s.reason))));
     (summary, lines)
 }
+
+/// What changing "Focus new conversation" did.
+pub fn focus_saved(on: bool) -> &'static str {
+    if on { "Focus new conversation is on: Resume and Fork go to it." } else { "Focus new conversation is off: focus stays on ccm." }
+}
+
+pub fn focus_not_saved(error: &str) -> String {
+    format!("Couldn't save the setting: {}", ccm_core::format::sanitize(error))
+}

@@ -136,6 +136,7 @@ Actions:
 | `y` | Copy the conversation's ID |
 | `Shift+Y` | Copy the command that resumes it |
 | `Shift+O` | Open the list of crashed conversations to reopen |
+| `Shift+F` | Choose whether Resume and Fork go to the new conversation. See [Focus](#focus) |
 | Esc | Clear the marks, then the search. It never quits |
 | `q`, Ctrl-C | Quit |
 
@@ -176,6 +177,16 @@ Open conversations are never suggested, and `ccm` never brings this screen up by
 - A job that may have a worktree is never deleted by `ccm`, because `claude rm` is what removes its worktree safely. Open the job line with Enter and press `c` to copy the `claude rm` commands.
 
 Change what counts as large or old with `large_threshold_mb` and `old_after_days` in the [configuration](#configuration).
+
+## Focus
+
+**Focus new conversation** decides where you end up after Resume or Fork: on the new conversation, or still on `ccm`, so you can open several in a row. It's on by default. Change it with `Shift+F`, or the Focus new checkbox in `ccm web`. Both use the same setting, `focus_new_conversation` in the [configuration](#configuration). Reopening crashed conversations with `Shift+O` always stays on `ccm`.
+
+| Where it opens | On | Off |
+|---|---|---|
+| `herdr-app` | Goes to the new tab | The tab opens in the background |
+| A new window on Hyprland | The new window takes the focus | The focus comes back to the window you were on as soon as the new one appears |
+| Anywhere else | Your terminal or window manager decides | The same. `ccm` says so and the setting does nothing |
 
 ## Forking
 
@@ -254,7 +265,7 @@ Codex conversations can be resumed, forked and deleted, through Codex's own comm
 
 Resume and fork open a terminal on this computer, the same way the terminal app does. If that fails, the page gives you the command to copy. Rename, copying the ID or command, reopening after a crash and deleting work as they do in the terminal, under the same rules. The delete popup lists what goes and offers the same worktrees, and the wait for unpushed commits is enforced by `ccm` itself, not the page.
 
-The worktree view (`w`) and the clean-up screen (`Shift+C`) are there too, with the same checks and the same keys.
+The worktree view (`w`) and the clean-up screen (`Shift+C`) are there too, with the same checks and the same keys. So is [Focus new conversation](#focus), as a checkbox.
 
 It opens your browser and prints a link, then runs until you press `Ctrl+C`.
 
@@ -292,6 +303,10 @@ terminal = ["foot", "-e"]
 # Which tools to read: "claude", "codex" or both. By default, every tool whose
 # folder exists is read.
 tools = ["claude", "codex"]
+
+# Whether Resume and Fork go to the new conversation, where ccm can control that.
+# The default is true.
+focus_new_conversation = false
 
 # Context window sizes by model, for models that show "?".
 [windows]
