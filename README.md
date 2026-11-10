@@ -1,6 +1,6 @@
 # ccm
 
-**A terminal app for finding, resuming and cleaning up your Claude Code conversations.**
+**A terminal and browser app for finding, resuming and cleaning up your Claude Code and Codex conversations.**
 
 ![ccm showing a list of conversations with details and a preview of the selected one](docs/screenshot.png)
 
@@ -8,13 +8,13 @@
 
 ## Why
 
-If you run a lot of Claude Code sessions, they pile up:
+If you run a lot of Claude Code or Codex sessions, they pile up:
 
 - Finding an old conversation means remembering when and where it ran, or what it was called.
 - Claude Code can purge a whole project, but not one conversation and everything stored with it.
 - After a crash or reboot, nothing tells you which conversations were open or which folders they ran in.
 
-`ccm` puts every conversation from every project in one table, with full-text search and a preview. It only uses the files Claude Code already keeps, and it opens in a fraction of a second, even with hundreds of conversations.
+`ccm` puts every conversation from every project in one table, with full-text search and a preview. It only uses the files those tools already keep, and it opens in a fraction of a second, even with hundreds of conversations.
 
 ## What you can do
 
@@ -34,7 +34,7 @@ If you run a lot of Claude Code sessions, they pile up:
 
 ## Install
 
-You need [Claude Code](https://claude.com/claude-code). On Linux or macOS, run:
+You need [Claude Code](https://claude.com/claude-code) or [Codex](https://github.com/openai/codex). On Linux or macOS, run:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/nunoaleixogoncalves/ccm/main/install.sh | sh
@@ -42,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/nunoaleixogoncalves/ccm/main/instal
 
 This downloads the ready-made program for your system from the [latest release](https://github.com/nunoaleixogoncalves/ccm/releases/latest), checks its checksum and puts it in `~/.local/bin`. To use another folder, set `CCM_INSTALL_DIR`. The script tells you if that folder isn't on your `PATH`. You can [read the script](install.sh) first, or download the program from the releases page yourself.
 
-It then runs `ccm setup`, which shows the changes it would make to Claude Code's settings and applies them only if you answer `y`. Those changes are only needed for crash recovery and exact context window sizes. Everything else works without them.
+It then runs `ccm setup`, which shows the changes it would make to Claude Code's settings and applies them only if you answer `y`. Those changes are only needed for crash recovery and exact context window sizes in Claude Code. Everything else works without them, and Codex doesn't need them.
 
 The Linux programs are static, so they work on any distribution. The macOS ones aren't signed: installing with the command above is fine, but macOS may refuse one you download with a browser until you allow it in **System Settings → Privacy & Security**.
 

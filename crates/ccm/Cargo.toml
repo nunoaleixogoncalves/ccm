@@ -2,7 +2,7 @@
 name = "ccm"
 version = "2.0.0-beta"
 edition = "2024"
-description = "A terminal app for finding, resuming and cleaning up your Claude Code conversations"
+description = "A terminal and browser app for finding, resuming and cleaning up your Claude Code and Codex conversations"
 repository = "https://github.com/nunoaleixogoncalves/ccm"
 license = "MIT"
 publish = false
