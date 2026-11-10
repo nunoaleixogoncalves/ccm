@@ -43,3 +43,14 @@ jobs:
           persist-credentials: false
       - run: rustup update stable && rustup default stable && rustup component add clippy
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: rustup update stable && rustup default stable
+      - run: cargo build --locked
+      - run: tests/browser/run.sh
