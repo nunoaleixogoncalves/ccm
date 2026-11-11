@@ -29,7 +29,8 @@ export const shot = async (n) => { const r = await send("Page.captureScreenshot"
 export const key = async (k, code = k, text = k === "Enter" ? "\r" : k.length === 1 ? k : undefined) => { await send("Input.dispatchKeyEvent", { type: "keyDown", key: k, code, text, windowsVirtualKeyCode: ({Escape:27,Enter:13,Delete:46," ":32})[k] }); await send("Input.dispatchKeyEvent", { type: "keyUp", key: k, code }); await sleep(250); };
 let bad = 0;
 export const ok = (name, cond, got) => { console.log((cond ? "ok   " : "FAIL ") + name + (cond ? "" : "  got: " + JSON.stringify(got))); if (!cond) bad++; };
-export const names = () => js(`[...document.querySelectorAll('#rows tr[data-id] .col-name')].map(t=>t.firstChild.textContent)`);
+// The name is the cell's own text, before any pin mark, branch or tags.
+export const names = () => js(`[...document.querySelectorAll('#rows tr[data-id] .col-name')].map(t=>[...t.childNodes].find(n=>n.nodeType===3).textContent)`);
 export const count = () => js(`document.querySelectorAll('#rows tr[data-id]').length`);
 
 // Ends the run. `allowed` lists what may show as a browser error, such as requests a check blocks on purpose.

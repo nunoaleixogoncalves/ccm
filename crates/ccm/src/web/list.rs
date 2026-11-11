@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use ccm_core::config::Config;
 use ccm_core::format::{ago, bytes, sanitize, sanitize_lines, short_path};
+use ccm_core::labels;
 use ccm_core::model::{Session, Source};
 use ccm_core::preview::{Preview, Role};
 use ccm_core::query::{group_by_folder, group_by_repo, repo_tag, select, status_text, Filters, Group, GroupRow, SortKey, Suggestion};
@@ -95,6 +96,7 @@ impl Query {
             large: on("large"),
             closed: on("closed"),
             old: on("old"),
+            unpinned: on("unpinned"),
             tool: params.get("tool").and_then(|t| tools.iter().copied().find(|s| tool_key(*s) == t)),
         };
         let sort = params.get("sort").and_then(|k| COLUMNS.iter().find(|(key, ..)| key == k)).map_or(SortKey::LastActive, |c| c.2);
@@ -128,6 +130,8 @@ fn item(view: &View, s: &Session, grouping: Grouping) -> Value {
         "id": s.id,
         "bytes": s.size_bytes,
         "tag": tag,
+        "pinned": s.pinned,
+        "tags": s.tags.iter().map(|t| sanitize(t)).collect::<Vec<_>>(),
         "cells": {
             "tool": s.source.short(),
             "name": sanitize(&s.display_name()),
@@ -160,6 +164,8 @@ pub fn render(view: &View, query: &Query, version: u64, loading: bool, notice: O
     if let Some(matches) = view.matches {
         order.retain(|&i| matches.contains(&view.sessions[i].id));
     }
+    let (tags, _) = labels::split_query(&query.text);
+    order.retain(|&i| labels::has_tags(&view.sessions[i], &tags));
     let shown = order.len();
     let rows = match query.grouping {
         Grouping::Off => order.into_iter().map(GroupRow::Item).collect(),
@@ -191,7 +197,7 @@ pub fn render(view: &View, query: &Query, version: u64, loading: bool, notice: O
         "open": view.sessions.iter().filter(|s| s.open).count(),
         "crashed": view.sessions.iter().filter(|s| s.crashed).count(),
         "shown": shown,
-        "filtered": query.filters.any() || view.matches.is_some(),
+        "filtered": query.filters.any() || view.matches.is_some() || !tags.is_empty(),
         "suggestion": suggestion,
         "columns": columns,
         "tools": tools,
@@ -245,6 +251,8 @@ pub fn details(s: &Session, sessions: &[Session], forks: &HashMap<String, String
         "id": s.id,
         "command": copy_command(s),
         "name": name(s),
+        "pinned": s.pinned,
+        "tags": s.tags.iter().map(|t| sanitize(t)).collect::<Vec<_>>(),
         "tool": s.source.label(),
         "folder": s.folder.as_deref().map_or("-".to_string(), sanitize),
         "missing": s.is_folder_missing(),
@@ -296,6 +304,8 @@ pub mod tests {
             crashed: false,
             window_size: None,
             folder_exists: true,
+            pinned: false,
+            tags: Vec::new(),
         }
     }
 
@@ -333,7 +343,7 @@ pub mod tests {
     fn a_query_reads_everything_it_can_set() {
         let q = query(&[("filters", "open,crashed,junk,missing,large,nonsense"), ("tool", "codex"), ("sort", "size"), ("desc", "0"), ("group", "repo"), ("q", "x")]);
         assert!(q.filters.open && q.filters.crashed && q.filters.junk && q.filters.missing && q.filters.large);
-        assert!(!q.filters.old && !q.filters.closed);
+        assert!(!q.filters.old && !q.filters.closed && !q.filters.unpinned);
         assert_eq!(q.filters.tool, Some(Source::Codex));
         assert_eq!((q.sort, q.descending, q.grouping, q.text.as_str()), (SortKey::Size, false, Grouping::Repo, "x"));
     }
@@ -341,10 +351,11 @@ pub mod tests {
     #[test]
     fn a_clean_up_line_is_named_only_when_the_filters_are_exactly_its_own() {
         let suggestion = |filters: &str| rendered(&[session("a")], None, &query(&[("filters", filters)]), &HashMap::new())["suggestion"].clone();
-        assert_eq!(suggestion("closed,junk"), "Claude never replied to");
-        assert_eq!(suggestion("closed,large,old"), "over 100M not used for 30 days");
+        assert_eq!(suggestion("closed,unpinned,junk"), "Claude never replied to");
+        assert!(suggestion("closed,junk").is_null(), "pinned ones would show");
+        assert_eq!(suggestion("closed,unpinned,large,old"), "over 100M not used for 30 days");
         assert!(suggestion("junk").is_null());
-        assert!(suggestion("closed,junk,large").is_null());
+        assert!(suggestion("closed,unpinned,junk,large").is_null());
     }
 
     #[test]

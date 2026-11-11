@@ -60,6 +60,11 @@ pub struct Session {
     pub window_size: Option<u64>,
     #[serde(skip, default = "yes")]
     pub folder_exists: bool,
+    /// Pinned in `ccm`, which keeps pins and tags itself. See [`crate::labels`].
+    #[serde(skip)]
+    pub pinned: bool,
+    #[serde(skip)]
+    pub tags: Vec<String>,
 }
 
 /// How much of a conversation happened in one folder. Kept exact, so sanitize before display.
@@ -72,6 +77,18 @@ pub struct FolderVisit {
     /// highest one across visits is the folder the conversation was last in.
     pub last_record: u64,
     pub last_ms: Option<i64>,
+}
+
+/// A plain conversation for tests to change.
+#[cfg(test)]
+pub(crate) fn test_session(id: &str) -> Session {
+    serde_json::from_value(serde_json::json!({
+        "id": id, "source": "ClaudeCode", "transcript_path": "", "transcript_size": 0, "transcript_mtime_ns": 0,
+        "size_bytes": 0, "name": id, "folder": null, "branch": null, "model": null, "started_at_ms": null,
+        "last_active_ms": null, "context_used": null, "prompts": 1, "replies": 1, "cost_usd": null,
+        "lines_added": null, "lines_removed": null, "pr_url": null, "continued_in": null, "bad_lines": 0,
+    }))
+    .unwrap()
 }
 
 fn yes() -> bool {

@@ -10,6 +10,7 @@ use ccm_core::tools::{self, Features};
 use ccm_core::rename::MAX_NAME;
 use ccm_core::resume::{copy_command, decide, decide_fork, Decision, Focus, Fork, FOCUS_NOT_CONTROLLED};
 use ccm_core::jobs::{self, Leftover};
+use ccm_core::labels::{self, Change, Labels};
 use ccm_core::query::{group_by_folder, group_by_repo, select, status_text, Filters, GroupRow, SortKey, Suggestion};
 use ccm_core::repo::Place;
 use ccm_core::window::{context_label, window_size};
@@ -29,6 +30,8 @@ use crate::worktrees::{folders_of, Worktrees};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     ToggleFocus,
+    Pin,
+    Tags,
     ToggleOpen,
     ToggleCrashed,
     ToggleJunk,
@@ -113,6 +116,10 @@ pub type LeftoversFn = Box<dyn FnMut() -> Vec<Leftover>>;
 pub type RemoveJobsFn = Box<dyn FnMut(&[PathBuf]) -> jobs::Outcome>;
 /// The time now, in milliseconds. Tests set their own.
 pub type ClockFn = Box<dyn Fn() -> i64>;
+/// Reads the saved pins and tags.
+pub type ReadLabelsFn = Box<dyn FnMut() -> Result<Labels, String>>;
+/// Changes the pins or tags of these conversations, and returns them all as saved.
+pub type LabelFn = Box<dyn FnMut(&[String], &Change) -> Result<Labels, String>>;
 
 /// Two clicks on a row this close together are a double-click. Terminals report each click
 /// separately, so this has to be timed here.
@@ -243,6 +250,19 @@ pub struct Reopen {
     pub cursor: usize,
 }
 
+/// Tags being typed, for one or several conversations. With several, the line starts with the
+/// tags they all share, and only those are changed.
+pub struct Tagging {
+    pub ids: Vec<String>,
+    common: Vec<String>,
+    pub text: String,
+    /// Why the tags as typed can't be saved, shown until the next key.
+    pub problem: Option<String>,
+}
+
+/// Long enough for every tag a conversation can have.
+const MAX_TAGS_TEXT: usize = 800;
+
 /// A rename in progress. It holds its own target, because a refresh can move the selection.
 pub struct Renaming {
     id: String,
@@ -308,6 +328,16 @@ pub struct App {
     pub renamer: Option<RenameFn>,
     /// Keys go to the name while this is set.
     pub renaming: Option<Renaming>,
+    pub read_labels: Option<ReadLabelsFn>,
+    pub labeler: Option<LabelFn>,
+    /// The pins and tags last read, kept when the file can't be read.
+    labels: Labels,
+    /// Why they couldn't be read, said once each time it changes.
+    labels_problem: Option<String>,
+    /// Keys go to the tags while this is set.
+    pub tagging: Option<Tagging>,
+    /// The `#tag` words of the search.
+    tag_filter: Vec<String>,
     pub copier: Option<CopyFn>,
     just_resumed: HashMap<String, Instant>,
     last_click: Option<(usize, Instant)>,
@@ -378,6 +408,12 @@ impl App {
             dialog_width: 0,
             renamer: None,
             renaming: None,
+            read_labels: None,
+            labeler: None,
+            labels: Labels::default(),
+            labels_problem: None,
+            tagging: None,
+            tag_filter: Vec::new(),
             copier: None,
             just_resumed: HashMap::new(),
             last_click: None,
@@ -407,6 +443,7 @@ impl App {
             self.focus_new = read();
         }
         self.sessions = sessions;
+        self.read_labels();
         for s in &self.sessions {
             if let Some(from) = &s.forked_from {
                 self.forks.entry(s.id.clone()).or_insert_with(|| from.clone());
@@ -423,6 +460,25 @@ impl App {
         self.marked.retain(|id| present.contains(id.as_str()));
         self.run_search();
         self.worktrees.relink(&self.sessions);
+    }
+
+    /// Reads the pins and tags again, since `ccm web` may have changed them, and puts them on the
+    /// conversations. If they can't be read, the last ones read stay.
+    fn read_labels(&mut self) {
+        if let Some(read) = self.read_labels.as_mut() {
+            match read() {
+                Ok(labels) => {
+                    self.labels = labels;
+                    self.labels_problem = None;
+                }
+                Err(e) if self.labels_problem.as_ref() != Some(&e) => {
+                    self.status = Some(sanitize(&e));
+                    self.labels_problem = Some(e);
+                }
+                Err(_) => {}
+            }
+        }
+        self.labels.apply(&mut self.sessions);
     }
 
     /// The folders to scan for worktrees, when a scan is due. The caller runs Git elsewhere and
@@ -825,6 +881,7 @@ impl App {
         if let Some(matches) = &self.matches {
             order.retain(|&i| matches.contains(&self.sessions[i].id));
         }
+        order.retain(|&i| labels::has_tags(&self.sessions[i], &self.tag_filter));
         self.rows = match self.grouping {
             Grouping::Off => order.into_iter().map(GroupRow::Item).collect(),
             Grouping::Folder => group_by_folder(&self.sessions, &order),
@@ -844,8 +901,10 @@ impl App {
     /// Re-runs the current query. Rows follow its results, not their relevance, so the chosen
     /// sort order always holds.
     fn run_search(&mut self) {
+        let (tags, text) = labels::split_query(&self.query);
+        self.tag_filter = tags;
         self.matches = match self.search.as_mut() {
-            Some(search) => match search(&self.query) {
+            Some(search) => match search(&text) {
                 Ok(matches) => matches,
                 Err(e) => {
                     self.status = Some(format!("Search failed: {e}"));
@@ -936,6 +995,85 @@ impl App {
         }
     }
 
+    /// What pin and tags act on: the marked conversations on screen, or else the selected one.
+    fn targets(&self) -> Vec<&Session> {
+        let marked = self.marked_shown();
+        if marked.is_empty() { self.selected().into_iter().collect() } else { marked }
+    }
+
+    /// Pins them all, unless they're all pinned already, which unpins them.
+    fn toggle_pin(&mut self) {
+        let targets = self.targets();
+        let pin = targets.iter().any(|s| !s.pinned);
+        let ids: Vec<String> = targets.iter().map(|s| s.id.clone()).collect();
+        if !ids.is_empty() {
+            self.change_labels(&ids, &Change::Pin(pin), crate::wording::pinned(pin, ids.len()));
+        }
+    }
+
+    fn change_labels(&mut self, ids: &[String], change: &Change, done: String) -> bool {
+        let Some(labeler) = self.labeler.as_mut() else { return false };
+        match labeler(ids, change) {
+            Ok(labels) => {
+                self.labels = labels;
+                self.labels.apply(&mut self.sessions);
+                self.status = Some(done);
+                self.rebuild();
+                true
+            }
+            Err(e) => {
+                self.status = Some(sanitize(&e));
+                false
+            }
+        }
+    }
+
+    fn start_tagging(&mut self) {
+        let targets = self.targets();
+        if targets.is_empty() {
+            return;
+        }
+        let common = labels::common(&targets);
+        let mut text = labels::shown(&common);
+        if !text.is_empty() {
+            text.push(' ');
+        }
+        let ids = targets.iter().map(|s| s.id.clone()).collect();
+        self.tagging = Some(Tagging { ids, common, text, problem: None });
+    }
+
+    fn on_tag_key(&mut self, key: KeyCode) {
+        let Some(tagging) = self.tagging.as_mut() else { return };
+        tagging.problem = None;
+        match key {
+            KeyCode::Char(c) if tagging.text.chars().count() < MAX_TAGS_TEXT => tagging.text.push(c),
+            KeyCode::Backspace => {
+                tagging.text.pop();
+            }
+            KeyCode::Enter => self.save_tags(),
+            KeyCode::Esc => {
+                self.tagging = None;
+                self.status = Some("Cancelled.".into());
+            }
+            _ => {}
+        }
+    }
+
+    /// Saves them, or keeps the line open to fix what can't be saved.
+    fn save_tags(&mut self) {
+        let Some(tagging) = self.tagging.as_mut() else { return };
+        let after = match labels::parse(&tagging.text) {
+            Ok(after) => after,
+            Err(e) => {
+                tagging.problem = Some(e);
+                return;
+            }
+        };
+        let Some(Tagging { ids, common, .. }) = self.tagging.take() else { return };
+        let done = crate::wording::tags_saved(&after, ids.len());
+        self.change_labels(&ids, &labels::edit(&common, &after), done);
+    }
+
     fn name_of(&self, id: &str) -> String {
         self.sessions.iter().find(|s| s.id == id).map_or_else(
             || id.to_string(),
@@ -944,9 +1082,7 @@ impl App {
     }
 
     fn start_delete(&mut self) {
-        let marked = self.marked_shown();
-        let targets: Vec<&Session> = if marked.is_empty() { self.selected().into_iter().collect() } else { marked };
-        let targets: Vec<Session> = targets.into_iter().cloned().collect();
+        let targets: Vec<Session> = self.targets().into_iter().cloned().collect();
         if targets.is_empty() {
             return;
         }
@@ -972,8 +1108,10 @@ impl App {
         });
     }
 
-    /// What deleting these would do, leaving out any just resumed.
+    /// What deleting these would do, leaving out any pinned or just resumed.
     fn plan_delete(&mut self, targets: Vec<&Session>) -> Plan {
+        let (pinned, targets): (Vec<&Session>, Vec<&Session>) = targets.into_iter().partition(|s| s.pinned);
+        let pinned: Vec<Skipped> = pinned.into_iter().map(|s| Skipped { id: s.id.clone(), reason: labels::PINNED.into() }).collect();
         let (targets, unsupported): (Vec<&Session>, Vec<&Session>) = targets.into_iter().partition(|s| s.source.features().delete);
         let unsupported: Vec<Skipped> = unsupported
             .into_iter()
@@ -987,6 +1125,7 @@ impl App {
         let ids: Vec<Session> = ids.into_iter().cloned().collect();
         let Some(planner) = self.planner.as_mut() else { return Plan::default() };
         let mut plan = if ids.is_empty() { Plan::default() } else { planner(&ids) };
+        plan.skipped.extend(pinned);
         plan.skipped.extend(starting);
         plan.skipped.extend(unsupported);
         plan
@@ -1367,7 +1506,7 @@ impl App {
     }
 
     pub fn is_searching(&self) -> bool {
-        self.matches.is_some()
+        self.matches.is_some() || !self.tag_filter.is_empty()
     }
 
     fn clear_search(&mut self) {
@@ -1476,6 +1615,8 @@ impl App {
             Action::ReverseSort => self.descending = !self.descending,
             Action::Search => self.typing = true,
             Action::ToggleFocus => self.toggle_focus(),
+            Action::Pin => self.toggle_pin(),
+            Action::Tags => self.start_tagging(),
             Action::Resume => self.resume_selected(),
             Action::Fork => self.fork_selected(),
             Action::Delete if self.view == View::Worktrees => self.start_remove(),
@@ -1534,6 +1675,11 @@ impl App {
                     rename.name.clear();
                 }
             }
+            KeyCode::Char('u') if self.tagging.is_some() => {
+                if let Some(tagging) = self.tagging.as_mut() {
+                    tagging.text.clear();
+                }
+            }
             KeyCode::Char('u') if self.typing => {
                 self.query.clear();
                 self.run_search();
@@ -1588,6 +1734,9 @@ impl App {
         if self.renaming.is_some() {
             return self.on_rename_key(key);
         }
+        if self.tagging.is_some() {
+            return self.on_tag_key(key);
+        }
         if self.view == View::Worktrees {
             return self.on_worktree_key(key);
         }
@@ -1606,6 +1755,8 @@ impl App {
             KeyCode::Char('d') | KeyCode::Delete => self.run(Action::Delete),
             KeyCode::Char('R') => self.run(Action::Rename),
             KeyCode::Char('F') => self.run(Action::ToggleFocus),
+            KeyCode::Char('p') => self.run(Action::Pin),
+            KeyCode::Char('T') => self.run(Action::Tags),
             KeyCode::Char('f') => self.run(Action::Fork),
             KeyCode::Char('y') => self.run(Action::CopyId),
             KeyCode::Char('Y') => self.run(Action::CopyCommand),
@@ -1646,6 +1797,7 @@ impl App {
             || self.confirm_remove.is_some()
             || self.confirm_jobs.is_some()
             || self.renaming.is_some()
+            || self.tagging.is_some()
             || self.report.is_some()
             || self.reopen.is_some();
         if waiting && !matches!(kind, MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
@@ -1736,7 +1888,7 @@ impl App {
             self.status = Some("Cancelled. Nothing was deleted.".into());
             return;
         }
-        if self.renaming.take().is_some() || self.reopen.take().is_some() {
+        if self.renaming.take().is_some() || self.tagging.take().is_some() || self.reopen.take().is_some() {
             self.status = Some("Cancelled.".into());
             return;
         }

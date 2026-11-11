@@ -9,6 +9,7 @@ const DETAILS_WAIT_MS = 60;
 const PAGE_ROWS = 10;
 const FORK_WAIT_MS = 15 * 60 * 1000;
 const MAX_NAME = 200;
+const MAX_TAGS_TEXT = 800;
 // Two clicks this close together are a double-click, so a second one isn't its own decision.
 const DOUBLE_CLICK_MS = 400;
 // Del both opens and confirms a delete, so a held key must not do both.
@@ -37,6 +38,8 @@ let selected = null;
 let selectedIndex = 0;
 let version = null;
 let focusState = { on: false, note: null };
+// Counts changes to the setting made here, so an answer asked for before one can't undo it.
+let focusChanges = 0;
 let listRequest = 0;
 let detailsRequest = 0;
 let detailsTimer = 0;
@@ -148,6 +151,7 @@ function address() {
 
 async function loadList() {
   const request = ++listRequest;
+  const changes = focusChanges;
   const data = await api(address());
   if (!data || request !== listRequest) return;
   version = data.version;
@@ -155,7 +159,7 @@ async function loadList() {
   tools = data.tools;
   rows = data.rows;
   drawSummary(data);
-  drawFocus(data.focus);
+  if (changes === focusChanges) drawFocus(data.focus);
   drawHead();
   drawRows();
   drawChips();
@@ -178,7 +182,10 @@ async function toggleFocus() {
     drawFocus(focusState);
     return;
   }
+  // Before and after, so an answer asked for while saving is dropped too.
+  focusChanges++;
   const reply = await post("/api/focus", { on: !focusState.on });
+  focusChanges++;
   if (!reply) {
     drawFocus(focusState);
     return;
@@ -285,8 +292,17 @@ function drawRow(row) {
     } else {
       td.textContent = row.cells[column.key];
     }
+    if (column.key === "name" && row.pinned) {
+      td.prepend(el("span", { className: "pin", textContent: "◆", title: "Pinned" }));
+    }
     if (column.key === "name" && row.tag) {
       td.append(el("span", { className: "tag", textContent: row.tag }));
+    }
+    if (column.key === "name") {
+      // Clicking one searches for it.
+      for (const tag of row.tags) {
+        td.append(el("button", { type: "button", className: "label", tabIndex: -1, textContent: "#" + tag, title: `Show only #${tag}` }));
+      }
     }
     tr.append(td);
   }
@@ -434,10 +450,13 @@ function drawDetails(data) {
   fact(facts, "Cost", data.cost);
   fact(facts, "Lines", data.lines);
   fact(facts, "PR", data.pr);
+  if (data.tags.length) fact(facts, "Tags", data.tags.map((tag) => "#" + tag).join(" "));
   const actions = el("div", { className: "actions" },
     actionButton("Resume", "Enter", () => resume(), data.can.resume, true),
     actionButton("Fork", "f", () => resume(true), data.can.fork),
     actionButton("Rename", "R", startRename, data.can.rename),
+    actionButton(data.pinned ? "Unpin" : "Pin", "p", togglePin),
+    actionButton("Tags", "T", startTags),
     deleteButton(data),
     actionButton("Copy ID", "y", () => copy(data.id)),
     actionButton("Copy command", "Y", () => copy(data.command)));
@@ -545,6 +564,61 @@ function startRename() {
     loadList();
   });
   input.select();
+}
+
+// The marked rows shown, or else the selected one, as pin and tags act on.
+function targets() {
+  const shown = markedShown();
+  if (shown.length) return shown;
+  return items().filter((row) => row.id === selected);
+}
+
+async function togglePin() {
+  const ids = targets().map((row) => row.id);
+  if (!ids.length) return;
+  const result = await post("/api/pin", { ids });
+  if (!result) return;
+  say(result.message, !result.ok);
+  loadList();
+  loadDetails();
+}
+
+function searchTag(tag) {
+  const words = view.q.split(/\s+/).filter(Boolean);
+  if (!words.includes("#" + tag)) words.push("#" + tag);
+  $("search").value = words.join(" ");
+  setQuery($("search").value);
+}
+
+// With several, the box starts with the tags they all share, and only those change.
+function startTags() {
+  const picked = targets();
+  if (!picked.length) return;
+  const ids = picked.map((row) => row.id);
+  const shared = picked[0].tags.filter((tag) => picked.every((row) => row.tags.includes(tag)));
+  const before = shared.map((tag) => "#" + tag).join(" ");
+  const input = el("input", { type: "text", maxLength: MAX_TAGS_TEXT, value: before ? before + " " : "", spellcheck: false, ariaLabel: "Tags" });
+  const hint = el("p", { className: "hint", textContent: ids.length === 1
+    ? "Spaces between tags. Leave it empty for none."
+    : "These are the tags they all have. Tags only some have stay." });
+  const problem = el("p", { className: "problem", hidden: true });
+  const title = ids.length === 1 ? "Tags for this conversation" : `Tags for ${ids.length} conversations`;
+  openDialog(title, [input, hint, problem], [cancelButton(), dialogButton("Save", null, true)], async () => {
+    const result = await post("/api/tags", { ids, before, tags: input.value });
+    if (!result) return;
+    if (!result.ok) {
+      problem.textContent = result.message;
+      problem.hidden = false;
+      input.focus();
+      return;
+    }
+    closeDialog();
+    say(result.message);
+    loadList();
+    loadDetails();
+  });
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
 }
 
 async function startReopen() {
@@ -1198,6 +1272,8 @@ const KEYS = {
   Enter: () => resume(),
   f: () => resume(true),
   R: startRename,
+  p: togglePin,
+  T: startTags,
   y: () => { if (current) copy(current.id); },
   Y: () => { if (current) copy(current.command); },
   O: startReopen,
@@ -1285,11 +1361,12 @@ $("rows").addEventListener("click", (event) => {
   const tr = event.target.closest("tr[data-id]");
   if (!tr) return;
   if (event.target.matches(".col-mark input")) toggleMark(tr.dataset.id);
+  else if (event.target.matches(".label")) searchTag(event.target.textContent.slice(1));
   else select(tr.dataset.id);
 });
 $("rows").addEventListener("dblclick", (event) => {
   const tr = event.target.closest("tr[data-id]");
-  if (tr && !event.target.matches(".col-mark input")) resume(false, false, tr.dataset.id);
+  if (tr && !event.target.matches(".col-mark input, .label")) resume(false, false, tr.dataset.id);
 });
 $("dialog-form").addEventListener("submit", (event) => {
   event.preventDefault();
@@ -1340,8 +1417,9 @@ async function poll() {
     reloadScreen();
     return;
   }
+  const changes = focusChanges;
   const data = await api("/api/version");
-  if (data) drawFocus(data.focus);
+  if (data && changes === focusChanges) drawFocus(data.focus);
   if (data && data.version !== version) loadList();
 }
 

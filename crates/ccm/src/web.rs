@@ -5,7 +5,7 @@ mod actions;
 mod cleanup;
 mod deletion;
 mod guard;
-mod list;
+pub(crate) mod list;
 mod worktrees;
 
 use std::collections::HashMap;
@@ -20,6 +20,7 @@ use ccm_core::config::Config;
 use ccm_core::forks;
 use ccm_core::index::Searcher;
 use ccm_core::jobs::{self, Leftover};
+use ccm_core::labels::{self, Labels};
 use ccm_core::model::{Session, Source};
 use ccm_core::paths::Paths;
 use ccm_core::removal;
@@ -102,6 +103,8 @@ pub(crate) struct State {
     worktrees: Mutex<Worktrees>,
     /// Job folders found on the last visit to the clean-up screen.
     leftovers: Mutex<Option<Vec<Leftover>>>,
+    /// The pins and tags last read, kept when the file can't be read.
+    labels: Mutex<Labels>,
 }
 
 // A panic in one request must not take the page down for the others.
@@ -134,18 +137,48 @@ fn forks_of(paths: &Paths, sessions: &[Session]) -> HashMap<String, String> {
 }
 
 impl State {
+    /// Puts the saved pins and tags on these, which the terminal app may have just changed. If
+    /// they can't be read, the last ones read stay, and the reason is given.
+    fn read_labels(&self, sessions: &mut [Session]) -> Option<String> {
+        let mut labels = lock(&self.labels);
+        let problem = match (self.effects.read_labels)() {
+            Ok(read) => {
+                *labels = read;
+                None
+            }
+            Err(e) => Some(e),
+        };
+        labels.apply(sessions);
+        problem
+    }
+
+    /// Takes pins and tags just saved.
+    pub(crate) fn relabel(&self, labels: Labels) {
+        let mut live = write(&self.live);
+        labels.apply(Arc::make_mut(&mut live.sessions).as_mut_slice());
+        *lock(&self.labels) = labels;
+        live.version += 1;
+    }
+
     fn apply(&self, update: crate::Update, paths: &Paths) {
+        let update = update.map(|sessions| {
+            let mut sessions = by_id(sessions);
+            let problem = self.read_labels(&mut sessions);
+            (sessions, problem)
+        });
         let mut live = write(&self.live);
         match update {
-            Ok(sessions) => {
-                let sessions = by_id(sessions);
+            Ok((sessions, problem)) => {
                 if live.loading || *live.sessions != sessions {
                     live.forks = Arc::new(forks_of(paths, &sessions));
                     live.sessions = Arc::new(sessions);
                     live.version += 1;
                 }
                 live.loading = false;
-                live.problem = None;
+                if live.problem != problem {
+                    live.version += 1;
+                }
+                live.problem = problem;
             }
             Err(e) => {
                 live.problem = Some(format!("Refresh failed: {e}"));
@@ -180,7 +213,9 @@ pub fn serve(paths: Paths, options: Options) -> Result<()> {
     let (guard, login) = Guard::new(port)?;
 
     let terminal = start.config.terminal.clone();
-    let sessions = by_id(start.cached);
+    let mut sessions = by_id(start.cached);
+    let labels = labels::load(&paths).unwrap_or_default();
+    labels.apply(&mut sessions);
     let state = Arc::new(State {
         live: RwLock::new(Live {
             forks: Arc::new(forks_of(&paths, &sessions)),
@@ -242,11 +277,20 @@ pub fn serve(paths: Paths, options: Options) -> Result<()> {
                 let paths = paths.clone();
                 move |dirs| jobs::remove(&paths, Path::new(crate::PROC), dirs, SystemTime::now())
             }),
+            read_labels: Box::new({
+                let paths = paths.clone();
+                move || labels::load(&paths)
+            }),
+            change_labels: Box::new({
+                let paths = paths.clone();
+                move |ids, change| labels::change(&paths, ids, change)
+            }),
         },
         starting: Mutex::default(),
         pending_delete: Mutex::default(),
         worktrees: Mutex::default(),
         leftovers: Mutex::default(),
+        labels: Mutex::new(labels),
     });
 
     let updates = crate::spawn_refresher(start.catalog);
@@ -387,6 +431,8 @@ fn handle(state: &Arc<State>, guard: &Guard, method: &str, url: &str, headers: &
                 "/api/rename" => Reply::json(&actions::rename(state, &body)),
                 "/api/reopen" => Reply::json(&actions::reopen(state, &body)),
                 "/api/focus" => Reply::json(&actions::set_focus(state, &body)),
+                "/api/pin" => Reply::json(&actions::pin(state, &body)),
+                "/api/tags" => Reply::json(&actions::tags(state, &body)),
                 "/api/delete/plan" => Reply::json(&deletion::plan(state, &body)),
                 "/api/delete/worktrees" => Reply::json(&deletion::toggle_worktrees(state, &body)),
                 "/api/delete/confirm" => Reply::json(&deletion::confirm(state, &body)),
@@ -432,7 +478,7 @@ fn list_reply(state: &Arc<State>, params: &HashMap<String, String>) -> Value {
     if query.grouping == crate::app::Grouping::Repo {
         state.look_up_repos(&sessions, params.contains_key("fresh"));
     }
-    let matches = lock(&state.searcher).search(&query.text);
+    let matches = lock(&state.searcher).search(&ccm_core::labels::split_query(&query.text).1);
     let (matches, search_error) = match matches {
         Ok(found) => (found, None),
         Err(e) => (None, Some(format!("Search failed: {e}"))),
@@ -465,6 +511,12 @@ fn details_reply(state: &State, id: &str) -> Option<Value> {
     Some(details)
 }
 
+/// Where a test keeps pins and tags.
+#[cfg(test)]
+pub(crate) fn test_paths(root: &Path) -> Paths {
+    Paths { claude: root.join("claude"), index: root.join("index.db"), config: root.join("config.toml"), claude_json: root.join("claude.json"), state: root.join("state") }
+}
+
 #[cfg(test)]
 impl State {
     fn for_tests(root: &Path, sessions: Vec<Session>) -> Arc<Self> {
@@ -495,11 +547,20 @@ impl State {
                 plan_remove: Box::new(|_, _| ccm_core::removal::Plan::default()),
                 leftovers: Box::new(Vec::new),
                 remove_jobs: Box::new(|_| ccm_core::jobs::Outcome::default()),
+                read_labels: Box::new({
+                    let paths = test_paths(root);
+                    move || labels::load(&paths)
+                }),
+                change_labels: Box::new({
+                    let paths = test_paths(root);
+                    move |ids, change| labels::change(&paths, ids, change)
+                }),
             },
             starting: Mutex::default(),
             pending_delete: Mutex::default(),
             worktrees: Mutex::default(),
             leftovers: Mutex::default(),
+            labels: Mutex::default(),
         })
     }
 }
@@ -629,6 +690,24 @@ mod tests {
         assert_eq!(read(&state.live).version, 1);
         state.apply(Ok(vec![session("a")]), &paths);
         assert_eq!(read(&state.live).version, 2);
+    }
+
+    #[test]
+    fn each_scan_takes_the_pins_and_tags_saved_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "11111111-2222-4333-8444-555555555555";
+        let state = State::for_tests(dir.path(), vec![list::tests::session(id)]);
+        let paths = test_paths(dir.path());
+        labels::change(&paths, &[id.to_string()], &labels::Change::Pin(true)).unwrap();
+        let before = read(&state.live).version;
+        state.apply(Ok(vec![list::tests::session(id)]), &paths);
+        assert!(read(&state.live).sessions[0].pinned);
+        assert_eq!(read(&state.live).version, before + 1, "the page is told to draw it");
+        std::fs::write(paths.state.join("labels.json"), "not json").unwrap();
+        state.apply(Ok(vec![list::tests::session(id)]), &paths);
+        let live = read(&state.live);
+        assert!(live.sessions[0].pinned, "the last ones read stay");
+        assert!(live.problem.as_deref().unwrap().contains("can't be read"));
     }
 
     #[test]

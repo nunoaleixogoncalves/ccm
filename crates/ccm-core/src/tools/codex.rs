@@ -126,6 +126,8 @@ impl Tool for Codex {
             crashed: false,
             window_size: None,
             folder_exists: true,
+            pinned: false,
+            tags: Vec::new(),
         };
         Some((session, doc))
     }

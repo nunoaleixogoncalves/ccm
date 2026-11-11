@@ -444,6 +444,8 @@ mod tests {
                 crashed: false,
                 window_size: None,
                 folder_exists: true,
+                pinned: false,
+                tags: Vec::new(),
             }
         }
     }

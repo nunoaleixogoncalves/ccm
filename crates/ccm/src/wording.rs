@@ -227,3 +227,23 @@ pub fn focus_saved(on: bool) -> &'static str {
 pub fn focus_not_saved(error: &str) -> String {
     format!("Couldn't save the setting: {}", ccm_core::format::sanitize(error))
 }
+
+/// What pinning or unpinning `count` conversations did.
+pub fn pinned(pin: bool, count: usize) -> String {
+    match (pin, count) {
+        (true, 1) => "Pinned. It stays at the top of the list.".into(),
+        (true, n) => format!("Pinned {n} conversations. They stay at the top of the list."),
+        (false, 1) => "Unpinned.".into(),
+        (false, n) => format!("Unpinned {n} conversations."),
+    }
+}
+
+/// What saving tags did. With several conversations, only the tags they all shared were edited.
+pub fn tags_saved(tags: &[String], count: usize) -> String {
+    match (tags.is_empty(), count) {
+        (true, 1) => "No tags now.".into(),
+        (false, 1) => format!("Tags saved: {}. Search for one with #.", ccm_core::labels::shown(tags)),
+        (true, n) => format!("Removed the shared tags from {n} conversations."),
+        (false, n) => format!("{n} conversations now share {}.", ccm_core::labels::shown(tags)),
+    }
+}
