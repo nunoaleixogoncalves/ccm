@@ -284,6 +284,20 @@ tr.group td {
 tr.group .count { margin-left: 10px; color: var(--muted); font-weight: 400; }
 
 .tag { margin-left: 8px; color: var(--muted); font-size: 12px; }
+.pin { margin-right: 6px; color: var(--accent); }
+.label {
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--muted);
+  font: 12px/1.4 var(--sans);
+  cursor: pointer;
+}
+.label:hover { color: var(--accent); border-color: var(--accent); }
+dialog .hint { color: var(--muted); font-size: 13px; }
+dialog .problem { color: var(--crashed); }
 
 /* Keeps the end of a long path, which is the telling part. */
 .col-folder { direction: rtl; text-align: left; font-family: var(--mono); font-size: 12px; }

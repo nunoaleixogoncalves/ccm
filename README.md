@@ -20,6 +20,7 @@ If you run a lot of Claude Code or Codex sessions, they pile up:
 
 - **Browse:** see every conversation's folder, age, context used, messages, size, model, branch and status.
 - **Search:** find a conversation by anything said in it.
+- **Pin and tag:** keep conversations at the top of the list, and tag them to find them again with `#tag`. See [Pins and tags](#pins-and-tags).
 - **Preview:** read the latest messages and scroll back, without opening the conversation.
 - **Resume:** open it in a new terminal, in the folder it ran in. Inside `herdr-app`, it opens in that folder's workspace.
 - **Fork:** start a new conversation as a copy of one, to try another direction while the original stays as it was.
@@ -131,6 +132,8 @@ Actions:
 | `m`, while confirming a delete | Choose whether to delete memory notes too. It only appears when there are notes to delete |
 | `w`, while confirming a delete | Choose whether to remove the worktrees only those conversations used. It only appears when there's one to remove. See [Removing a worktree with its conversation](#removing-a-worktree-with-its-conversation) |
 | `Shift+R` | Rename |
+| `p` | Pin or unpin the selected or marked conversations. See [Pins and tags](#pins-and-tags) |
+| `Shift+T` | Change the tags of the selected or marked conversations |
 | Space | Mark or unmark, then move to the next row |
 | `a` | Mark everything shown, or clear those marks |
 | `y` | Copy the conversation's ID |
@@ -144,7 +147,7 @@ View:
 
 | Key | What it does |
 |---|---|
-| `/` | Search. Enter keeps the results, Esc clears them |
+| `/` | Search. Enter keeps the results, Esc clears them. `#work` shows only conversations tagged work |
 | `o` | Show only open conversations |
 | `x` | Show only crashed conversations |
 | `Shift+J` | Show only junk, meaning conversations Claude never replied to |
@@ -170,13 +173,25 @@ Press `Shift+C` to see what could be cleaned up. Each line says how many items i
 - worktrees no conversation worked in that have nothing to lose: no uncommitted changes, no unpushed commits and a branch, or a folder that's already gone. Locked ones, and ones a running session is in, aren't suggested
 - background job folders in `~/.claude/jobs` whose conversation is gone, that haven't changed for a day and aren't running
 
-Open conversations are never suggested, and `ccm` never brings this screen up by itself.
+Open and pinned conversations are never suggested, and `ccm` never brings this screen up by itself.
 
 - `d` or Del deletes everything on the selected line. To delete several lines at once, mark them with Space (`a` marks every line with something in it) and press `d`. One confirmation lists each line and everything that would go, and a conversation found on two lines is deleted once. Each one is checked again just before it goes, as with any delete. Worktrees are removed with `git worktree remove` and their branches are kept. One that has gained unpushed commits since is skipped, so remove it from the worktree view.
 - Enter or a double-click opens a line to look through it or delete only some. A conversation line opens the list showing just those conversations, and `c` clears it like any filter. The worktree line opens the worktree view showing just those worktrees, and `c` shows all of them again. The job line lists the folders.
 - A job that may have a worktree is never deleted by `ccm`, because `claude rm` is what removes its worktree safely. Open the job line with Enter and press `c` to copy the `claude rm` commands.
 
 Change what counts as large or old with `large_threshold_mb` and `old_after_days` in the [configuration](#configuration).
+
+## Pins and tags
+
+Press `p` to pin a conversation. Pinned ones show a ◆ and stay at the top of the list, whatever the sort, and at the top of their group when grouped. Filters and searches still hide them. Press `p` again to unpin it.
+
+A pinned conversation can't be deleted, so unpin it first. When several are marked, the pinned ones are left out of the delete and the confirmation says so. The clean-up screen never suggests them.
+
+Press `Shift+T` to type a conversation's tags, separated by spaces or commas. A tag can hold letters, digits and `- _ . /`, is kept in lowercase, and can be up to 32 characters, with up to 20 tags on a conversation. Tags show after the name. To see only the conversations with a tag, search for `#tag`. Several tags must all be there, and the rest of the search works as usual, so `#work login` finds conversations tagged work that mention login. In `ccm web`, clicking a tag on a row searches for it.
+
+With several conversations marked, `p` pins them all, or unpins them if they're all pinned already. `Shift+T` starts with the tags they all have: tags you add go on all of them, tags you remove come off all of them, and tags only some of them have stay.
+
+Pins and tags are `ccm`'s own, so they don't show in Claude Code or Codex. They're kept in `~/.local/state/ccm/labels.json`, which the terminal app and `ccm web` both read, so a change in one shows in the other. Deleting a conversation with `ccm` drops its pin and tags.
 
 ## Focus
 
@@ -263,7 +278,7 @@ Codex conversations can be resumed, forked and deleted, through Codex's own comm
 
 `ccm web` shows the same list in a browser: search, filters, sorting, grouping and the preview, with the same keys. It updates by itself, and can run alongside the terminal app.
 
-Resume and fork open a terminal on this computer, the same way the terminal app does. If that fails, the page gives you the command to copy. Rename, copying the ID or command, reopening after a crash and deleting work as they do in the terminal, under the same rules. The delete popup lists what goes and offers the same worktrees, and the wait for unpushed commits is enforced by `ccm` itself, not the page.
+Resume and fork open a terminal on this computer, the same way the terminal app does. If that fails, the page gives you the command to copy. Rename, pins and tags, copying the ID or command, reopening after a crash and deleting work as they do in the terminal, under the same rules. The delete popup lists what goes and offers the same worktrees, and the wait for unpushed commits is enforced by `ccm` itself, not the page.
 
 The worktree view (`w`) and the clean-up screen (`Shift+C`) are there too, with the same checks and the same keys. So is [Focus new conversation](#focus), as a checkbox.
 
@@ -331,6 +346,7 @@ It writes these files of its own:
 | `~/.config/ccm/config.toml` | Your configuration, if you create one. `ccm` only reads it |
 | `~/.local/state/ccm/sessions.jsonl` | When sessions start and end, as IDs and times only |
 | `~/.local/state/ccm/forks.jsonl` | Which conversations are forks `ccm` started, and of which, as IDs and times only |
+| `~/.local/state/ccm/labels.json` | Your [pins and tags](#pins-and-tags), by conversation ID. It's owner-only. `labels.lock` beside it is an empty file that lets the terminal app and `ccm web` change it at the same time |
 | `~/.local/state/ccm/launch.log` | Error messages from the last terminal `ccm` started, so a failure to start can say why. Emptied each time |
 | `~/.local/state/ccm/windows/` | Each session's context window size |
 | `~/.local/state/ccm/backups/` | Your original settings files, from before `ccm setup` changed them |
@@ -342,7 +358,7 @@ It writes these files of its own:
 
 ### What a delete removes
 
-**A delete can't be undone.** `ccm` refuses to delete a conversation that's open, running as a background job, or written to in the last minute. It also stops if it can't tell, such as when a running session's registry file can't be read.
+**A delete can't be undone.** `ccm` refuses to delete a conversation that's pinned, open, running as a background job, or written to in the last minute. It also stops if it can't tell, such as when a running session's registry file can't be read.
 
 | | |
 |---|---|

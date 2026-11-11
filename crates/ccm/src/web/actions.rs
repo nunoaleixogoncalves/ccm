@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use ccm_core::delete;
 use ccm_core::jobs::{self, Leftover};
+use ccm_core::labels::{self, Change, Labels};
 use ccm_core::format::{sanitize, short_path};
 use ccm_core::model::{Session, Source};
 use ccm_core::removal::{self, Target};
@@ -34,6 +35,8 @@ type ScanFn = Box<dyn Fn(&[String], bool) -> crate::ScanResult + Send + Sync>;
 type PlanRemoveFn = Box<dyn Fn(&[Target], &[Session]) -> removal::Plan + Send + Sync>;
 type LeftoversFn = Box<dyn Fn() -> Vec<Leftover> + Send + Sync>;
 type RemoveJobsFn = Box<dyn Fn(&[PathBuf]) -> jobs::Outcome + Send + Sync>;
+type ReadLabelsFn = Box<dyn Fn() -> Result<Labels, String> + Send + Sync>;
+type LabelFn = Box<dyn Fn(&[String], &Change) -> Result<Labels, String> + Send + Sync>;
 
 /// What actually touches the system. Tests swap these.
 pub struct Effects {
@@ -52,6 +55,9 @@ pub struct Effects {
     pub plan_remove: PlanRemoveFn,
     pub leftovers: LeftoversFn,
     pub remove_jobs: RemoveJobsFn,
+    pub read_labels: ReadLabelsFn,
+    /// Changes the pins or tags of these conversations, and returns them all as saved.
+    pub change_labels: LabelFn,
 }
 
 /// Conversations just started, as they don't show as open at once.
@@ -187,6 +193,48 @@ pub fn rename(state: &State, body: &Value) -> Value {
         }
         Err(e) => refused(&e),
     }
+}
+
+/// The conversations of these IDs that are still there, in the order asked for.
+fn found(state: &State, ids: &[String]) -> Vec<Session> {
+    let sessions = Arc::clone(&read(&state.live).sessions);
+    ids.iter().filter_map(|id| sessions.iter().find(|s| &s.id == id).cloned()).collect()
+}
+
+fn change_labels(state: &State, ids: &[String], change: &Change, message: &str) -> Value {
+    match (state.effects.change_labels)(ids, change) {
+        Ok(labels) => {
+            state.relabel(labels);
+            done(message)
+        }
+        Err(e) => refused(&e),
+    }
+}
+
+/// Pins them all, unless they're all pinned already, which unpins them.
+pub fn pin(state: &State, body: &Value) -> Value {
+    let targets = found(state, &ids(&body["ids"]));
+    if targets.is_empty() {
+        return refused("That conversation is gone.");
+    }
+    let pin = targets.iter().any(|s| !s.pinned);
+    let ids: Vec<String> = targets.iter().map(|s| s.id.clone()).collect();
+    change_labels(state, &ids, &Change::Pin(pin), &crate::wording::pinned(pin, ids.len()))
+}
+
+/// Saves typed tags. `before` holds the tags the page showed, which they all shared: only those
+/// can be removed, so a tag added elsewhere meanwhile stays.
+pub fn tags(state: &State, body: &Value) -> Value {
+    let targets = found(state, &ids(&body["ids"]));
+    if targets.is_empty() {
+        return refused("That conversation is gone.");
+    }
+    let (before, after) = match (labels::parse(body["before"].as_str().unwrap_or_default()), labels::parse(body["tags"].as_str().unwrap_or_default())) {
+        (Ok(before), Ok(after)) => (before, after),
+        (Err(e), _) | (_, Err(e)) => return refused(&e),
+    };
+    let ids: Vec<String> = targets.iter().map(|s| s.id.clone()).collect();
+    change_labels(state, &ids, &labels::edit(&before, &after), &crate::wording::tags_saved(&after, ids.len()))
 }
 
 /// "Focus new conversation" as the page shows it. `note` says why it can't work here.
@@ -448,6 +496,40 @@ mod tests {
         resume(&state, &json!({ "id": B }));
         assert!(rename(&state, &json!({ "id": B, "name": "x" }))["message"].as_str().unwrap().contains("/rename"));
         assert!(calls.lock().unwrap().iter().all(|c| !c.starts_with("rename")));
+    }
+
+    #[test]
+    fn pin_pins_them_all_unless_all_are_pinned_and_shows_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = state(dir.path(), vec![session(A), session(B)], fine());
+        let before = read(&state.live).version;
+        let out = pin(&state, &json!({ "ids": [B] }));
+        assert_eq!(out, json!({ "ok": true, "message": "Pinned. It stays at the top of the list." }));
+        assert!(read(&state.live).sessions.iter().any(|s| s.id == B && s.pinned));
+        assert_eq!(read(&state.live).version, before + 1);
+        assert_eq!(pin(&state, &json!({ "ids": [A, B] }))["message"], "Pinned 2 conversations. They stay at the top of the list.");
+        assert_eq!(pin(&state, &json!({ "ids": [A, B] }))["message"], "Unpinned 2 conversations.");
+        assert!(ccm_core::labels::load(&crate::web::test_paths(dir.path())).unwrap().pinned.is_empty(), "saved in the file");
+        assert_eq!(pin(&state, &json!({ "ids": ["gone"] }))["ok"], false);
+    }
+
+    #[test]
+    fn tags_change_only_what_the_page_showed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, _) = state(dir.path(), vec![session(A), session(B)], fine());
+        let out = tags(&state, &json!({ "ids": [A], "before": "", "tags": "#Work bug" }));
+        assert_eq!(out["message"], "Tags saved: #work #bug. Search for one with #.");
+        // Added elsewhere after the page drew its tags, so it isn't the page's to remove.
+        state.relabel((state.effects.change_labels)(&[A.to_string()], &Change::Tags { add: vec!["meanwhile".into()], remove: vec![] }).unwrap());
+        tags(&state, &json!({ "ids": [A, B], "before": "#work", "tags": "#shared" }));
+        let live = read(&state.live);
+        let of = |id: &str| live.sessions.iter().find(|s| s.id == id).unwrap().tags.clone();
+        assert_eq!(of(A), ["bug", "meanwhile", "shared"]);
+        assert_eq!(of(B), ["shared"]);
+        drop(live);
+        let out = tags(&state, &json!({ "ids": [A], "before": "", "tags": "no!" }));
+        assert_eq!(out["ok"], false);
+        assert!(out["message"].as_str().unwrap().contains("can't be a tag"));
     }
 
     #[test]

@@ -60,12 +60,14 @@ fn tone(t: Tone) -> &'static str {
 /// What deleting these would do, leaving out any just resumed.
 pub(super) fn plan_for(state: &State, sessions: &[Session], ids: &[String]) -> Plan {
     let picked = |s: &&Session| ids.contains(&s.id);
-    let (targets, unsupported): (Vec<&Session>, Vec<&Session>) = sessions.iter().filter(picked).partition(|s| s.source.features().delete);
+    let (pinned, targets): (Vec<&Session>, Vec<&Session>) = sessions.iter().filter(picked).partition(|s| s.pinned);
+    let (targets, unsupported): (Vec<&Session>, Vec<&Session>) = targets.into_iter().partition(|s| s.source.features().delete);
     let starting_now = lock(&state.starting);
     let (starting, targets): (Vec<&Session>, Vec<&Session>) = targets.into_iter().partition(|s| starting_now.recent(&s.id));
     drop(starting_now);
     let targets: Vec<Session> = targets.into_iter().cloned().collect();
     let mut plan = if targets.is_empty() { Plan::default() } else { (state.effects.plan_delete)(&targets) };
+    plan.skipped.extend(pinned.into_iter().map(|s| Skipped { id: s.id.clone(), reason: ccm_core::labels::PINNED.into() }));
     plan.skipped.extend(starting.into_iter().map(|s| Skipped { id: s.id.clone(), reason: "it was just resumed".into() }));
     plan.skipped.extend(unsupported.into_iter().map(|s| Skipped { id: s.id.clone(), reason: format!("ccm can't delete {} conversations yet", s.source.label()) }));
     plan
@@ -316,6 +318,19 @@ mod tests {
         let out = plan(state, &json!({ "ids": ids }));
         let id = out["plan_id"].as_str().unwrap_or_default().to_string();
         (out, id)
+    }
+
+    #[test]
+    fn a_pinned_conversation_is_never_planned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pinned = session(A);
+        pinned.pinned = true;
+        let (state, _) = state(dir.path(), vec![pinned, session(B)], offered(0));
+        let (out, _) = planned(&state, &[A]);
+        assert_eq!(out, json!({ "ok": false, "message": "Can't delete: it's pinned, so unpin it first." }));
+        let (out, _) = planned(&state, &[A, B]);
+        let names: Vec<&str> = out["conversations"].as_array().unwrap().iter().map(|c| c["short"].as_str().unwrap()).collect();
+        assert_eq!(names, ["21111111"], "only the one not pinned");
     }
 
     #[test]

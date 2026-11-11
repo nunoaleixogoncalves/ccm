@@ -1,5 +1,6 @@
 use ccm_core::delete::Item;
 use ccm_core::format::{ago, bytes, sanitize, short_path};
+use ccm_core::labels;
 use ccm_core::model::{Session, Source};
 use ccm_core::preview::{Preview, Role};
 use ccm_core::removal;
@@ -20,6 +21,8 @@ mod worktrees;
 
 const COLUMN_SPACING: u16 = 1;
 const MIN_NAME_WIDTH: usize = 10;
+/// Before a pinned conversation's name.
+const PIN: &str = "◆ ";
 /// The footer sets its own background, so its text sets fixed colours too. Colours from the
 /// terminal's theme could be unreadable on it.
 const BAR: Color = Color::Indexed(236);
@@ -480,14 +483,25 @@ fn column_text(app: &App, s: &Session, key: SortKey, width: usize, now_ms: i64) 
     }
 }
 
-/// The name, followed in repository groups by the branch and the worktree, which tell apart the
-/// work in one repository. The name is shortened first, so the tag stays visible.
+/// The name after a pin mark, followed in repository groups by the branch and the worktree,
+/// which tell apart the work in one repository, and then by its tags. The name is shortened
+/// first, so the rest stays visible.
 fn name_text(app: &App, s: &Session, width: usize) -> String {
-    let tag = if app.grouping == Grouping::Repo { repo_tag(s, &app.repos.places) } else { None };
-    let Some(tag) = tag else { return fit_end(&s.display_name(), width) };
-    let tag = fit_end(&format!(" [{tag}]"), width / 2);
-    let name = fit_end(&s.display_name(), width.saturating_sub(tag.width()));
-    format!("{name}{tag}")
+    let pin = if s.pinned { PIN } else { "" };
+    let width = width.saturating_sub(pin.width());
+    let mut extra = String::new();
+    if let Some(tag) = (app.grouping == Grouping::Repo).then(|| repo_tag(s, &app.repos.places)).flatten() {
+        extra.push_str(&format!(" [{tag}]"));
+    }
+    if !s.tags.is_empty() {
+        extra.push_str(&format!(" {}", labels::shown(&s.tags)));
+    }
+    if extra.is_empty() {
+        return format!("{pin}{}", fit_end(&s.display_name(), width));
+    }
+    let extra = fit_end(&extra, width / 2);
+    let name = fit_end(&s.display_name(), width.saturating_sub(extra.width()));
+    format!("{pin}{name}{extra}")
 }
 
 /// Shortens text keeping its start.
@@ -539,6 +553,12 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         Line::from(format!("PR      {}", s.pr_url.as_deref().unwrap_or("-"))),
     ];
     let mut notes = Vec::new();
+    if s.pinned {
+        notes.push("Pinned".to_string());
+    }
+    if !s.tags.is_empty() {
+        notes.push(format!("Tags {}", labels::shown(&s.tags)));
+    }
     if let Some(next) = &s.continued_in {
         notes.push(format!("Continued in {}", sanitize(next)));
     }
@@ -814,6 +834,21 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(Paragraph::new(vec![name, hint]).style(bar), area);
         return;
     }
+    if let Some(tagging) = &app.tagging {
+        app.hit.buttons.clear();
+        let label = if tagging.ids.len() == 1 { " Tags: ".to_string() } else { format!(" Tags for {}: ", tagging.ids.len()) };
+        let text = format!("{label}{}", tagging.text);
+        let x = area.x + (text.width() as u16).min(area.width.saturating_sub(1));
+        f.set_cursor_position((x, area.y));
+        let typed = Line::from(Span::styled(text, Style::new().fg(BAR_KEY).add_modifier(Modifier::BOLD)));
+        let hint = match &tagging.problem {
+            Some(problem) => Line::from(Span::styled(format!(" {problem}"), Style::new().fg(BAR_NOTICE))),
+            None if tagging.ids.len() == 1 => Line::from(" Spaces between tags   Enter save   Esc cancel   Ctrl-U clear"),
+            None => Line::from(" Tags they all have. Others stay.   Enter save   Esc cancel   Ctrl-U clear"),
+        };
+        f.render_widget(Paragraph::new(vec![typed, hint]).style(bar), area);
+        return;
+    }
     if let Some(status) = &app.status {
         f.render_widget(Paragraph::new(status.clone()).style(bar.fg(BAR_NOTICE)), area);
         app.hit.buttons.clear();
@@ -921,6 +956,8 @@ mod tests {
             crashed: false,
             window_size: None,
             folder_exists: true,
+            pinned: false,
+            tags: Vec::new(),
         }
     }
 
@@ -2310,6 +2347,171 @@ mod tests {
         assert!(!a.quit && a.confirm_delete.is_none());
         a.on_key(KeyCode::Esc);
         assert!(a.renaming.is_none() && !a.quit && calls.borrow().is_empty());
+    }
+
+    type Saved = Rc<RefCell<ccm_core::labels::Labels>>;
+
+    /// Pins and tags kept in memory, read again on each refresh as the real file is.
+    fn labelled(a: &mut App) -> Saved {
+        let saved: Saved = Rc::default();
+        let (read, write) = (saved.clone(), saved.clone());
+        a.read_labels = Some(Box::new(move || Ok(read.borrow().clone())));
+        a.labeler = Some(Box::new(move |ids, change| {
+            write.borrow_mut().change(ids, change)?;
+            Ok(write.borrow().clone())
+        }));
+        let sessions = a.sessions.clone();
+        a.set_sessions(sessions);
+        saved
+    }
+
+    fn press(a: &mut App, text: &str) {
+        for c in text.chars() {
+            a.on_key(KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn p_pins_to_the_top_and_p_again_unpins() {
+        let mut a = app();
+        let saved = labelled(&mut a);
+        let screen = render(&mut a, 160, 30);
+        assert!(row_of(&screen, "Open one") < row_of(&screen, "Old model"), "{screen}");
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Char('p'));
+        assert!(saved.borrow().pinned.contains("id-old"));
+        let screen = render(&mut a, 160, 30);
+        assert!(screen.contains("Pinned. It stays at the top of the list."), "{screen}");
+        assert!(screen.contains("◆ Old model") && row_of(&screen, "◆ Old model") < row_of(&screen, "Open one"), "{screen}");
+        assert_eq!(a.selected().unwrap().id, "id-old", "the selection follows it to the top");
+        a.on_key(KeyCode::Char('r'));
+        let screen = render(&mut a, 160, 30);
+        assert!(row_of(&screen, "◆ Old model") < row_of(&screen, "Open one"), "reversing keeps it on top:\n{screen}");
+        a.on_key(KeyCode::Char('p'));
+        assert!(saved.borrow().pinned.is_empty());
+        assert!(!render(&mut a, 160, 30).contains('◆'));
+    }
+
+    #[test]
+    fn p_with_marks_pins_them_all_unless_all_are_pinned() {
+        let mut a = app();
+        let saved = labelled(&mut a);
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Char('p'));
+        a.on_key(KeyCode::Char('a'));
+        a.on_key(KeyCode::Char('p'));
+        assert_eq!(saved.borrow().pinned.len(), 3);
+        assert_eq!(a.status.as_deref(), Some("Pinned 3 conversations. They stay at the top of the list."));
+        a.on_key(KeyCode::Char('p'));
+        assert!(saved.borrow().pinned.is_empty());
+        assert_eq!(a.status.as_deref(), Some("Unpinned 3 conversations."));
+    }
+
+    #[test]
+    fn a_pinned_conversation_is_not_deleted() {
+        let mut a = app();
+        labelled(&mut a);
+        let _ = deletable(&mut a, &[]);
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Char('p'));
+        a.on_key(KeyCode::Char('d'));
+        assert!(a.confirm_delete.is_none());
+        assert_eq!(a.status.as_deref(), Some("Can't delete: it's pinned, so unpin it first."));
+        a.on_key(KeyCode::Char('a'));
+        a.on_key(KeyCode::Char('d'));
+        let plan = &a.confirm_delete.as_ref().unwrap().plan;
+        let planned: Vec<&str> = plan.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(planned, ["id-junk"], "the open one and the pinned one stay");
+        assert!(plan.skipped.iter().any(|s| s.id == "id-old" && s.reason.contains("pinned")));
+    }
+
+    #[test]
+    fn shift_t_tags_and_a_hash_search_finds_them() {
+        let mut a = app();
+        let saved = labelled(&mut a);
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Char('T'));
+        assert!(render(&mut a, 120, 30).contains("Tags:"));
+        press(&mut a, "Work, bug-12");
+        a.on_key(KeyCode::Enter);
+        assert_eq!(saved.borrow().tags["id-old"], ["work", "bug-12"]);
+        let screen = render(&mut a, 160, 30);
+        assert!(screen.contains("Tags saved: #work #bug-12. Search for one with #."), "{screen}");
+        assert!(screen.lines().any(|l| l.contains("Old model #work #bug-12")), "{screen}");
+        assert!(screen.contains("Tags #work #bug-12"), "the details say so too:\n{screen}");
+        a.on_key(KeyCode::Char('/'));
+        press(&mut a, "#work");
+        let screen = render(&mut a, 160, 30);
+        assert!(screen.contains("showing 1") && screen.contains("Old model") && !screen.contains("Junk one"), "{screen}");
+        press(&mut a, " #nope");
+        assert!(render(&mut a, 160, 30).contains("No conversations match"));
+        a.on_key(KeyCode::Esc);
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Char('T'));
+        assert_eq!(a.tagging.as_ref().unwrap().text, "#work #bug-12 ", "the line starts with its tags");
+        a.on_ctrl(KeyCode::Char('u'));
+        a.on_key(KeyCode::Enter);
+        assert!(saved.borrow().tags.is_empty());
+        assert_eq!(a.status.as_deref(), Some("No tags now."));
+    }
+
+    #[test]
+    fn a_tag_that_cant_be_saved_keeps_the_line_open() {
+        let mut a = app();
+        let saved = labelled(&mut a);
+        a.on_key(KeyCode::Char('T'));
+        press(&mut a, "fine no!");
+        a.on_key(KeyCode::Enter);
+        let screen = render(&mut a, 120, 30);
+        assert!(screen.contains("no! can't be a tag"), "{screen}");
+        assert!(a.tagging.is_some() && saved.borrow().tags.is_empty());
+        a.on_key(KeyCode::Backspace);
+        assert!(a.tagging.as_ref().unwrap().problem.is_none(), "the reason goes with the next key");
+        a.on_key(KeyCode::Esc);
+        assert!(a.tagging.is_none() && !a.quit);
+        assert_eq!(a.status.as_deref(), Some("Cancelled."));
+    }
+
+    #[test]
+    fn tagging_several_changes_only_the_tags_they_share() {
+        let mut a = app();
+        let saved = labelled(&mut a);
+        saved.borrow_mut().change(&["id-old".into()], &ccm_core::labels::Change::Tags { add: vec!["shared".into(), "own".into()], remove: vec![] }).unwrap();
+        saved.borrow_mut().change(&["id-junk".into()], &ccm_core::labels::Change::Tags { add: vec!["shared".into()], remove: vec![] }).unwrap();
+        let sessions = a.sessions.clone();
+        a.set_sessions(sessions);
+        select_named(&mut a, "Old model");
+        a.on_key(KeyCode::Char(' '));
+        select_named(&mut a, "Junk one");
+        a.on_key(KeyCode::Char(' '));
+        a.on_key(KeyCode::Char('T'));
+        assert_eq!(a.tagging.as_ref().unwrap().text, "#shared ");
+        assert!(render(&mut a, 160, 30).contains("Tags for 2: #shared"));
+        a.on_ctrl(KeyCode::Char('u'));
+        press(&mut a, "new");
+        a.on_key(KeyCode::Enter);
+        assert_eq!(saved.borrow().tags["id-old"], ["own", "new"]);
+        assert_eq!(saved.borrow().tags["id-junk"], ["new"]);
+        assert_eq!(a.status.as_deref(), Some("2 conversations now share #new."));
+    }
+
+    #[test]
+    fn pins_and_tags_changed_elsewhere_show_on_the_next_refresh() {
+        let mut a = app();
+        let saved = labelled(&mut a);
+        saved.borrow_mut().change(&["id-junk".into()], &ccm_core::labels::Change::Pin(true)).unwrap();
+        let sessions = a.sessions.clone();
+        a.set_sessions(sessions);
+        assert!(render(&mut a, 160, 30).contains("◆ Junk one"));
+        a.read_labels = Some(Box::new(|| Err("Pins and tags can't be read from labels.json: bad".into())));
+        let sessions = a.sessions.clone();
+        a.set_sessions(sessions);
+        let screen = render(&mut a, 160, 30);
+        assert!(screen.contains("◆ Junk one") && screen.contains("can't be read"), "the last ones read stay:\n{screen}");
+        a.on_key(KeyCode::Down);
+        let sessions = a.sessions.clone();
+        a.set_sessions(sessions);
+        assert!(a.status.is_none(), "the same problem is said once");
     }
 
     #[test]

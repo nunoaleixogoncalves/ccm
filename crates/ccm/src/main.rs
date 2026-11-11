@@ -23,6 +23,7 @@ use ccm_core::config::Config;
 use ccm_core::delete::{self, Failure, Outcome, Plan, Skipped};
 use ccm_core::index::{Index, Searcher};
 use ccm_core::jobs;
+use ccm_core::labels;
 use ccm_core::model::Session;
 use ccm_core::paths::Paths;
 use ccm_core::recovery;
@@ -175,6 +176,10 @@ fn browse(paths: Paths) -> Result<()> {
     let focus_path = paths.config.clone();
     app.save_focus = Some(Box::new(move |on| Config::save_focus(&focus_path, on)));
     app.forks = forks::load(&paths);
+    let labels_paths = paths.clone();
+    app.read_labels = Some(Box::new(move || labels::load(&labels_paths)));
+    let label_paths = paths.clone();
+    app.labeler = Some(Box::new(move |ids, change| labels::change(&label_paths, ids, change)));
     app.search = Some(Box::new(move |q| searcher.search(q).map_err(|e| e.to_string())));
     let plan_paths = paths.clone();
     app.planner = Some(Box::new(move |sessions| plan_delete(&plan_paths, sessions)));
@@ -241,11 +246,17 @@ fn dismisser(paths: &Paths) -> impl Fn(&[String]) -> Result<(), String> + Send +
     move |ids| recovery::dismiss(&paths, ids, now_ms()).map_err(|e| e.to_string())
 }
 
-/// Each tool's conversations are planned by that tool's code.
+/// Each tool's conversations are planned by that tool's code. Pinned ones are left out, checked
+/// in the saved file, as the other front end may have just pinned one.
 fn plan_delete(paths: &Paths, sessions: &[Session]) -> Plan {
-    let (codex, claude): (Vec<&Session>, Vec<&Session>) = sessions.iter().partition(|s| s.source == Source::Codex);
+    let pinned = labels::load(paths).map(|l| l.pinned);
+    let (refused, sessions): (Vec<&Session>, Vec<&Session>) = sessions.iter().partition(|s| pinned.as_ref().map_or(true, |p| p.contains(&s.id)));
+    let reason = if pinned.is_ok() { labels::PINNED } else { "pins can't be read, so it may be pinned" };
+    let refused = refused.into_iter().map(|s| Skipped { id: s.id.clone(), reason: reason.into() });
+    let (codex, claude): (Vec<&Session>, Vec<&Session>) = sessions.into_iter().partition(|s| s.source == Source::Codex);
     let ids: Vec<String> = claude.iter().map(|s| s.id.clone()).collect();
     let mut plan = if ids.is_empty() { Plan::default() } else { delete::plan(paths, Path::new(PROC), &ids) };
+    plan.skipped.extend(refused);
     if !codex.is_empty() {
         let program = codex_program();
         let more = codex::plan_delete(&codex, program.as_deref());
@@ -260,8 +271,13 @@ fn codex_program() -> Option<PathBuf> {
     resume::find_program("codex", &std::env::var("PATH").unwrap_or_default())
 }
 
-/// Also removes them from the search index, whose copy of their words would otherwise linger.
+/// Also removes them from the search index, whose copy of their words would otherwise linger,
+/// and forgets their pins and tags. Nothing goes if one was pinned since the plan was made.
 fn delete_conversations(paths: &Paths, codex_home: &Path, plan: &Plan, notes: bool) -> Result<Outcome, String> {
+    let pinned = labels::load(paths)?.pinned;
+    if plan.items.iter().any(|i| pinned.contains(&i.id)) {
+        return Err("One of them was pinned meanwhile, so nothing was deleted.".into());
+    }
     let codex: Vec<&delete::Item> = plan.items.iter().filter(|i| i.source == Source::Codex).collect();
     let mut outcome = if codex.len() == plan.items.len() { Outcome::default() } else { delete::execute(paths, Path::new(PROC), plan, notes)? };
     if !codex.is_empty() {
@@ -280,6 +296,9 @@ fn delete_conversations(paths: &Paths, codex_home: &Path, plan: &Plan, notes: bo
         let forgotten = Index::open(&paths.index).and_then(|mut index| index.forget(&outcome.deleted));
         if let Err(e) = forgotten {
             outcome.failures.push(Failure { path: PathBuf::from(&paths.index), error: format!("search entries stay until the next scan: {e}") });
+        }
+        if let Err(e) = labels::change(paths, &outcome.deleted, &labels::Change::Forget) {
+            outcome.failures.push(Failure { path: paths.state.join("labels.json"), error: format!("their tags stay saved: {e}") });
         }
     }
     Ok(outcome)
@@ -507,4 +526,36 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, updates: Receiver<Update>,
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const A: &str = "11111111-2222-4333-8444-555555555555";
+
+    fn paths(root: &Path) -> Paths {
+        Paths { claude: root.join("claude"), index: root.join("index.db"), config: root.join("config.toml"), claude_json: root.join("claude.json"), state: root.join("state") }
+    }
+
+    #[test]
+    fn the_saved_pins_are_checked_again_before_planning_and_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths(dir.path());
+        // Pinned in the other front end, so the list here doesn't know yet.
+        labels::change(&paths, &[A.to_string()], &labels::Change::Pin(true)).unwrap();
+        let plan = plan_delete(&paths, &[web::list::tests::session(A)]);
+        assert!(plan.items.is_empty());
+        assert_eq!(plan.skipped[0].reason, labels::PINNED);
+
+        let item = delete::Item { id: A.into(), source: Source::ClaudeCode, side: vec![], transcripts: vec![], bytes: 1 };
+        let planned = Plan { items: vec![item], ..Plan::default() };
+        let refused = delete_conversations(&paths, dir.path(), &planned, false).unwrap_err();
+        assert!(refused.contains("pinned meanwhile"), "{refused}");
+
+        std::fs::write(paths.state.join("labels.json"), "not json").unwrap();
+        let plan = plan_delete(&paths, &[web::list::tests::session(A)]);
+        assert!(plan.items.is_empty() && plan.skipped[0].reason.contains("may be pinned"));
+        assert!(delete_conversations(&paths, dir.path(), &planned, false).is_err());
+    }
 }

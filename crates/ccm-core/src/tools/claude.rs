@@ -124,6 +124,8 @@ fn read_session(f: &Found) -> Option<(Session, SearchDoc)> {
         crashed: false,
         window_size: None,
         folder_exists: true,
+        pinned: false,
+        tags: Vec::new(),
     };
     Some((session, doc))
 }

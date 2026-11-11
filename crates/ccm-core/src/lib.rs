@@ -8,6 +8,7 @@ pub mod forks;
 pub mod format;
 pub mod index;
 pub mod jobs;
+pub mod labels;
 pub mod model;
 pub mod paths;
 pub mod preview;

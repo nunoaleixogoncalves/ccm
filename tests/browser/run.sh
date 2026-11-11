@@ -1,7 +1,7 @@
 #!/bin/bash
 # Checks ccm web in headless Chrome, with the terminal app open on the same data.
 #
-#   cargo build --locked && tests/browser/run.sh [list] [actions] [delete] [focus] [worktrees]
+#   cargo build --locked && tests/browser/run.sh [list] [actions] [delete] [focus] [labels] [worktrees]
 #
 # With no names, every suite runs. It needs Node 22 or later, Chrome, Python 3, Git, curl and ss.
 # CCM_BIN picks another program and CHROME another browser.
@@ -119,8 +119,8 @@ EOT
     fi
 }
 
-all=(list:data_list.py actions:data_list.py delete:data_delete.py focus:data_list.py worktrees:data_worktrees.py)
-[ $# -gt 0 ] || set -- list actions delete focus worktrees
+all=(list:data_list.py actions:data_list.py delete:data_delete.py focus:data_list.py labels:data_list.py worktrees:data_worktrees.py)
+[ $# -gt 0 ] || set -- list actions delete focus labels worktrees
 for wanted in "$@"; do
     found=
     for entry in "${all[@]}"; do

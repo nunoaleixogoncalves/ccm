@@ -21,6 +21,8 @@ pub struct Filters {
     pub closed: bool,
     /// Only this tool's conversations.
     pub tool: Option<Source>,
+    /// Not pinned. Only the clean-up screen sets this, since pinned conversations are never suggested.
+    pub unpinned: bool,
 }
 
 /// What counts as large and as old.
@@ -42,11 +44,12 @@ impl Filters {
             && (!self.large || s.size_bytes > limits.large_bytes)
             && (!self.old || s.last_active_ms.is_some_and(|t| t < limits.old_before_ms))
             && (!self.closed || !s.open)
+            && (!self.unpinned || !s.pinned)
             && self.tool.is_none_or(|t| s.source == t)
     }
 
     pub fn any(&self) -> bool {
-        self.open || self.crashed || self.junk || self.missing || self.large || self.old || self.closed || self.tool.is_some()
+        self.open || self.crashed || self.junk || self.missing || self.large || self.old || self.closed || self.unpinned || self.tool.is_some()
     }
 }
 
@@ -62,7 +65,7 @@ impl Suggestion {
     pub const ALL: [Suggestion; 3] = [Suggestion::NoReply, Suggestion::FolderGone, Suggestion::LargeOld];
 
     pub fn filters(self) -> Filters {
-        let closed = Filters { closed: true, ..Filters::default() };
+        let closed = Filters { closed: true, unpinned: true, ..Filters::default() };
         match self {
             Suggestion::NoReply => Filters { junk: true, ..closed },
             Suggestion::FolderGone => Filters { missing: true, ..closed },
@@ -148,7 +151,8 @@ fn compare(a: &Session, b: &Session, key: SortKey) -> Ordering {
     }
 }
 
-/// Indices into `sessions`, filtered and sorted. Ties fall back to newest first and then ID, so
+/// Indices into `sessions`, filtered and sorted, with pinned ones first. Grouping keeps this
+/// order, so they also come first in their group. Ties fall back to newest first and then ID, so
 /// rows don't jump between refreshes.
 pub fn select(sessions: &[Session], filters: Filters, limits: Limits, key: SortKey, descending: bool) -> Vec<usize> {
     let mut rows: Vec<usize> =
@@ -157,6 +161,7 @@ pub fn select(sessions: &[Session], filters: Filters, limits: Limits, key: SortK
         let (a, b) = (&sessions[x], &sessions[y]);
         let primary = compare(a, b, key);
         let primary = if descending { primary.reverse() } else { primary };
+        let primary = b.pinned.cmp(&a.pinned).then(primary);
         primary.then_with(|| b.last_active_ms.cmp(&a.last_active_ms)).then_with(|| a.id.cmp(&b.id))
     });
     rows
@@ -306,6 +311,8 @@ mod tests {
             crashed: false,
             window_size: None,
             folder_exists: true,
+            pinned: false,
+            tags: Vec::new(),
         }
     }
 
@@ -361,6 +368,40 @@ mod tests {
         assert_eq!(ids(Filters { missing: true, ..Default::default() }), ["gone"]);
         assert_eq!(ids(Filters { large: true, ..Default::default() }), ["big", "both"]);
         assert_eq!(ids(Filters { junk: true, large: true, ..Default::default() }), ["both"]);
+    }
+
+    #[test]
+    fn pinned_rows_come_first_in_either_order_and_in_their_group() {
+        let at = |id: &str, folder: &str, size, pinned| {
+            let mut s = session(id);
+            s.folder = Some(folder.into());
+            s.size_bytes = size;
+            s.pinned = pinned;
+            s
+        };
+        let all = [at("small", "/a", 1, false), at("big", "/a", 9, false), at("pinned-small", "/b", 2, true), at("pinned-big", "/a", 8, true)];
+        let order = |d| select(&all, Filters::default(), LIMITS, SortKey::Size, d);
+        assert_eq!(order(true), [3, 2, 1, 0]);
+        assert_eq!(order(false), [2, 3, 0, 1], "reversing the sort keeps the pinned ones on top");
+        let header = |f: &str, count, size_bytes| GroupRow::Header { group: Group::Folder(f.into()), count, size_bytes };
+        assert_eq!(
+            group_by_folder(&all, &order(true)),
+            [header("/a", 3, 18), GroupRow::Item(3), GroupRow::Item(1), GroupRow::Item(0), header("/b", 1, 2), GroupRow::Item(2)]
+        );
+        let shown = select(&all, Filters { large: true, ..Default::default() }, Limits { large_bytes: 5, old_before_ms: 0 }, SortKey::Size, true);
+        assert_eq!(shown, [3, 1], "filters still hide pinned ones");
+    }
+
+    #[test]
+    fn suggestions_never_include_pinned_conversations() {
+        let mut junk = session("junk");
+        junk.replies = 0;
+        let mut pinned = session("pinned-junk");
+        pinned.replies = 0;
+        pinned.pinned = true;
+        let all = [junk, pinned];
+        assert_eq!(Suggestion::NoReply.select(&all, LIMITS), [0]);
+        assert_eq!(select(&all, Suggestion::NoReply.filters(), LIMITS, SortKey::Name, false), [0]);
     }
 
     #[test]

@@ -29,9 +29,9 @@ fn key(line: Cleanup) -> &'static str {
 /// The list filters that show a line's conversations, by the names the list understands.
 fn filters(line: Cleanup) -> Vec<&'static str> {
     match line {
-        Cleanup::Conversations(Suggestion::NoReply) => vec!["closed", "junk"],
-        Cleanup::Conversations(Suggestion::FolderGone) => vec!["closed", "missing"],
-        Cleanup::Conversations(Suggestion::LargeOld) => vec!["closed", "large", "old"],
+        Cleanup::Conversations(Suggestion::NoReply) => vec!["closed", "unpinned", "junk"],
+        Cleanup::Conversations(Suggestion::FolderGone) => vec!["closed", "unpinned", "missing"],
+        Cleanup::Conversations(Suggestion::LargeOld) => vec!["closed", "unpinned", "large", "old"],
         Cleanup::Worktrees | Cleanup::Jobs => Vec::new(),
     }
 }
@@ -303,7 +303,7 @@ mod tests {
         assert_eq!(line(&out, "jobs")["items"], "2");
         assert_eq!(line(&out, "jobs")["frees"], "2M", "the one with a worktree frees nothing");
         assert_eq!(line(&out, "jobs")["jobs"][1]["note"], JOB_KEPT_NOTE);
-        assert_eq!(line(&out, "no_reply")["filters"], json!(["closed", "junk"]));
+        assert_eq!(line(&out, "no_reply")["filters"], json!(["closed", "unpinned", "junk"]));
         assert!(out["summary"].as_str().unwrap().starts_with("7 suggested"), "{}", out["summary"]);
     }
 
