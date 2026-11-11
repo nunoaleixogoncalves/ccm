@@ -49,10 +49,10 @@ The Linux programs are static, so they work on any distribution. The macOS ones 
 
 ### Trying the beta
 
-`2.0.0-beta` is a pre-release, so the command above still installs the last stable version. To install the beta instead:
+`2.0.0-beta.2` is a pre-release, so the command above still installs the last stable version. To install the beta instead:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/nunoaleixogoncalves/ccm/main/install.sh | CCM_RELEASE_URL=https://github.com/nunoaleixogoncalves/ccm/releases/download/v2.0.0-beta sh
+curl -fsSL https://raw.githubusercontent.com/nunoaleixogoncalves/ccm/main/install.sh | CCM_RELEASE_URL=https://github.com/nunoaleixogoncalves/ccm/releases/download/v2.0.0-beta.2 sh
 ```
 
 Codex support is new and is still being tested with real Codex conversations. To go back to the stable version, run the install command above.

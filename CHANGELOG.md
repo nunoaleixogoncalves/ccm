@@ -2,6 +2,19 @@
 
 Every release of `ccm` and what changed in it. Each section is also used as the notes of its release on GitHub.
 
+## [2.0.0-beta.2] - 2026-11-11
+
+A pre-release, so the install command keeps giving you the last stable version. To try this one, see [Trying the beta](https://github.com/nunoaleixogoncalves/ccm#trying-the-beta).
+
+### Added
+
+- **Pins and tags.** `p` pins the selected or marked conversations, so they stay at the top of the list whatever the sort. `Shift+T` gives them tags, and `#tag` in the search shows only the conversations with that tag. A pinned conversation can't be deleted until it's unpinned, and clean-up never suggests one. Pins and tags are `ccm`'s own, kept in `~/.local/state/ccm/labels.json`, and work the same in `ccm web`. ([#16](https://github.com/nunoaleixogoncalves/ccm/issues/16))
+- **Focus new conversation.** Choose whether Resume and Fork take you to the new conversation or leave you on `ccm`, with `Shift+F` or a checkbox in `ccm web`. It works inside `herdr-app` and on Hyprland. New setting `focus_new_conversation` in `config.toml`. ([#56](https://github.com/nunoaleixogoncalves/ccm/issues/56))
+
+### Fixed
+
+- In `ccm web`, the Focus new checkbox could flip back for a moment after being changed. ([#62](https://github.com/nunoaleixogoncalves/ccm/pull/62))
+
 ## [2.0.0-beta] - 2026-11-09
 
 A pre-release, so the install command keeps giving you the last stable version. To try this one, see [Trying the beta](https://github.com/nunoaleixogoncalves/ccm#trying-the-beta). Codex support is new and is still being tested with real Codex conversations. `ccm web` has been tested in Chrome on Linux.
@@ -67,6 +80,7 @@ The first release.
 - `ccm setup` to install the hooks crash recovery needs, after showing the changes and asking.
 - Ready-made programs for Linux (static, x86-64 and ARM) and macOS (Intel and Apple silicon), and an install script that checks their checksums.
 
+[2.0.0-beta.2]: https://github.com/nunoaleixogoncalves/ccm/compare/v2.0.0-beta...v2.0.0-beta.2
 [2.0.0-beta]: https://github.com/nunoaleixogoncalves/ccm/compare/v1.1.1...v2.0.0-beta
 [1.1.1]: https://github.com/nunoaleixogoncalves/ccm/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/nunoaleixogoncalves/ccm/compare/v1.0.0...v1.1.0
